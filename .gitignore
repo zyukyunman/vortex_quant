@@ -1,0 +1,30 @@
+# 数据目录 (Parquet 文件, 本地不提交)
+data/
+
+# 环境配置 (含 Token)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# 报告输出
+reports/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/settings.json
+
+# 临时文件
+tmp_*.py
+*.tmp
+
+# 书籍资料 (本地参考)
+book/
