@@ -25,6 +25,3 @@ reports/
 # 临时文件
 tmp_*.py
 *.tmp
-
-# 书籍资料 (本地参考)
-book/
