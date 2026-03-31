@@ -17,16 +17,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import Settings, setup_logging
+from vortex.config.settings import Settings, setup_logging
 
 setup_logging("INFO")
 
-from app.core.datastore import DataStore
-from app.core.factorhub import FactorHub
-from app.core.signalbus import SignalBus
-from app.core.weight_optimizer import FixedWeightOptimizer
-from app.executor.backtest import BacktestEngine
-from app.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
+from vortex.core.datastore import DataStore
+from vortex.core.factorhub import FactorHub
+from vortex.core.signalbus import SignalBus
+from vortex.core.weight_optimizer import FixedWeightOptimizer
+from vortex.executor.backtest import BacktestEngine
+from vortex.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
 
 
 # ================================================================

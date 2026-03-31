@@ -21,9 +21,9 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import pandas as pd
 
-from app.models import SelectionResult, Signal
-from app.strategy.base import BaseStrategy
-from app.strategy.filters import (
+from vortex.models import SelectionResult, Signal
+from vortex.strategy.base import BaseStrategy
+from vortex.strategy.filters import (
     FactorThresholdFilter,
     FilterContext,
     FilterPipeline,

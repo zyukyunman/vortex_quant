@@ -18,7 +18,7 @@ class TestSettings:
         assert settings.max_industry_pct == 0.30
 
     def test_validate_empty_token(self):
-        from config.settings import Settings
+        from vortex.config.settings import Settings
         s = Settings(tushare_token="")
         with pytest.raises(ValueError, match="TUSHARE_TOKEN"):
             s.validate()

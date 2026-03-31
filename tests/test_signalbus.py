@@ -2,8 +2,8 @@
 import pandas as pd
 import pytest
 
-from app.core.signalbus import SignalBus
-from app.models import Signal
+from vortex.core.signalbus import SignalBus
+from vortex.models import Signal
 
 
 class TestSignalBus:

@@ -146,7 +146,7 @@ class BacktestEngine:
             raise ValueError(f"区间 {start_date}~{end_date} 无有效再平衡日期")
 
         # 确保第一个交易日立即建仓 (不等到下一个周期末)
-        from app.utils.date_utils import load_trade_cal
+        from vortex.utils.date_utils import load_trade_cal
         cal = load_trade_cal(self.ds.data_dir)
         cal_list = sorted([d.strftime("%Y%m%d") for d in cal])
         first_trade_day = None
@@ -293,7 +293,7 @@ class BacktestEngine:
         self, start: str, end: str, freq: str
     ) -> List[str]:
         """获取再平衡日期列表 (月末/季末交易日)"""
-        from app.utils.date_utils import load_trade_cal
+        from vortex.utils.date_utils import load_trade_cal
         cal = load_trade_cal(self.ds.data_dir)
         cal_list = sorted([d.strftime("%Y%m%d") for d in cal])
         in_range = [d for d in cal_list if start <= d <= end]

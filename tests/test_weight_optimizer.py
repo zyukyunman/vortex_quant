@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from app.core.weight_optimizer import (
+from vortex.core.weight_optimizer import (
     EqualWeightOptimizer,
     FixedWeightOptimizer,
     ICIRWeightOptimizer,

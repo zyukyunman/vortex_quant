@@ -3,8 +3,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.models import SelectionResult, Signal
-from app.strategy.runner import StrategyRunner
+from vortex.models import SelectionResult, Signal
+from vortex.strategy.runner import StrategyRunner
 
 
 def _make_mock_strategy(name, signals=None):

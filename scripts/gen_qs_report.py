@@ -165,8 +165,8 @@ def main():
     # 尝试加载基准
     benchmark = None
     try:
-        from config.settings import Settings
-        from app.core.datastore import DataStore
+        from vortex.config.settings import Settings
+        from vortex.core.datastore import DataStore
         cfg = Settings()
         ds = DataStore(cfg)
         start_date = min(best["returns"].keys())

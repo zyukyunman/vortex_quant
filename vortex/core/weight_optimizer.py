@@ -263,7 +263,7 @@ class ICWeightOptimizer(WeightOptimizer):
 
     def _get_rebalance_dates(self, date: str) -> List[str]:
         """获取过去 lookback_months 个月的月末交易日列表"""
-        from app.utils.date_utils import load_trade_cal
+        from vortex.utils.date_utils import load_trade_cal
 
         cal = load_trade_cal(self.ds.data_dir)
         if cal.empty:

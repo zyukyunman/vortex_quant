@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.executor.backtest import BacktestEngine, BacktestResult
+from vortex.executor.backtest import BacktestEngine, BacktestResult
 
 
 class TestBacktestResult:

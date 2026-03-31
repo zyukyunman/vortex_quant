@@ -3,10 +3,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.models import SelectionResult, Signal
-from app.notify.notifier import Notifier
-from app.notify.serverchan import send_serverchan
-from app.notify.templates import (
+from vortex.models import SelectionResult, Signal
+from vortex.notify.notifier import Notifier
+from vortex.notify.serverchan import send_serverchan
+from vortex.notify.templates import (
     format_data_update,
     format_daily_summary,
     format_risk_alert,
@@ -15,7 +15,7 @@ from app.notify.templates import (
 
 
 class TestServerchan:
-    @patch("app.notify.serverchan.requests.post")
+    @patch("vortex.notify.serverchan.requests.post")
     def test_send_success(self, mock_post):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"code": 0, "message": "success"}
@@ -66,7 +66,7 @@ class TestNotifier:
     def test_rate_limit(self):
         notifier = Notifier(serverchan_key="test")
         # Manually patch send_serverchan to prevent actual calls
-        with patch("app.notify.notifier.send_serverchan", return_value=True):
+        with patch("vortex.notify.notifier.send_serverchan", return_value=True):
             notifier.notify_custom("P2", "test1", "body")
             notifier.notify_custom("P2", "test2", "body")
             notifier.notify_custom("P2", "test3", "body")
@@ -78,7 +78,7 @@ class TestNotifier:
 
     def test_dedup(self):
         notifier = Notifier(serverchan_key="test")
-        with patch("app.notify.notifier.send_serverchan", return_value=True):
+        with patch("vortex.notify.notifier.send_serverchan", return_value=True):
             notifier.notify_custom("P2", "same_title", "body")
         assert "same_title" in notifier._sent_titles
         can = notifier._can_send("P2", "same_title")

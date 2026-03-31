@@ -2,7 +2,7 @@
 import sys
 sys.path.insert(0, ".")
 
-from app.notify.serverchan import send_serverchan
+from vortex.notify.serverchan import send_serverchan
 
 KEY = "SCT281388T1heazXaxMKfgBQfCS9MZ1P9g"
 

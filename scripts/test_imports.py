@@ -7,43 +7,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 print("测试模块导入...")
 
-from config.settings import Settings, setup_logging
+from vortex.config.settings import Settings, setup_logging
 print("  ✓ config.settings")
 
-from app.models import Signal, SelectionResult
+from vortex.models import Signal, SelectionResult
 print("  ✓ app.models")
 
-from app.factor.base import BaseFactor, zscore, rank_pct
+from vortex.factor.base import BaseFactor, zscore, rank_pct
 print("  ✓ app.factor.base")
 
-from app.factor.value import (
+from vortex.factor.value import (
     DividendYield, DividendYield3Y, PayoutRatio3Y,
     EP, DP, ConsecutiveDividendYears,
 )
 print("  ✓ app.factor.value (6 factors)")
 
-from app.factor.quality import (
+from vortex.factor.quality import (
     RoeTTM, DeltaROE, ROEStability, OPCFD,
     DebtToAssets, NetProfitYoY,
 )
 print("  ✓ app.factor.quality (6 factors)")
 
-from app.factor.cashflow import FCFYield, OCFtoOP, FCF_TTM, OCF3YPositive
+from vortex.factor.cashflow import FCFYield, OCFtoOP, FCF_TTM, OCF3YPositive
 print("  ✓ app.factor.cashflow (4 factors)")
 
-from app.core.datastore import DataStore
+from vortex.core.datastore import DataStore
 print("  ✓ app.core.datastore")
 
-from app.core.factorhub import FactorHub
+from vortex.core.factorhub import FactorHub
 print("  ✓ app.core.factorhub")
 
-from app.core.signalbus import SignalBus
+from vortex.core.signalbus import SignalBus
 print("  ✓ app.core.signalbus")
 
-from app.strategy.base import BaseStrategy
+from vortex.strategy.base import BaseStrategy
 print("  ✓ app.strategy.base")
 
-from app.strategy.dividend import DividendQualityFCFStrategy
+from vortex.strategy.dividend import DividendQualityFCFStrategy
 print("  ✓ app.strategy.dividend")
 
 print("\n所有模块导入成功! ✅")

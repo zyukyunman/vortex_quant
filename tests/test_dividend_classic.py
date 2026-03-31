@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.strategy.dividend_classic import (
+from vortex.strategy.dividend_classic import (
     DividendYield4In3Out,
     BUY_THRESHOLD,
     SELL_THRESHOLD,

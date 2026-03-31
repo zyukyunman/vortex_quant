@@ -14,11 +14,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
-from app.core.datastore import DataStore
-from app.core.factorhub import FactorHub
-from app.core.signalbus import SignalBus
-from app.models import SelectionResult
-from app.strategy.base import BaseStrategy
+from vortex.core.datastore import DataStore
+from vortex.core.factorhub import FactorHub
+from vortex.core.signalbus import SignalBus
+from vortex.models import SelectionResult
+from vortex.strategy.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 

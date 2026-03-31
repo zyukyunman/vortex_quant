@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from app.models import SelectionResult, Signal
+from vortex.models import SelectionResult, Signal
 
 
 def format_selection_result(result: SelectionResult) -> tuple[str, str]:

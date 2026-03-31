@@ -24,7 +24,7 @@ os.environ.setdefault("API_KEY", "test_api_key")
 
 @pytest.fixture
 def settings():
-    from config.settings import Settings
+    from vortex.config.settings import Settings
     return Settings()
 
 
@@ -43,7 +43,7 @@ def tmp_data_dir(tmp_path):
 
 @pytest.fixture
 def mock_settings(tmp_data_dir):
-    from config.settings import Settings
+    from vortex.config.settings import Settings
     return Settings(
         tushare_token="test_token",
         data_dir=tmp_data_dir,
@@ -68,7 +68,7 @@ def sample_stock_basic():
 @pytest.fixture
 def sample_signals():
     """示例信号列表"""
-    from app.models import Signal
+    from vortex.models import Signal
     return [
         Signal(date="20250630", strategy="test_strat", ts_code="000651.SZ",
                name="格力电器", action="buy", weight=0.05, score=0.85,

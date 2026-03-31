@@ -15,7 +15,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from app.factor.base import (
+from vortex.factor.base import (
     BaseFactor,
     get_latest_annual_period,
     get_latest_n_annual_periods,

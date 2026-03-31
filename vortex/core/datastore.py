@@ -21,7 +21,7 @@ import duckdb
 import pandas as pd
 import tushare as ts
 
-from config.settings import Settings
+from vortex.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 

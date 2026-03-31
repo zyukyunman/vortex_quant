@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from app.strategy.filters import (
+from vortex.strategy.filters import (
     FactorRangeFilter,
     FactorThresholdFilter,
     FilterContext,

@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.settings import Settings, setup_logging
-from app.core.datastore import DataStore
+from vortex.config.settings import Settings, setup_logging
+from vortex.core.datastore import DataStore
 
 setup_logging("INFO")
 

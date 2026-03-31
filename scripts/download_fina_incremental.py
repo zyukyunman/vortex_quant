@@ -16,10 +16,10 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import Settings, setup_logging
+from vortex.config.settings import Settings, setup_logging
 setup_logging("INFO")
 
-from app.core.datastore import DataStore
+from vortex.core.datastore import DataStore
 
 import logging
 logger = logging.getLogger(__name__)

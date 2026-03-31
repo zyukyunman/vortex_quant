@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # --- 1. filters.py ---
-from app.strategy.filters import (
+from vortex.strategy.filters import (
     FilterPipeline, FilterContext, StockFilter,
     NonSTFilter, MinListedDaysFilter, IndustryExcludeFilter,
     FactorThresholdFilter, FactorRangeFilter, QuantileCutoffFilter,
@@ -13,14 +13,14 @@ from app.strategy.filters import (
 print("[OK] filters.py imports")
 
 # --- 2. weight_optimizer.py ---
-from app.core.weight_optimizer import (
+from vortex.core.weight_optimizer import (
     WeightOptimizer, FixedWeightOptimizer, EqualWeightOptimizer,
     ICWeightOptimizer, ICIRWeightOptimizer,
 )
 print("[OK] weight_optimizer.py imports")
 
 # --- 3. dividend.py ---
-from app.strategy.dividend import (
+from vortex.strategy.dividend import (
     DividendQualityFCFStrategy, build_filter_pipeline,
     EXCLUDED_INDUSTRIES, DEFAULT_WEIGHTS, SCORING_FACTORS,
 )
@@ -45,7 +45,7 @@ assert abs(sum(w2.values()) - 1.0) < 1e-6
 print(f"[OK] DEFAULT_WEIGHTS: { {k: round(v,4) for k,v in w2.items()} }")
 
 # --- 7. FilterPipeline ---
-from config.settings import Settings
+from vortex.config.settings import Settings
 cfg = Settings()
 pipeline = build_filter_pipeline(cfg)
 print(f"[OK] FilterPipeline: {len(pipeline.filters)} filters")

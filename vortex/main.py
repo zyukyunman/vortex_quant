@@ -1,7 +1,7 @@
 """
 QuantPilot FastAPI 应用入口
 
-启动: uvicorn app.main:app --reload --port 8000
+启动: uvicorn vortex.main:app --reload --port 8000
 """
 from __future__ import annotations
 
@@ -10,20 +10,20 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from config.settings import get_settings, setup_logging
+from vortex.config.settings import get_settings, setup_logging
 
 logger = logging.getLogger(__name__)
 
 
 def build_components():
     """构建全部核心组件 — 单例"""
-    from app.core.datastore import DataStore
-    from app.core.factorhub import FactorHub
-    from app.core.scheduler import TaskScheduler
-    from app.core.signalbus import SignalBus
-    from app.notify.notifier import Notifier
-    from app.strategy.dividend import DividendQualityFCFStrategy
-    from app.strategy.runner import StrategyRunner
+    from vortex.core.datastore import DataStore
+    from vortex.core.factorhub import FactorHub
+    from vortex.core.scheduler import TaskScheduler
+    from vortex.core.signalbus import SignalBus
+    from vortex.notify.notifier import Notifier
+    from vortex.strategy.dividend import DividendQualityFCFStrategy
+    from vortex.strategy.runner import StrategyRunner
 
     cfg = get_settings()
     ds = DataStore(cfg)
@@ -94,7 +94,7 @@ app = FastAPI(
 
 
 # 注册路由
-from app.api.routes import router  # noqa: E402
+from vortex.api.routes import router  # noqa: E402
 app.include_router(router, prefix="/api/v1")
 
 

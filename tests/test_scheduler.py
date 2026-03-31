@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.core.scheduler import TaskScheduler
+from vortex.core.scheduler import TaskScheduler
 
 
 class TestTaskScheduler:

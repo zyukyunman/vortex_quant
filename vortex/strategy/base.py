@@ -13,10 +13,10 @@ import logging
 from abc import ABC, abstractmethod
 from typing import List
 
-from app.core.datastore import DataStore
-from app.core.factorhub import FactorHub
-from app.core.signalbus import SignalBus
-from app.models import Signal, SelectionResult
+from vortex.core.datastore import DataStore
+from vortex.core.factorhub import FactorHub
+from vortex.core.signalbus import SignalBus
+from vortex.models import Signal, SelectionResult
 
 logger = logging.getLogger(__name__)
 

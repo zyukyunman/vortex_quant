@@ -15,7 +15,7 @@ import logging
 import pandas as pd
 import pytest
 
-from app.strategy.filters import (
+from vortex.strategy.filters import (
     FactorRangeFilter,
     FactorThresholdFilter,
     FilterContext,
@@ -183,7 +183,7 @@ class TestIndustryExcludeAudit:
 
     def test_legacy_mode_excludes_correctly(self, large_stock_basic, large_factor_data, audit_ctx):
         """降级模式: 用 industry 列名称匹配"""
-        from app.strategy.dividend import EXCLUDED_INDUSTRIES
+        from vortex.strategy.dividend import EXCLUDED_INDUSTRIES
         pool = set(large_stock_basic["ts_code"])
         f = IndustryExcludeFilter(industries=EXCLUDED_INDUSTRIES)
         result = f.apply(pool, large_factor_data, audit_ctx)
@@ -356,7 +356,7 @@ class TestFullPipelineAudit:
         self, large_stock_basic, large_factor_data, audit_ctx
     ):
         """完整管道输出必须同时满足所有规则"""
-        from app.strategy.dividend import EXCLUDED_INDUSTRIES, build_filter_pipeline
+        from vortex.strategy.dividend import EXCLUDED_INDUSTRIES, build_filter_pipeline
         pipeline = build_filter_pipeline(audit_ctx.settings)
 
         initial_pool = set(large_stock_basic["ts_code"])
@@ -400,7 +400,7 @@ class TestFullPipelineAudit:
 
     def test_trace_records_monotonic(self, large_stock_basic, large_factor_data, audit_ctx):
         """追踪记录的 after 值应递减"""
-        from app.strategy.dividend import build_filter_pipeline
+        from vortex.strategy.dividend import build_filter_pipeline
         pipeline = build_filter_pipeline(audit_ctx.settings)
 
         initial_pool = set(large_stock_basic["ts_code"])

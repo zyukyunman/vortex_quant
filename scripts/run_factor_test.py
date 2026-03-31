@@ -24,7 +24,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import Settings, StrategyConfig, setup_logging
+from vortex.config.settings import Settings, StrategyConfig, setup_logging
 
 setup_logging("INFO")
 logger = logging.getLogger("factor_test")
@@ -182,10 +182,10 @@ def compute_optimal_weights(ic_results: dict):
 
 def run_backtest_compare(ds, fh, weight_sets: dict, start: str, end: str, freq: str = "SA"):
     """对多组权重做回测比较"""
-    from app.core.signalbus import SignalBus
-    from app.core.weight_optimizer import FixedWeightOptimizer
-    from app.executor.backtest import BacktestEngine
-    from app.strategy.dividend import DividendQualityFCFStrategy
+    from vortex.core.signalbus import SignalBus
+    from vortex.core.weight_optimizer import FixedWeightOptimizer
+    from vortex.executor.backtest import BacktestEngine
+    from vortex.strategy.dividend import DividendQualityFCFStrategy
 
     results = {}
     for label, weights in weight_sets.items():
@@ -334,9 +334,9 @@ def main():
     cfg = Settings()
     cfg.validate()
 
-    from app.core.datastore import DataStore
-    from app.core.factorhub import FactorHub
-    from app.utils.date_utils import load_trade_cal
+    from vortex.core.datastore import DataStore
+    from vortex.core.factorhub import FactorHub
+    from vortex.utils.date_utils import load_trade_cal
 
     ds = DataStore(cfg)
     fh = FactorHub(ds)

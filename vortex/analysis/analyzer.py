@@ -15,8 +15,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from app.core.datastore import DataStore
-from app.core.factorhub import FactorHub
+from vortex.core.datastore import DataStore
+from vortex.core.factorhub import FactorHub
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,7 @@ class FactorAnalyzer:
         if factor_names is None:
             factor_names = list(self.fh.factors.keys())
         if dates is None:
-            from app.utils.date_utils import load_trade_cal
+            from vortex.utils.date_utils import load_trade_cal
             cal = load_trade_cal(self.ds.data_dir)
             cal_list = sorted([d.strftime("%Y%m%d") for d in cal])
             # 默认取最近12个月末
@@ -191,7 +191,7 @@ class FactorAnalyzer:
         self, date: str, ts_codes: List[str], days: int
     ) -> pd.Series:
         """获取从 date 开始 days 交易日后的累计收益"""
-        from app.utils.date_utils import load_trade_cal
+        from vortex.utils.date_utils import load_trade_cal
         cal = load_trade_cal(self.ds.data_dir)
         cal_list = sorted([d.strftime("%Y%m%d") for d in cal])
         try:

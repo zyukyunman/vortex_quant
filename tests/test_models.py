@@ -1,7 +1,7 @@
 """test_models.py — 数据模型单元测试"""
 import pytest
 
-from app.models import FactorExposure, SelectionResult, Signal
+from vortex.models import FactorExposure, SelectionResult, Signal
 
 
 class TestSignal:

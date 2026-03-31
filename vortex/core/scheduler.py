@@ -17,13 +17,13 @@ import logging
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
-from app.core.datastore import DataStore
-from app.core.factorhub import FactorHub
-from app.core.signalbus import SignalBus
-from app.models import SelectionResult
-from app.notify.notifier import Notifier
-from app.strategy.runner import StrategyRunner
-from app.utils.date_utils import today_str
+from vortex.core.datastore import DataStore
+from vortex.core.factorhub import FactorHub
+from vortex.core.signalbus import SignalBus
+from vortex.models import SelectionResult
+from vortex.notify.notifier import Notifier
+from vortex.strategy.runner import StrategyRunner
+from vortex.utils.date_utils import today_str
 
 logger = logging.getLogger(__name__)
 

@@ -21,7 +21,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import Settings, setup_logging
+from vortex.config.settings import Settings, setup_logging
 
 setup_logging("INFO")
 logger = logging.getLogger("auto_pipeline")
@@ -108,7 +108,7 @@ def run_ic_analysis(ds, fh, date: str, lookback_dates: list):
                     continue
 
                 # 获取 20 天后收益率
-                from app.utils.date_utils import load_trade_cal
+                from vortex.utils.date_utils import load_trade_cal
                 cal = sorted([dt.strftime("%Y%m%d") for dt in load_trade_cal(ds.data_dir)])
                 idx = None
                 for i, c in enumerate(cal):
@@ -212,10 +212,10 @@ def compute_optimal_weights(ic_results: dict):
 
 def run_backtest_comparison(ds, fh, weight_sets: dict, start: str, end: str, benchmark_codes: list = None):
     """对多组权重做回测比较"""
-    from app.core.signalbus import SignalBus
-    from app.core.weight_optimizer import FixedWeightOptimizer
-    from app.executor.backtest import BacktestEngine
-    from app.strategy.dividend import DividendQualityFCFStrategy
+    from vortex.core.signalbus import SignalBus
+    from vortex.core.weight_optimizer import FixedWeightOptimizer
+    from vortex.executor.backtest import BacktestEngine
+    from vortex.strategy.dividend import DividendQualityFCFStrategy
 
     engine = BacktestEngine(ds)
     results = {}
@@ -350,14 +350,14 @@ def main():
     cfg = Settings()
     cfg.validate()
 
-    from app.core.datastore import DataStore
-    from app.core.factorhub import FactorHub
-    from app.core.signalbus import SignalBus
-    from app.core.weight_optimizer import FixedWeightOptimizer
-    from app.executor.backtest import BacktestEngine
-    from app.notify.serverchan import send_serverchan
-    from app.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
-    from app.utils.date_utils import get_recent_trade_dates, load_trade_cal, today_str
+    from vortex.core.datastore import DataStore
+    from vortex.core.factorhub import FactorHub
+    from vortex.core.signalbus import SignalBus
+    from vortex.core.weight_optimizer import FixedWeightOptimizer
+    from vortex.executor.backtest import BacktestEngine
+    from vortex.notify.serverchan import send_serverchan
+    from vortex.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
+    from vortex.utils.date_utils import get_recent_trade_dates, load_trade_cal, today_str
 
     # ---- Step 0: 数据同步 (可选) ----
     ds = DataStore(cfg)

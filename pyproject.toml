@@ -1,5 +1,5 @@
 [project]
-name = "quantpilot"
+name = "vortex"
 version = "0.1.0"
 description = "个人量化投资平台 — 高股息+红利质量+自由现金流策略"
 requires-python = ">=3.9"

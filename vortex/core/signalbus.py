@@ -13,7 +13,7 @@ from typing import Dict, List
 
 import pandas as pd
 
-from app.models import Signal
+from vortex.models import Signal
 
 logger = logging.getLogger(__name__)
 

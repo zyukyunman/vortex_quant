@@ -19,19 +19,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def run_backtest_phase():
     """阶段1: 回测，保存数据到 JSON"""
-    from config.settings import Settings, setup_logging
+    from vortex.config.settings import Settings, setup_logging
     setup_logging("INFO")
 
     cfg = Settings()
     cfg.validate()
 
-    from app.core.datastore import DataStore
-    from app.core.factorhub import FactorHub
-    from app.core.signalbus import SignalBus
-    from app.core.weight_optimizer import FixedWeightOptimizer
-    from app.executor.backtest import BacktestEngine
-    from app.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
-    from app.utils.date_utils import get_recent_trade_dates, load_trade_cal, today_str
+    from vortex.core.datastore import DataStore
+    from vortex.core.factorhub import FactorHub
+    from vortex.core.signalbus import SignalBus
+    from vortex.core.weight_optimizer import FixedWeightOptimizer
+    from vortex.executor.backtest import BacktestEngine
+    from vortex.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
+    from vortex.utils.date_utils import get_recent_trade_dates, load_trade_cal, today_str
 
     ds = DataStore(cfg)
     fh = FactorHub(ds)

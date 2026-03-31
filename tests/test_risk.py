@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from app.risk.manager import RiskCheckResult, RiskManager, RiskReport
+from vortex.risk.manager import RiskCheckResult, RiskManager, RiskReport
 
 
 class TestRiskCheckResult:

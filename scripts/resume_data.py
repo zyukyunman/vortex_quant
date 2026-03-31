@@ -16,8 +16,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.settings import Settings, setup_logging
-from app.core.datastore import DataStore
+from vortex.config.settings import Settings, setup_logging
+from vortex.core.datastore import DataStore
 
 
 def main():

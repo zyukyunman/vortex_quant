@@ -31,7 +31,7 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
-    from app.main import get_component
+    from vortex.main import get_component
     expected = get_component("settings").api_key
     if expected and api_key != expected:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -59,14 +59,14 @@ class BacktestRequest(BaseModel):
 # ---- 策略路由 ----
 @router.get("/strategy/list")
 async def strategy_list(key=Depends(verify_api_key)):
-    from app.main import get_component
+    from vortex.main import get_component
     runner = get_component("runner")
     return {"strategies": runner.list_strategies()}
 
 
 @router.post("/strategy/run")
 async def strategy_run(req: RunStrategyRequest, key=Depends(verify_api_key)):
-    from app.main import get_component
+    from vortex.main import get_component
     runner = get_component("runner")
 
     if req.strategy:
@@ -95,14 +95,14 @@ async def strategy_run(req: RunStrategyRequest, key=Depends(verify_api_key)):
 # ---- 因子路由 ----
 @router.get("/factor/list")
 async def factor_list(key=Depends(verify_api_key)):
-    from app.main import get_component
+    from vortex.main import get_component
     fh = get_component("fh")
     return {"factors": fh.list_factors()}
 
 
 @router.post("/factor/compute")
 async def factor_compute(req: ComputeFactorRequest, key=Depends(verify_api_key)):
-    from app.main import get_component
+    from vortex.main import get_component
     fh = get_component("fh")
 
     if req.factor_name:
@@ -126,7 +126,7 @@ async def factor_compute(req: ComputeFactorRequest, key=Depends(verify_api_key))
 # ---- 信号路由 ----
 @router.post("/signal/flush")
 async def signal_flush(date: str = Query(...), key=Depends(verify_api_key)):
-    from app.main import get_component
+    from vortex.main import get_component
     bus = get_component("bus")
     signals = bus.flush(date)
     return {"date": date, "flushed": len(signals)}
@@ -138,7 +138,7 @@ async def signal_history(
     key=Depends(verify_api_key),
 ):
     import pandas as pd
-    from app.main import get_component
+    from vortex.main import get_component
     cfg = get_component("settings")
     path = cfg.data_dir / "signal" / f"{year}.parquet"
     if not path.exists():
@@ -153,7 +153,7 @@ async def scheduler_trigger(
     task: str = Query("daily_pipeline"),
     key=Depends(verify_api_key),
 ):
-    from app.main import get_component
+    from vortex.main import get_component
     scheduler = get_component("scheduler")
     result = scheduler.trigger(task)
     return result
@@ -161,7 +161,7 @@ async def scheduler_trigger(
 
 @router.get("/scheduler/status")
 async def scheduler_status(key=Depends(verify_api_key)):
-    from app.main import get_component
+    from vortex.main import get_component
     scheduler = get_component("scheduler")
     return scheduler.status()
 
@@ -172,7 +172,7 @@ async def notify_test(
     title: str = Query("QuantPilot 测试"),
     key=Depends(verify_api_key),
 ):
-    from app.main import get_component
+    from vortex.main import get_component
     notifier = get_component("notifier")
     success = notifier.notify_custom("P2", title, "这是一条测试消息。如果你看到了，说明通知配置正确。")
     return {"sent": success}
@@ -184,8 +184,8 @@ async def stock_profile(
     ts_code: str = Query(..., description="股票代码 e.g. 000651.SZ"),
     key=Depends(verify_api_key),
 ):
-    from app.analysis.analyzer import StockAnalyzer
-    from app.main import get_component
+    from vortex.analysis.analyzer import StockAnalyzer
+    from vortex.main import get_component
     ds = get_component("ds")
     analyzer = StockAnalyzer(ds)
     return analyzer.profile(ts_code)
@@ -194,14 +194,14 @@ async def stock_profile(
 # ---- 回测路由 ----
 @router.post("/backtest/run")
 async def backtest_run(req: BacktestRequest, key=Depends(verify_api_key)):
-    from app.executor.backtest import BacktestEngine
-    from app.main import get_component
+    from vortex.executor.backtest import BacktestEngine
+    from vortex.main import get_component
 
     ds = get_component("ds")
     fh = get_component("fh")
     bus = get_component("bus")
 
-    from app.strategy.dividend import DividendQualityFCFStrategy
+    from vortex.strategy.dividend import DividendQualityFCFStrategy
     strategy = DividendQualityFCFStrategy(ds, fh, bus)
     engine = BacktestEngine(ds)
 

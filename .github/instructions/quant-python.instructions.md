@@ -121,7 +121,7 @@ import pandas as pd
 
 # 本地模块
 from utils.data_utils import get_price_data
-from config.settings import TUSHARE_TOKEN
+from vortex.config.settings import TUSHARE_TOKEN
 
 # ============ 常量 ============
 DEFAULT_LOOKBACK = 20

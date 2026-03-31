@@ -20,9 +20,9 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from app.models import SelectionResult
-from app.notify.serverchan import send_serverchan
-from app.notify.templates import (
+from vortex.models import SelectionResult
+from vortex.notify.serverchan import send_serverchan
+from vortex.notify.templates import (
     format_daily_summary,
     format_risk_alert,
     format_selection_result,

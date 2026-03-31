@@ -15,8 +15,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from app.core.datastore import DataStore
-from app.factor.base import BaseFactor
+from vortex.core.datastore import DataStore
+from vortex.factor.base import BaseFactor
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +36,15 @@ class FactorHub:
 
     def register_all_defaults(self):
         """注册所有默认因子（策略所需的全部因子）"""
-        from app.factor.value import (
+        from vortex.factor.value import (
             DividendYield, DividendYield3Y, PayoutRatio3Y,
             EP, DP, ConsecutiveDividendYears, RoeOverPb,
         )
-        from app.factor.quality import (
+        from vortex.factor.quality import (
             RoeTTM, DeltaROE, ROEStability, OPCFD,
             DebtToAssets, NetProfitYoY,
         )
-        from app.factor.cashflow import (
+        from vortex.factor.cashflow import (
             FCFYield, OCFtoOP, FCF_TTM, OCF3YPositive,
         )
 

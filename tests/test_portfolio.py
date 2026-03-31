@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from app.portfolio import PortfolioEngine, Position, RebalanceOrder
+from vortex.portfolio import PortfolioEngine, Position, RebalanceOrder
 
 
 class TestPortfolioEngine:

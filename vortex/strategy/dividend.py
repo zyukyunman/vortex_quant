@@ -22,15 +22,15 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from app.core.weight_optimizer import (
+from vortex.core.weight_optimizer import (
     FixedWeightOptimizer,
     ICWeightOptimizer,
     WeightOptimizer,
 )
-from app.factor.base import zscore
-from app.models import SelectionResult, Signal
-from app.strategy.base import BaseStrategy
-from app.strategy.filters import (
+from vortex.factor.base import zscore
+from vortex.models import SelectionResult, Signal
+from vortex.strategy.base import BaseStrategy
+from vortex.strategy.filters import (
     FactorRangeFilter,
     FactorThresholdFilter,
     FilterContext,
