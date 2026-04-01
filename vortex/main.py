@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def build_components():
     """构建全部核心组件 — 单例"""
-    from vortex.core.datastore import DataStore
+    from vortex.core.data.datastore import DataStore
     from vortex.core.factorhub import FactorHub
     from vortex.core.scheduler import TaskScheduler
     from vortex.core.signalbus import SignalBus

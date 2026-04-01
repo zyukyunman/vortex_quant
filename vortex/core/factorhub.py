@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 from vortex.factor.base import BaseFactor
 
 logger = logging.getLogger(__name__)

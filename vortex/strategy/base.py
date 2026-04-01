@@ -13,7 +13,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import List
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
 from vortex.models import Signal, SelectionResult

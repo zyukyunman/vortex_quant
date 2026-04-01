@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 
 logger = logging.getLogger(__name__)

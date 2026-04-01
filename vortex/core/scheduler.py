@@ -17,7 +17,7 @@ import logging
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
 from vortex.models import SelectionResult
@@ -117,6 +117,15 @@ class TaskScheduler:
 
         self._scheduler = BackgroundScheduler()
 
+        # 每交易日 06:30 增量同步数据
+        self._scheduler.add_job(
+            func=self._run_daily_sync,
+            trigger=CronTrigger(hour=6, minute=30, day_of_week="mon-fri"),
+            id="daily_sync",
+            name="每日数据同步",
+            replace_existing=True,
+        )
+
         # 每交易日 15:35 执行日终流水线
         self._scheduler.add_job(
             func=self.run_daily_pipeline,
@@ -127,7 +136,7 @@ class TaskScheduler:
         )
 
         self._scheduler.start()
-        logger.info("调度器已启动 (每交易日 15:35 执行)")
+        logger.info("调度器已启动 (06:30 数据同步, 15:35 日终流水线)")
 
     def stop(self):
         """停止调度器"""
@@ -139,8 +148,37 @@ class TaskScheduler:
         """手动触发指定任务"""
         if task_name == "daily_pipeline":
             return self.run_daily_pipeline()
+        elif task_name == "daily_sync":
+            return self._run_daily_sync()
         else:
             return {"error": f"未知任务: {task_name}"}
+
+    def _run_daily_sync(self) -> Dict:
+        """每日增量数据同步"""
+        logger.info("[DailySync] 开始每日数据同步...")
+        try:
+            from vortex.core.data.syncer import DataSyncer
+            syncer = DataSyncer(self.ds, start_year=2014, user_points=2000)
+            results = syncer.sync_daily()
+            summary = {
+                "total": len(results),
+                "success": sum(1 for r in results if r.status.value == "success"),
+                "skipped": sum(1 for r in results if r.status.value == "skipped"),
+                "failed": sum(1 for r in results if r.status.value == "failed"),
+            }
+            logger.info("[DailySync] 完成: %s", summary)
+
+            # 同步失败时推送通知
+            failed = [r for r in results if r.status.value == "failed"]
+            if failed and self.notifier:
+                msg = "\n".join(f"- {r.name}: {r.message[:60]}" for r in failed)
+                self.notifier.notify_risk_alert(
+                    "P2", "数据同步部分失败", msg,
+                )
+            return summary
+        except Exception as e:
+            logger.error("[DailySync] 异常: %s", e)
+            return {"error": str(e)}
 
     def status(self) -> Dict:
         """获取调度器状态"""

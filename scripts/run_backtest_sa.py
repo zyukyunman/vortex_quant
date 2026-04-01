@@ -21,7 +21,7 @@ from vortex.config.settings import Settings, setup_logging
 
 setup_logging("INFO")
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
 from vortex.core.weight_optimizer import FixedWeightOptimizer

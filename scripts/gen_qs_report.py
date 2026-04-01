@@ -166,7 +166,7 @@ def main():
     benchmark = None
     try:
         from vortex.config.settings import Settings
-        from vortex.core.datastore import DataStore
+        from vortex.core.data.datastore import DataStore
         cfg = Settings()
         ds = DataStore(cfg)
         start_date = min(best["returns"].keys())

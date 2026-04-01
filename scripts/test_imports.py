@@ -31,7 +31,7 @@ print("  ✓ app.factor.quality (6 factors)")
 from vortex.factor.cashflow import FCFYield, OCFtoOP, FCF_TTM, OCF3YPositive
 print("  ✓ app.factor.cashflow (4 factors)")
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 print("  ✓ app.core.datastore")
 
 from vortex.core.factorhub import FactorHub

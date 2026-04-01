@@ -334,7 +334,7 @@ def main():
     cfg = Settings()
     cfg.validate()
 
-    from vortex.core.datastore import DataStore
+    from vortex.core.data.datastore import DataStore
     from vortex.core.factorhub import FactorHub
     from vortex.utils.date_utils import load_trade_cal
 

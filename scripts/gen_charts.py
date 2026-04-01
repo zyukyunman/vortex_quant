@@ -25,7 +25,7 @@ def run_backtest_phase():
     cfg = Settings()
     cfg.validate()
 
-    from vortex.core.datastore import DataStore
+    from vortex.core.data.datastore import DataStore
     from vortex.core.factorhub import FactorHub
     from vortex.core.signalbus import SignalBus
     from vortex.core.weight_optimizer import FixedWeightOptimizer

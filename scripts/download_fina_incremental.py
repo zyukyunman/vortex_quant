@@ -19,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from vortex.config.settings import Settings, setup_logging
 setup_logging("INFO")
 
-from vortex.core.datastore import DataStore
+from vortex.core.data.datastore import DataStore
 
 import logging
 logger = logging.getLogger(__name__)
