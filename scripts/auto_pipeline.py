@@ -213,7 +213,6 @@ def compute_optimal_weights(ic_results: dict):
 def run_backtest_comparison(ds, fh, weight_sets: dict, start: str, end: str, benchmark_codes: list = None):
     """对多组权重做回测比较"""
     from vortex.core.signalbus import SignalBus
-    from vortex.core.weight_optimizer import FixedWeightOptimizer
     from vortex.executor.backtest import BacktestEngine
     from vortex.strategy.dividend import DividendQualityFCFStrategy
 
@@ -225,8 +224,7 @@ def run_backtest_comparison(ds, fh, weight_sets: dict, start: str, end: str, ben
         logger.info("权重: %s", {k: f"{v:.2%}" for k, v in weights.items() if v > 0})
 
         bus = SignalBus(ds.data_dir)
-        optimizer = FixedWeightOptimizer(weights)
-        strategy = DividendQualityFCFStrategy(ds, fh, bus, weight_optimizer=optimizer)
+        strategy = DividendQualityFCFStrategy(ds, fh, bus, weights=weights)
 
         try:
             bt_result = engine.run(
@@ -479,8 +477,7 @@ def main():
             logger.info("多段回测 [%s]: %s ~ %s", seg_name, seg_start, bt_end)
             try:
                 bus_seg = SignalBus(cfg.data_dir)
-                opt_seg = FixedWeightOptimizer(final_w)
-                strat_seg = DividendQualityFCFStrategy(ds, fh, bus_seg, weight_optimizer=opt_seg)
+                strat_seg = DividendQualityFCFStrategy(ds, fh, bus_seg, weights=final_w)
                 engine_seg = BacktestEngine(ds)
                 seg_result = engine_seg.run(
                     strat_seg, seg_start, bt_end, freq="M",
@@ -506,8 +503,7 @@ def main():
         final_weights = DEFAULT_WEIGHTS
 
     bus = SignalBus(cfg.data_dir)
-    optimizer = FixedWeightOptimizer(final_weights)
-    strategy = DividendQualityFCFStrategy(ds, fh, bus, weight_optimizer=optimizer)
+    strategy = DividendQualityFCFStrategy(ds, fh, bus, weights=final_weights)
 
     latest_selection = None
     try:

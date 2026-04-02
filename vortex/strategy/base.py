@@ -16,6 +16,7 @@ from typing import List
 from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
+from vortex.evaluation.spec import EvalSpec
 from vortex.models import Signal, SelectionResult
 
 logger = logging.getLogger(__name__)
@@ -66,3 +67,12 @@ class BaseStrategy(ABC):
         )
 
         return result
+
+    def eval_specs(self) -> List[EvalSpec]:
+        """
+        返回该策略使用的所有因子的评测规格。
+
+        子类应重写此方法, 在列表中声明每个因子的 role / threshold / data_source,
+        供 EvalPipeline 自动评测。默认返回空列表。
+        """
+        return []

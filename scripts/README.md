@@ -34,29 +34,31 @@ python scripts/run_sync.py --start-year 2017       # 指定起始年份
 
 | 脚本 | 用途 |
 |------|------|
-| `run_strategy.py` | 单次选股执行，输出持仓信号 |
+| `run_strategy.py` | 单次选股执行，优先读取 `data/reports/strategy_weights_config.json` |
 
 ```bash
 python scripts/run_strategy.py                     # 最近一个交易日
 python scripts/run_strategy.py --date 20260327     # 指定日期
 python scripts/run_strategy.py --top 20            # 选 Top 20
-python scripts/run_strategy.py --weight-method ic  # IC 加权
+python scripts/run_strategy.py --weights-file data/reports/strategy_weights_config.json
 ```
 
 ### 回测
 
 | 脚本 | 用途 |
 |------|------|
-| `run_backtest_full.py` | 多段 + 全量回测，生成 HTML 报告 (含基准对比) |
-| `run_backtest_sa.py` | 敏感性分析回测 (2023-2026 半年调仓) |
+| `run_backtest_full.py` | 多段 + 全量回测，生成 HTML 报告 (含基准对比)，支持读取研究产出的配置 |
+| `run_backtest_sa.py` | 单次回测并生成 HTML 报告，支持读取研究产出的配置 |
 
 ```bash
-python scripts/run_backtest_full.py                # 全量 2017~now
-python scripts/run_backtest_full.py --freq Q       # 季度调仓
-python scripts/run_backtest_full.py --start 20190101
+python scripts/run_backtest_full.py
+python scripts/run_backtest_full.py --config data/reports/strategy_weights_config.json
+python scripts/run_backtest_full.py --config data/reports/strategy_weights_config.json --freq Q
+python scripts/run_backtest_full.py --no-config --start 20190101
 
-python scripts/run_backtest_sa.py                  # 默认 2023-2026 SA
-python scripts/run_backtest_sa.py --start 20200101 --end 20260328 --freq Q
+python scripts/run_backtest_sa.py
+python scripts/run_backtest_sa.py --config data/reports/strategy_weights_config.json
+python scripts/run_backtest_sa.py --config data/reports/strategy_weights_config.json --start 20200101 --end 20260328 --freq Q
 ```
 
 ### 因子研究

@@ -22,11 +22,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from vortex.core.weight_optimizer import (
-    FixedWeightOptimizer,
-    ICWeightOptimizer,
-    WeightOptimizer,
-)
+from vortex.evaluation.spec import EvalSpec, FactorRole
 from vortex.factor.base import zscore
 from vortex.models import SelectionResult, Signal
 from vortex.strategy.base import BaseStrategy
@@ -120,13 +116,81 @@ class DividendQualityFCFStrategy(BaseStrategy):
     )
 
     def __init__(self, ds, fh, bus,
-                 weight_optimizer: Optional[WeightOptimizer] = None,
+                 weights: Optional[Dict[str, float]] = None,
                  strategy_config=None):
         super().__init__(ds, fh, bus)
         # 策略配置: 优先用显式传入的 strategy_config, 否则从 ds.cfg 读取 (向后兼容)
         self.scfg = strategy_config or ds.cfg
         self.pipeline = build_filter_pipeline(self.scfg)
-        self.weight_optimizer = weight_optimizer or FixedWeightOptimizer(DEFAULT_WEIGHTS)
+        # 权重在研究阶段由 WeightTuner 确定, 运行阶段只用固定权重
+        self.weights = weights or DEFAULT_WEIGHTS.copy()
+
+    # ------------------------------------------------------------------
+    #  eval_specs: 声明策略使用的全部因子及其评测规格
+    # ------------------------------------------------------------------
+    def eval_specs(self) -> list[EvalSpec]:
+        cfg = self.scfg
+        specs = [
+            # ---- 打分因子 (SCORING) ----
+            EvalSpec("dividend_yield", FactorRole.SCORING,
+                     factor_family="dividend",
+                     data_source="dividend.cash_div_tax(实施,按完整年度汇总) / daily.close",
+                     description="静态股息率(最近完整年度)"),
+            EvalSpec("fcf_yield", FactorRole.SCORING,
+                     factor_family="quality",
+                     data_source="cashflow.free_cashflow 或 (n_cashflow_act-capex) / EV",
+                     description="自由现金流收益率 FCF/EV"),
+            EvalSpec("roe_ttm", FactorRole.SCORING,
+                     factor_family="quality",
+                     data_source="fina_indicator.roe (最近完整年报, 兼容旧因子名 roe_ttm)",
+                     description="最新年报 ROE"),
+            EvalSpec("delta_roe", FactorRole.SCORING,
+                     factor_family="quality",
+                     data_source="fina_indicator.roe 按最近两年年报差分",
+                     description="年报 ROE 同比变化"),
+            EvalSpec("opcfd", FactorRole.SCORING,
+                     factor_family="quality",
+                     data_source="cashflow.n_cashflow_act / balancesheet.total_liab",
+                     description="经营现金流/总负债"),
+            EvalSpec("ep", FactorRole.SCORING,
+                     factor_family="value",
+                     data_source="valuation.pe_ttm 取倒数", description="盈利收益率 E/P"),
+            # ---- 过滤因子 (FILTER) ----
+            EvalSpec("consecutive_div_years", FactorRole.FILTER,
+                     factor_family="dividend",
+                     threshold=cfg.min_consecutive_dividend_years, threshold_op=">=",
+                     data_source="dividend(实施) 按年份统计", description="连续分红年数"),
+            EvalSpec("fcf_ttm", FactorRole.FILTER,
+                     factor_family="cashflow",
+                     threshold=0, threshold_op=">",
+                     data_source="cashflow.free_cashflow 或 (n_cashflow_act-capex)",
+                     description="最近完整年报自由现金流>0"),
+            EvalSpec("payout_ratio_3y", FactorRole.FILTER,
+                     factor_family="dividend",
+                     threshold=cfg.payout_ratio_range[0], threshold_op=">=",
+                     data_source="dividend.cash_div_tax×base_share / income.n_income_attr_p (三年平均)",
+                     description="三年平均股利支付率"),
+            EvalSpec("netprofit_yoy", FactorRole.FILTER,
+                     factor_family="growth",
+                     threshold=-10, threshold_op=">=",
+                     data_source="fina_indicator.profit_dedt 同比, 缺失时退化为 netprofit_yoy",
+                     description="扣非净利润同比≥-10%"),
+            # ---- 风险因子 (RISK) ----
+            EvalSpec("debt_to_assets", FactorRole.RISK,
+                     factor_family="risk",
+                     threshold=70, threshold_op="<=",
+                     data_source="fina_indicator.debt_to_assets",
+                     description="资产负债率(观察杠杆尾部风险)"),
+            EvalSpec("roe_stability", FactorRole.RISK,
+                     factor_family="quality",
+                     data_source="fina_indicator.roe 序列标准差(优先季度, 当前库退化年度)",
+                     description="ROE稳定性(越小越好)"),
+            EvalSpec("dividend_yield_3y", FactorRole.RISK,
+                     factor_family="dividend",
+                     data_source="dividend.cash_div_tax(实施,按年度汇总) / daily.close",
+                     description="三年平均静态股息率(观察尾部风险)"),
+        ]
+        return specs
 
     def generate(self, date: str) -> SelectionResult:
         # ============================================================
@@ -176,14 +240,17 @@ class DividendQualityFCFStrategy(BaseStrategy):
             )
 
         # ============================================================
-        #  Step 6: 多因子打分 (权重由 optimizer 决定)
+        #  Step 6: 多因子打分 (固定权重, 研究阶段已确定)
         # ============================================================
-        self.logger.info("Step 6: 多因子打分 (optimizer=%s)...", self.weight_optimizer.name)
-
         pool_list = sorted(stock_pool)
 
-        # 获取因子权重
-        weights_map = self.weight_optimizer.optimize(SCORING_FACTORS, date)
+        # 归一化权重
+        raw_w = {f: self.weights.get(f, 0.0) for f in SCORING_FACTORS}
+        w_sum = sum(raw_w.values())
+        weights_map = {f: w / w_sum for f, w in raw_w.items()} if w_sum > 0 else {
+            f: 1.0 / len(SCORING_FACTORS) for f in SCORING_FACTORS
+        }
+        self.logger.info("Step 6: 多因子打分 (固定权重)...")
         self.logger.info("因子权重: %s", {k: f"{v:.2%}" for k, v in weights_map.items()})
 
         # 构建打分矩阵
@@ -243,7 +310,7 @@ class DividendQualityFCFStrategy(BaseStrategy):
             top_n=top_n,
             metadata={
                 "score_weights": weights_map,
-                "weight_method": self.weight_optimizer.name,
+                "weight_method": "fixed",
                 "filter_trace": filter_trace,
                 "filters": {
                     "min_dividend_yield": self.scfg.dividend_sell_threshold,

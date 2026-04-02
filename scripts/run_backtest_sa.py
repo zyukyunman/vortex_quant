@@ -5,7 +5,8 @@ run_backtest_sa.py
 
 用法:
   python scripts/run_backtest_sa.py
-  python scripts/run_backtest_sa.py --start 20200101 --end 20260328 --freq Q
+  python scripts/run_backtest_sa.py --config data/reports/strategy_weights_config.json
+  python scripts/run_backtest_sa.py --config data/reports/strategy_weights_config.json --start 20200101 --end 20260328 --freq Q
 """
 from __future__ import annotations
 
@@ -17,16 +18,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from vortex.config.settings import Settings, setup_logging
+from vortex.config.settings import Settings, StrategyConfig, setup_logging
 
 setup_logging("INFO")
 
 from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
-from vortex.core.weight_optimizer import FixedWeightOptimizer
 from vortex.executor.backtest import BacktestEngine
-from vortex.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
+from vortex.strategy.dividend import DividendQualityFCFStrategy
+from vortex.utils.runtime_config import resolve_backtest_runtime_config
 
 
 # ================================================================
@@ -378,56 +379,108 @@ new Chart(document.getElementById('yearlyChart'), {{
 
 def main():
     parser = argparse.ArgumentParser(description="QuantPilot 回测 → HTML 报告")
-    parser.add_argument("--start", default="20230101", help="回测起始日 (默认: 20230101)")
-    parser.add_argument("--end", default="20260328", help="回测结束日 (默认: 20260328)")
-    parser.add_argument("--freq", default="SA", choices=["M", "Q", "SA"], help="调仓频率 M/Q/SA (默认: SA)")
-    parser.add_argument("--top-n", type=int, default=30, help="选股数量 (默认: 30)")
+    parser.add_argument("--start", default=None, help="回测起始日 YYYYMMDD")
+    parser.add_argument("--end", default=None, help="回测结束日 YYYYMMDD")
+    parser.add_argument("--freq", default=None, choices=["M", "Q", "SA"], help="调仓频率 M/Q/SA")
+    parser.add_argument("--top-n", type=int, default=None, help="选股数量")
+    parser.add_argument(
+        "--config", default=None,
+        help="读取研究阶段产出的配置 JSON (如 data/reports/strategy_weights_config.json)",
+    )
+    parser.add_argument(
+        "--no-config", action="store_true",
+        help="忽略 data/reports/strategy_weights_config.json，使用脚本默认参数和默认权重",
+    )
     args = parser.parse_args()
 
     cfg = Settings()
     cfg.validate()
+    runtime = resolve_backtest_runtime_config(
+        cfg,
+        default_start="20230101",
+        default_end="20260328",
+        default_freq="SA",
+        default_top_n=30,
+        config_path=args.config,
+        use_config=not args.no_config,
+        prefer_run_config=args.config is not None,
+        start=args.start,
+        end=args.end,
+        freq=args.freq,
+        top_n=args.top_n,
+    )
+
     ds = DataStore(cfg)
     fh = FactorHub(ds)
     fh.register_all_defaults()
 
-    freq_cn = FREQ_LABEL.get(args.freq, args.freq)
+    freq_cn = FREQ_LABEL.get(runtime.freq, runtime.freq)
     print("=" * 60)
-    print(f"  完整回测: {args.start[:4]}-{args.end[:4]}, {freq_cn}调仓")
-    print(f"  区间: {args.start} ~ {args.end}")
+    print(f"  完整回测: {runtime.start[:4]}-{runtime.end[:4]}, {freq_cn}调仓")
+    print(f"  区间: {runtime.start} ~ {runtime.end}")
+    if runtime.config_used:
+        print(f"  权重配置: {runtime.config_path}")
+        if runtime.used_run_config and runtime.run_config_source is not None:
+            print(f"  运行参数: {runtime.run_config_source}")
+        print(f"  权重方案: {runtime.method}")
+    else:
+        print("  权重配置: 默认固定权重")
+    active_weights = {k: f"{v:.2%}" for k, v in runtime.weights.items() if v > 0}
+    if active_weights:
+        print(f"  因子权重: {active_weights}")
     print("=" * 60)
 
     bus = SignalBus(ds.data_dir)
-    optimizer = FixedWeightOptimizer(DEFAULT_WEIGHTS)
-    strategy = DividendQualityFCFStrategy(ds, fh, bus, weight_optimizer=optimizer)
+    strategy = DividendQualityFCFStrategy(
+        ds,
+        fh,
+        bus,
+        weights=runtime.weights,
+        strategy_config=StrategyConfig(top_n=runtime.top_n),
+    )
     engine = BacktestEngine(ds)
 
     result = engine.run(
-        strategy, args.start, args.end, freq=args.freq,
+        strategy,
+        runtime.start,
+        runtime.end,
+        freq=runtime.freq,
         benchmark_codes=["000300.SH", "000905.SH", "000922.CSI"],
     )
 
     print(result.summary())
 
-    # ---- 生成 HTML 报告 ----
     report_dir = cfg.data_dir / "reports"
     report_dir.mkdir(exist_ok=True)
 
-    html = _build_html_report(result, DEFAULT_WEIGHTS, args.freq, label="红利质量FCF")
-    end_d = result.metrics.get("end_date", args.end)
-    html_file = report_dir / f"backtest_{args.freq}_{args.start}_{end_d}.html"
+    html = _build_html_report(
+        result,
+        runtime.weights,
+        runtime.freq,
+        label=f"红利质量FCF ({runtime.method})",
+    )
+    end_d = result.metrics.get("end_date", runtime.end)
+    html_file = report_dir / f"backtest_{runtime.freq}_{runtime.start}_{end_d}.html"
     html_file.write_text(html, encoding="utf-8")
     print(f"\n✅ HTML 报告: {html_file}")
     print(f"   浏览器打开: file://{html_file.resolve()}")
 
-    # ---- 也保存 JSON ----
     result_data = {
-        "backtest": f"{args.start[:4]}-{args.end[:4]} {freq_cn}调仓",
-        "start": args.start, "end": args.end, "freq": args.freq,
+        "backtest": f"{runtime.start[:4]}-{runtime.end[:4]} {freq_cn}调仓",
+        "start": runtime.start,
+        "end": runtime.end,
+        "freq": runtime.freq,
+        "top_n": runtime.top_n,
+        "config_file": str(runtime.config_path) if runtime.config_path else None,
+        "weights_source": str(runtime.weights_source) if runtime.weights_source else None,
+        "run_config_source": str(runtime.run_config_source) if runtime.run_config_source else None,
+        "weights_method": runtime.method,
+        "weights": runtime.weights,
         "metrics": result.metrics,
         "rebalance_dates": result.rebalance_dates,
         "nav_last": float(result.nav_series.iloc[-1]) if len(result.nav_series) > 0 else None,
     }
-    json_file = report_dir / f"backtest_{args.freq}_{args.start}_{end_d}.json"
+    json_file = report_dir / f"backtest_{runtime.freq}_{runtime.start}_{end_d}.json"
     json_file.write_text(json.dumps(result_data, ensure_ascii=False, indent=2, default=str))
     print(f"   JSON 数据:  {json_file}")
 

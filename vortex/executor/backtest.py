@@ -48,6 +48,9 @@ class BacktestResult:
             f"  Sortino比率: {m.get('sortino_ratio', 0):.3f}",
             f"  最大回撤:    {m.get('max_drawdown', 0):.2%}",
             f"  最大回撤天数:{m.get('max_dd_days', 0)}",
+            f"  回撤峰值日:  {m.get('max_dd_peak_date', 'N/A')}",
+            f"  回撤谷值日:  {m.get('max_dd_trough_date', 'N/A')}",
+            f"  回撤恢复日:  {m.get('max_dd_recovery_date', 'N/A')}",
             f"  Calmar比率:  {m.get('calmar_ratio', 0):.3f}",
             f"  盈亏比:      {m.get('profit_factor', 0):.2f}",
             f"  平均换手率:  {m.get('avg_turnover', 0):.2%}",
@@ -224,7 +227,11 @@ class BacktestEngine:
 
         # 计算绩效指标
         metrics = self._calc_metrics(
-            nav_series, returns_series, rebalance_dates, turnovers,
+            nav_series,
+            returns_series,
+            rebalance_dates,
+            turnovers,
+            initial_capital=initial_capital,
         )
 
         # 加载基准收益率
@@ -341,12 +348,16 @@ class BacktestEngine:
         returns: pd.Series,
         rebalance_dates: List[str],
         turnovers: List[float],
+        initial_capital: Optional[float] = None,
     ) -> Dict:
         """计算绩效指标"""
         if len(nav) < 2:
             return {}
 
-        total_return = nav.iloc[-1] / nav.iloc[0] - 1
+        base_capital = float(initial_capital) if initial_capital and initial_capital > 0 else float(nav.iloc[0])
+        start_nav = float(nav.iloc[0])
+        end_nav = float(nav.iloc[-1])
+        total_return = end_nav / base_capital - 1
         n_days = len(nav)
         annual_return = (1 + total_return) ** (252 / max(n_days, 1)) - 1
 
@@ -365,6 +376,19 @@ class BacktestEngine:
         cummax = nav.cummax()
         drawdown = (cummax - nav) / cummax
         max_dd = drawdown.max()
+
+        max_dd_peak_date = nav.index[0]
+        max_dd_trough_date = nav.index[0]
+        max_dd_recovery_date = nav.index[0]
+        if max_dd > 0:
+            max_dd_trough_date = drawdown.idxmax()
+            max_dd_peak_date = nav.loc[:max_dd_trough_date].idxmax()
+            peak_nav = float(nav.loc[max_dd_peak_date])
+            max_dd_recovery_date = None
+            for idx, nav_val in nav.loc[max_dd_trough_date:].items():
+                if float(nav_val) >= peak_nav:
+                    max_dd_recovery_date = idx
+                    break
 
         # 回撤持续天数: 从回撤开始到恢复(或截止)的最长期间
         max_dd_days = 0
@@ -390,6 +414,9 @@ class BacktestEngine:
         return {
             "start_date": nav.index[0] if len(nav) > 0 else "N/A",
             "end_date": nav.index[-1] if len(nav) > 0 else "N/A",
+            "initial_capital": base_capital,
+            "start_nav": start_nav,
+            "end_nav": end_nav,
             "n_rebalance": len(rebalance_dates),
             "total_return": total_return,
             "annual_return": annual_return,
@@ -398,6 +425,9 @@ class BacktestEngine:
             "sortino_ratio": sortino,
             "max_drawdown": max_dd,
             "max_dd_days": max_dd_days,
+            "max_dd_peak_date": max_dd_peak_date,
+            "max_dd_trough_date": max_dd_trough_date,
+            "max_dd_recovery_date": max_dd_recovery_date,
             "calmar_ratio": calmar,
             "profit_factor": profit_factor,
             "avg_turnover": np.mean(turnovers) if turnovers else 0,

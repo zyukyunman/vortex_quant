@@ -21,6 +21,9 @@ class TestBacktestResult:
                 "annual_volatility": 0.15,
                 "sharpe_ratio": 0.67,
                 "max_drawdown": 0.05,
+                "max_dd_peak_date": "20250115",
+                "max_dd_trough_date": "20250210",
+                "max_dd_recovery_date": "20250305",
                 "calmar_ratio": 2.0,
                 "avg_turnover": 0.3,
                 "win_rate": 0.55,
@@ -55,6 +58,9 @@ class TestBacktestEngineMetrics:
         assert "total_return" in metrics
         assert "sharpe_ratio" in metrics
         assert "max_drawdown" in metrics
+        assert "max_dd_peak_date" in metrics
+        assert "max_dd_trough_date" in metrics
+        assert "max_dd_recovery_date" in metrics
         assert "sortino_ratio" in metrics
         assert "profit_factor" in metrics
         assert "max_dd_days" in metrics
@@ -70,3 +76,18 @@ class TestBacktestEngineMetrics:
         turnover = BacktestEngine._calc_turnover(old, new)
         # |0.3-0.5| + |0-0.5| + |0.7-0| = 0.2 + 0.5 + 0.7 = 1.4 / 2 = 0.7
         assert abs(turnover - 0.7) < 1e-6
+
+    def test_calc_metrics_use_initial_capital_base(self):
+        nav = pd.Series([900000, 1000000, 1100000])
+        returns = pd.Series([0, 0.1111111111, 0.1])
+        metrics = BacktestEngine._calc_metrics(
+            nav,
+            returns,
+            ["20250131"],
+            [0.2],
+            initial_capital=1_000_000,
+        )
+        assert metrics["initial_capital"] == pytest.approx(1_000_000)
+        assert metrics["start_nav"] == pytest.approx(900000)
+        assert metrics["end_nav"] == pytest.approx(1100000)
+        assert metrics["total_return"] == pytest.approx(0.10, abs=1e-6)

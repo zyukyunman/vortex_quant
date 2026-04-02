@@ -135,7 +135,7 @@ def _plot_nav_curves(bt_results: Dict, save_path: Path):
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
     fig.autofmt_xdate()
     fig.tight_layout()
-    fig.savefig(save_path)
+    fig.savefig(str(save_path))
     plt.close(fig)
     logger.info("净值曲线图: %s", save_path)
 
@@ -176,7 +176,7 @@ def _plot_drawdown(result, label: str, save_path: Path):
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     fig.autofmt_xdate()
     fig.tight_layout()
-    fig.savefig(save_path)
+    fig.savefig(str(save_path))
     plt.close(fig)
     logger.info("回撤图: %s", save_path)
 
@@ -217,7 +217,7 @@ def _plot_monthly_heatmap(result, label: str, save_path: Path):
     ax.set_title(f"{label} — 月度收益率 (%)", fontsize=14, fontweight="bold")
     fig.colorbar(im, ax=ax, shrink=0.8, label="%")
     fig.tight_layout()
-    fig.savefig(save_path)
+    fig.savefig(str(save_path))
     plt.close(fig)
     logger.info("月度收益热力图: %s", save_path)
 
@@ -236,7 +236,7 @@ def _plot_weight_pie(weights: Dict[str, float], save_path: Path):
     name_map = {
         "dividend_yield": "股息率",
         "fcf_yield": "自由现金流收益率",
-        "roe_ttm": "ROE (TTM)",
+        "roe_ttm": "ROE",
         "delta_roe": "ROE变化",
         "opcfd": "经营现金流/负债",
         "ep": "E/P (盈利收益率)",
@@ -245,7 +245,7 @@ def _plot_weight_pie(weights: Dict[str, float], save_path: Path):
 
     colors = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948"]
     fig, ax = plt.subplots(figsize=(7, 7))
-    wedges, texts = ax.pie(
+    ax.pie(
         values,
         labels=display_labels,
         colors=colors[:len(values)],
@@ -254,12 +254,12 @@ def _plot_weight_pie(weights: Dict[str, float], save_path: Path):
     )
     ax.set_title("因子权重分布", fontsize=14, fontweight="bold")
     fig.tight_layout()
-    fig.savefig(save_path)
+    fig.savefig(str(save_path))
     plt.close(fig)
     logger.info("权重饼图: %s", save_path)
 
 
-def _plot_dashboard(bt_results: Dict, weights: Dict, best_label: str, save_path: Path):
+def _plot_dashboard(bt_results: Dict, weights: Dict, best_label: Optional[str], save_path: Path):
     """综合仪表盘 — 四合一大图"""
     fig = plt.figure(figsize=(16, 10))
 
@@ -346,7 +346,7 @@ def _plot_dashboard(bt_results: Dict, weights: Dict, best_label: str, save_path:
             "fcf_yield": "FCF收益率",
             "roe_ttm": "ROE",
             "delta_roe": "ΔROE",
-            "opcfd": "OPCFD",
+            "opcfd": "经营现金流/负债",
             "ep": "E/P",
         }
         labels = [name_map.get(k, k) for k in w]
@@ -359,6 +359,6 @@ def _plot_dashboard(bt_results: Dict, weights: Dict, best_label: str, save_path:
         ax4.set_title("因子权重", fontsize=12, fontweight="bold")
 
     fig.suptitle("QuantPilot 回测仪表盘", fontsize=16, fontweight="bold", y=0.98)
-    fig.savefig(save_path)
+    fig.savefig(str(save_path))
     plt.close(fig)
     logger.info("综合仪表盘: %s", save_path)

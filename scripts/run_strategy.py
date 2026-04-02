@@ -30,15 +30,8 @@ from vortex.config.settings import Settings, setup_logging
 from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
-from vortex.core.weight_optimizer import (
-    EqualWeightOptimizer,
-    FixedWeightOptimizer,
-    ICIRWeightOptimizer,
-    ICWeightOptimizer,
-)
 from vortex.strategy.dividend import (
     DEFAULT_WEIGHTS,
-    SCORING_FACTORS,
     DividendQualityFCFStrategy,
 )
 from vortex.utils.date_utils import get_recent_trade_dates, today_str
@@ -55,13 +48,8 @@ def parse_args():
         help="选股数量 (默认: 配置文件的 top_n=30)",
     )
     parser.add_argument(
-        "--weight-method", type=str, default="fixed",
-        choices=["fixed", "equal", "ic", "ic_ir"],
-        help="因子权重方法: fixed(固定), equal(等权), ic(IC加权), ic_ir(IC_IR加权)",
-    )
-    parser.add_argument(
-        "--ic-report", action="store_true",
-        help="生成 IC 诊断报告 (需要足够历史数据)",
+        "--weights-file", type=str, default=None,
+        help="加载研究阶段产出的权重配置 JSON (默认: data/reports/strategy_weights_config.json)",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
@@ -102,38 +90,40 @@ def main():
             # 降级: 直接用今天
             run_date = today_str()
 
-    # ---- 构建权重优化器 ----
-    weight_method = args.weight_method
-    if weight_method == "fixed":
-        optimizer = FixedWeightOptimizer(DEFAULT_WEIGHTS)
-    elif weight_method == "equal":
-        optimizer = EqualWeightOptimizer()
-    elif weight_method == "ic":
-        optimizer = ICWeightOptimizer(
-            ds, fh,
-            lookback_months=12,
-            min_periods=6,
-            fallback=FixedWeightOptimizer(DEFAULT_WEIGHTS),
-        )
-    elif weight_method == "ic_ir":
-        optimizer = ICIRWeightOptimizer(
-            ds, fh,
-            lookback_months=12,
-            min_periods=6,
-            fallback=FixedWeightOptimizer(DEFAULT_WEIGHTS),
-        )
-    else:
-        optimizer = FixedWeightOptimizer(DEFAULT_WEIGHTS)
-
+    # ---- 加载权重 (研究阶段已确定) ----
     print("\n" + "=" * 60)
     print("  QuantPilot — 红利质量现金流复合策略")
     print(f"  选股日期: {run_date}")
     print(f"  目标数量: Top {cfg.top_n}")
-    print(f"  权重方法: {weight_method}")
+
+    default_cfg = cfg.data_dir / "reports" / "strategy_weights_config.json"
+    fallback_weights = cfg.data_dir / "reports" / "weights_optimal.json"
+
+    weights_file = Path(args.weights_file) if args.weights_file else default_cfg
+    if weights_file.exists():
+        import json
+        saved = json.loads(weights_file.read_text(encoding="utf-8"))
+        # 兼容两种格式:
+        # 1) strategy_weights_config.json (推荐)
+        # 2) weights_optimal.json
+        weights = saved.get("weights", DEFAULT_WEIGHTS)
+        weight_label = saved.get("method", "configured")
+        print(f"  加载权重: {weights_file.name} ({weight_label})")
+    elif fallback_weights.exists():
+        import json
+        saved = json.loads(fallback_weights.read_text(encoding="utf-8"))
+        weights = saved.get("weights", DEFAULT_WEIGHTS)
+        weight_label = saved.get("method", "optimal")
+        print(f"  加载权重: {fallback_weights.name} ({weight_label})")
+    else:
+        weights = DEFAULT_WEIGHTS.copy()
+        weight_label = "default"
+        print("  权重: 默认固定权重")
+
     print("=" * 60)
 
     # ---- 执行策略 ----
-    strategy = DividendQualityFCFStrategy(ds, fh, bus, weight_optimizer=optimizer)
+    strategy = DividendQualityFCFStrategy(ds, fh, bus, weights=weights)
     result = strategy.run(run_date)
 
     # ---- 信号持久化 ----
@@ -179,12 +169,6 @@ def main():
     print("\n" + "=" * 60)
     print("  完成! 信号已保存到 data/signal/ 目录")
     print("=" * 60)
-
-    # ---- IC 诊断报告 ----
-    if args.ic_report and isinstance(optimizer, (ICWeightOptimizer, ICIRWeightOptimizer)):
-        print("\n📈 IC 诊断报告:")
-        ic_df = optimizer.get_ic_report(SCORING_FACTORS, run_date)
-        print(ic_df.to_string(index=False))
 
 
 if __name__ == "__main__":

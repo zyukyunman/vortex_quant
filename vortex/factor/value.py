@@ -12,7 +12,7 @@ value.py
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,61 @@ import pandas as pd
 from vortex.factor.base import BaseFactor, get_latest_annual_period, get_latest_n_annual_periods
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_implemented_dividend_rows(df_div: pd.DataFrame) -> pd.DataFrame:
+    """仅保留已实施分红记录。"""
+    if df_div.empty:
+        return df_div
+    if "div_proc" not in df_div.columns:
+        return df_div.copy()
+    mask = df_div["div_proc"].astype(str).str.contains("实施", na=False)
+    return cast(pd.DataFrame, df_div.loc[mask].copy())
+
+
+def _get_dividend_cash_field(df_div: pd.DataFrame) -> str:
+    """优先使用税前每股分红口径。"""
+    return "cash_div_tax" if "cash_div_tax" in df_div.columns else "cash_div"
+
+
+def _sum_year_dividend_per_share(df_div: pd.DataFrame, year: int) -> pd.Series:
+    """按自然年汇总每股现金分红，覆盖年报/中报/季报实施分红。"""
+    if df_div.empty or "end_date" not in df_div.columns:
+        return pd.Series(dtype=float)
+
+    cash_field = _get_dividend_cash_field(df_div)
+    if cash_field not in df_div.columns:
+        return pd.Series(dtype=float)
+
+    df_year = df_div[df_div["end_date"].astype(str).str.startswith(str(year))].copy()
+    if df_year.empty:
+        return pd.Series(dtype=float)
+
+    result = df_year.groupby("ts_code")[cash_field].sum()
+    return result.dropna()
+
+
+def _sum_year_dividend_cash_total(df_div: pd.DataFrame, year: int) -> pd.Series:
+    """按自然年汇总现金分红总额(元)。"""
+    if df_div.empty or "end_date" not in df_div.columns or "base_share" not in df_div.columns:
+        return pd.Series(dtype=float)
+
+    cash_field = _get_dividend_cash_field(df_div)
+    if cash_field not in df_div.columns:
+        return pd.Series(dtype=float)
+
+    df_year = df_div[df_div["end_date"].astype(str).str.startswith(str(year))].copy()
+    if df_year.empty:
+        return pd.Series(dtype=float)
+
+    df_year = df_year[df_year["base_share"].notna() & df_year[cash_field].notna()]
+    if df_year.empty:
+        return pd.Series(dtype=float)
+
+    # base_share 单位为万股，乘 10000 转为股，再乘每股分红得到元。
+    total_cash = df_year[cash_field].astype(float) * df_year["base_share"].astype(float) * 10000.0
+    result = total_cash.groupby(df_year["ts_code"]).sum()
+    return result.dropna()
 
 
 class DividendYield(BaseFactor):
@@ -39,25 +94,19 @@ class DividendYield(BaseFactor):
     def compute(self, ds, date: str) -> pd.Series:
         # 1) 确定最新年报期
         latest_period = get_latest_annual_period(date)
+        latest_year = int(latest_period[:4])
         logger.debug("dividend_yield: 基准年报期=%s", latest_period)
 
-        # 2) 读取分红数据，按年度汇总每股现金分红
+        # 2) 读取分红数据，按自然年汇总已实施分红（含中报/季报）
         df_div = ds.get_dividend()
         if df_div.empty:
             return pd.Series(dtype=float, name=self.name)
 
-        # 只取已实施的分红(div_proc 包含 '实施')
-        if "div_proc" in df_div.columns:
-            df_div = df_div[df_div["div_proc"].str.contains("实施", na=False)]
-
-        # 只取对应年度
-        df_year = df_div[df_div["end_date"] == latest_period].copy()
-        if df_year.empty:
-            logger.warning("dividend_yield: 年度 %s 无分红数据", latest_period)
+        df_div = _filter_implemented_dividend_rows(df_div)
+        cash_per_share = _sum_year_dividend_per_share(df_div, latest_year)
+        if cash_per_share.empty:
+            logger.warning("dividend_yield: 年度 %s 无实施分红数据", latest_period)
             return pd.Series(dtype=float, name=self.name)
-
-        # 每股现金分红(税前)，同一股票同一年度可能多次分红，汇总
-        cash_per_share = df_year.groupby("ts_code")["cash_div"].sum()
 
         # 3) 读取当前股价
         df_daily = ds.get_daily(trade_date=date)
@@ -91,15 +140,15 @@ class DividendYield3Y(BaseFactor):
         if df_div.empty:
             return pd.Series(dtype=float, name=self.name)
 
-        if "div_proc" in df_div.columns:
-            df_div = df_div[df_div["div_proc"].str.contains("实施", na=False)]
+        df_div = _filter_implemented_dividend_rows(df_div)
 
-        # 每年度每股现金分红
+        # 每个自然年度汇总每股现金分红
         yearly_div = {}
         for period in periods:
-            df_y = df_div[df_div["end_date"] == period]
-            if not df_y.empty:
-                yearly_div[period] = df_y.groupby("ts_code")["cash_div"].sum()
+            year = int(period[:4])
+            div_y = _sum_year_dividend_per_share(df_div, year)
+            if not div_y.empty:
+                yearly_div[str(year)] = div_y
 
         if not yearly_div:
             return pd.Series(dtype=float, name=self.name)
@@ -124,7 +173,7 @@ class PayoutRatio3Y(BaseFactor):
     """
     过去三年平均股利支付率 (932315 门槛: 10%~100%)
 
-    = 每股现金分红 / 每股收益 (近似)
+    = 过去三年已实施现金分红总额 / 归母净利润 的年度均值
     """
     name = "payout_ratio_3y"
     category = "value"
@@ -134,63 +183,46 @@ class PayoutRatio3Y(BaseFactor):
     def compute(self, ds, date: str) -> pd.Series:
         periods = get_latest_n_annual_periods(date, n=3)
         df_div = ds.get_dividend()
-        df_fina = ds.get_fina_indicator()
-
-        if df_div.empty or df_fina.empty:
-            return pd.Series(dtype=float, name=self.name)
-
-        if "div_proc" in df_div.columns:
-            df_div = df_div[df_div["div_proc"].str.contains("实施", na=False)]
-
-        ratios = []
-        for period in periods:
-            div_y = df_div[df_div["end_date"] == period].groupby("ts_code")["cash_div"].sum()
-            # profit_dedt = 扣非净利润(每股)在 fina_indicator 中
-            # 简化: 使用 ROE 作为盈利能力代理，这里用 EPS 近似
-            # 实际 payout = 每股分红 / EPS
-            # Tushare daily_basic 有 EPS 但我们用 dv_ratio / pe_ttm 来近似
-            # 或者直接用 cash_div 和 income 数据
-            fina_y = df_fina[df_fina["end_date"] == period]
-            if not fina_y.empty and "ocfps" in fina_y.columns:
-                # 这里用 cfps (每股现金流) 做分母的近似并不准确
-                # 更好的方式: 从 income 表取 EPS
-                pass
-            ratios.append(div_y)
-
-        if not ratios:
-            return pd.Series(dtype=float, name=self.name)
-
-        # 读取利润表获取 EPS (净利润/总股本)
         df_income = ds.get_income()
-        df_basic = ds.get_stock_basic()
-        # 用 total_mv / close 估算总股本 (粗略)
-        # 更好: 直接计算 每股分红总额 / 归母净利润
-        # 简化版: 三年平均分红 / 三年平均归母净利润(每股)
-        yearly_payout = []
+
+        if df_div.empty or df_income.empty:
+            return pd.Series(dtype=float, name=self.name)
+
+        df_div = _filter_implemented_dividend_rows(df_div)
+        yearly_ratios = []
+
         for period in periods:
-            div_y = df_div[df_div["end_date"] == period].groupby("ts_code")["cash_div"].sum()
-            inc_y = df_income[df_income["end_date"] == period]
-            if not inc_y.empty and "n_income_attr_p" in inc_y.columns:
-                # n_income_attr_p 是归母净利润 (万元)
-                # cash_div 是每股分红(元)，这里单位不一致
-                # 需要总股本来转换... 先用 dv_ratio / pe_ttm 近似
-                pass
-            yearly_payout.append(div_y)
+            year = int(period[:4])
+            div_total = _sum_year_dividend_cash_total(df_div, year)
+            if div_total.empty:
+                continue
 
-        # 降级方案: 从 daily_basic 直接算
-        # payout ≈ dv_ratio * pe_ttm / 100 (如果两者都是百分比...)
-        # 实际: dv_ratio(%) = cash_div / close * 100, pe = close / eps
-        # → dv_ratio / 100 * pe = (cash_div/close) * (close/eps) = cash_div / eps = payout ratio
-        df_val = ds.get_valuation(trade_date=date)
-        if not df_val.empty and "dv_ratio" in df_val.columns and "pe_ttm" in df_val.columns:
-            df_val = df_val.set_index("ts_code")
-            # pe_ttm 可能为负(亏损)，排除
-            mask = (df_val["pe_ttm"] > 0) & (df_val["dv_ratio"] > 0)
-            payout = (df_val.loc[mask, "dv_ratio"] / 100) * df_val.loc[mask, "pe_ttm"]
-            payout.name = self.name
-            return payout.dropna()
+            inc_y = (
+                df_income[df_income["end_date"] == period]
+                .drop_duplicates("ts_code", keep="first")
+                .set_index("ts_code")
+            )
+            if "n_income_attr_p" not in inc_y.columns:
+                continue
 
-        return pd.Series(dtype=float, name=self.name)
+            income = inc_y["n_income_attr_p"].dropna()
+            common = div_total.index.intersection(income.index)
+            if len(common) == 0:
+                continue
+
+            div_common = div_total.reindex(common)
+            income_common = income.reindex(common)
+            mask = income_common > 0
+            if mask.any():
+                yearly_ratios.append((div_common[mask] / income_common[mask]).rename(period))
+
+        if not yearly_ratios:
+            return pd.Series(dtype=float, name=self.name)
+
+        ratio_df = pd.concat(yearly_ratios, axis=1)
+        result = ratio_df.mean(axis=1, skipna=True).replace([np.inf, -np.inf], np.nan).dropna()
+        result.name = self.name
+        return result
 
 
 class EP(BaseFactor):

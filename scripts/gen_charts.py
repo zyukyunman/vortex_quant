@@ -28,7 +28,6 @@ def run_backtest_phase():
     from vortex.core.data.datastore import DataStore
     from vortex.core.factorhub import FactorHub
     from vortex.core.signalbus import SignalBus
-    from vortex.core.weight_optimizer import FixedWeightOptimizer
     from vortex.executor.backtest import BacktestEngine
     from vortex.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
     from vortex.utils.date_utils import get_recent_trade_dates, load_trade_cal, today_str
@@ -62,8 +61,7 @@ def run_backtest_phase():
     for label, weights in weight_sets.items():
         print(f"回测: {label}", flush=True)
         bus = SignalBus(cfg.data_dir)
-        optimizer = FixedWeightOptimizer(weights)
-        strat = DividendQualityFCFStrategy(ds, fh, bus, weight_optimizer=optimizer)
+        strat = DividendQualityFCFStrategy(ds, fh, bus, weights=weights)
         result = engine.run(strat, bt_start, bt_end, freq="M")
         all_data[label] = {
             "nav": {k: float(v) for k, v in result.nav_series.items()},
@@ -115,7 +113,8 @@ def plot_phase(data_file: str):
     for i, (lb, rd) in enumerate(results.items()):
         nav = pd.Series(rd["nav"])
         dt = pdates(nav.index)
-        nav_n = nav / nav.iloc[0]
+        nav_base = rd["metrics"].get("initial_capital", float(nav.iloc[0]))
+        nav_n = nav / nav_base
         m = rd["metrics"]
         ax.plot(dt, nav_n, label=f"{lb} (年化{m['annual_return']:.1%}, 夏普{m['sharpe_ratio']:.2f})",
                 color=colors[i % len(colors)], linewidth=1.5)
@@ -136,7 +135,8 @@ def plot_phase(data_file: str):
     dd = (cmx - nav) / cmx
 
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(12, 6), height_ratios=[2, 1], sharex=True)
-    nav_n = nav / nav.iloc[0]
+    nav_base = results[best_label]["metrics"].get("initial_capital", float(nav.iloc[0]))
+    nav_n = nav / nav_base
     a1.plot(dates, nav_n, color="#1f77b4", linewidth=1.5)
     a1.fill_between(dates, nav_n, alpha=0.1, color="#1f77b4")
     a1.set_ylabel("归一化净值")
@@ -205,7 +205,8 @@ def plot_phase(data_file: str):
     ax1 = fig.add_subplot(gs[0, 0])
     for i, (lb, rd) in enumerate(results.items()):
         ns = pd.Series(rd["nav"])
-        ax1.plot(pdates(ns.index), ns / ns.iloc[0], label=lb, color=colors[i % len(colors)], lw=1.2)
+        nav_base = rd["metrics"].get("initial_capital", float(ns.iloc[0]))
+        ax1.plot(pdates(ns.index), ns / nav_base, label=lb, color=colors[i % len(colors)], lw=1.2)
     ax1.set_title("净值曲线", fontsize=12, fontweight="bold")
     ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))

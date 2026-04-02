@@ -3,11 +3,9 @@ scheduler.py
 调度编排 — 时间驱动的任务链
 
 调度表:
-  每交易日 06:30 — DataStore.update_daily()
-  每交易日 07:00 — FactorHub.compute_all()
-  每交易日 15:30 — StrategyRunner.run_all()
-  每交易日 15:40 — SignalBus.flush() + Notifier
-  每交易日 16:00 — RiskManager.monitor()
+  每交易日 15:35 — 日终流水线 (因子→策略→信号→通知)
+  每交易日 16:30 — 增量数据同步
+  每周六   08:00 — 全量同步检查 (补缺 + 完整性校验)
 
 实现: APScheduler CronTrigger
 """
@@ -117,10 +115,10 @@ class TaskScheduler:
 
         self._scheduler = BackgroundScheduler()
 
-        # 每交易日 06:30 增量同步数据
+        # 每交易日 16:30 增量同步数据
         self._scheduler.add_job(
             func=self._run_daily_sync,
-            trigger=CronTrigger(hour=6, minute=30, day_of_week="mon-fri"),
+            trigger=CronTrigger(hour=16, minute=30, day_of_week="mon-fri"),
             id="daily_sync",
             name="每日数据同步",
             replace_existing=True,
@@ -135,8 +133,17 @@ class TaskScheduler:
             replace_existing=True,
         )
 
+        # 每周六 08:00 全量同步检查
+        self._scheduler.add_job(
+            func=self._run_weekly_full_sync,
+            trigger=CronTrigger(hour=8, minute=0, day_of_week="sat"),
+            id="weekly_full_sync",
+            name="每周全量同步检查",
+            replace_existing=True,
+        )
+
         self._scheduler.start()
-        logger.info("调度器已启动 (06:30 数据同步, 15:35 日终流水线)")
+        logger.info("调度器已启动 (16:30 增量同步, 15:35 日终流水线, 周六08:00 全量检查)")
 
     def stop(self):
         """停止调度器"""
@@ -150,6 +157,8 @@ class TaskScheduler:
             return self.run_daily_pipeline()
         elif task_name == "daily_sync":
             return self._run_daily_sync()
+        elif task_name == "weekly_full_sync":
+            return self._run_weekly_full_sync()
         else:
             return {"error": f"未知任务: {task_name}"}
 
@@ -158,7 +167,7 @@ class TaskScheduler:
         logger.info("[DailySync] 开始每日数据同步...")
         try:
             from vortex.core.data.syncer import DataSyncer
-            syncer = DataSyncer(self.ds, start_year=2014, user_points=2000)
+            syncer = DataSyncer(self.ds, start_year=2005, user_points=5000)
             results = syncer.sync_daily()
             summary = {
                 "total": len(results),
@@ -178,6 +187,32 @@ class TaskScheduler:
             return summary
         except Exception as e:
             logger.error("[DailySync] 异常: %s", e)
+            return {"error": str(e)}
+
+    def _run_weekly_full_sync(self) -> Dict:
+        """每周六全量同步检查 — 补齐缺失数据、校验完整性"""
+        logger.info("[WeeklySync] 开始每周全量同步检查...")
+        try:
+            from vortex.core.data.syncer import DataSyncer
+            syncer = DataSyncer(self.ds, start_year=2005, user_points=5000)
+            results = syncer.sync_all()
+            summary = {
+                "total": len(results),
+                "success": sum(1 for r in results if r.status.value == "success"),
+                "skipped": sum(1 for r in results if r.status.value == "skipped"),
+                "failed": sum(1 for r in results if r.status.value == "failed"),
+            }
+            logger.info("[WeeklySync] 完成: %s", summary)
+
+            failed = [r for r in results if r.status.value == "failed"]
+            if failed and self.notifier:
+                msg = "\n".join(f"- {r.name}: {r.message[:60]}" for r in failed)
+                self.notifier.notify_risk_alert(
+                    "P2", "每周全量同步部分失败", msg,
+                )
+            return summary
+        except Exception as e:
+            logger.error("[WeeklySync] 异常: %s", e)
             return {"error": str(e)}
 
     def status(self) -> Dict:

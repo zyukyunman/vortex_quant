@@ -23,8 +23,8 @@ def generate_html(data: dict) -> str:
     for i, (label, rd) in enumerate(results.items()):
         nav = rd["nav"]
         dates = sorted(nav.keys())
-        first_val = nav[dates[0]]
-        nav_norm = [nav[d] / first_val for d in dates]
+        nav_base = rd["metrics"].get("initial_capital", nav[dates[0]])
+        nav_norm = [nav[d] / nav_base for d in dates]
         m = rd["metrics"]
         nav_datasets.append({
             "label": f'{label} (年化{m["annual_return"]*100:.1f}%, 夏普{m["sharpe_ratio"]:.2f})',

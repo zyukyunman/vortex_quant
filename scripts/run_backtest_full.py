@@ -12,9 +12,10 @@ A股历史阶段划分 (2017-2026):
   ⑥ 2024-09 ~ Now       924行情+政策转向
 
 用法:
-  python scripts/run_backtest_full.py                       # 全量 2017~now, SA
-  python scripts/run_backtest_full.py --freq Q              # 季度调仓
-  python scripts/run_backtest_full.py --start 20190101      # 自定义起始
+  python scripts/run_backtest_full.py
+  python scripts/run_backtest_full.py --config data/reports/strategy_weights_config.json
+  python scripts/run_backtest_full.py --config data/reports/strategy_weights_config.json --freq Q
+  python scripts/run_backtest_full.py --no-config --start 20190101
 """
 from __future__ import annotations
 
@@ -39,9 +40,9 @@ setup_logging("INFO")
 from vortex.core.data.datastore import DataStore
 from vortex.core.factorhub import FactorHub
 from vortex.core.signalbus import SignalBus
-from vortex.core.weight_optimizer import FixedWeightOptimizer
 from vortex.executor.backtest import BacktestEngine, BacktestResult
-from vortex.strategy.dividend import DEFAULT_WEIGHTS, DividendQualityFCFStrategy
+from vortex.strategy.dividend import DividendQualityFCFStrategy
+from vortex.utils.runtime_config import resolve_backtest_runtime_config
 
 
 # ================================================================
@@ -113,10 +114,10 @@ def build_full_report(
     bench_metrics = full_result.calc_benchmark_metrics()
     rets = full_result.returns_series
 
-    # ---- 全量净值 (归一化) ----
+    # ---- 全量净值 (以初始资金归一化) ----
     dates = sorted(nav.index.tolist())
-    first_val = nav.iloc[0]
-    nav_norm = [{"x": _fmt(d), "y": round(nav[d] / first_val, 4)} for d in dates]
+    nav_base = float(m.get("initial_capital", nav.iloc[0]))
+    nav_norm = [{"x": _fmt(d), "y": round(nav[d] / nav_base, 4)} for d in dates]
 
     # ---- 回撤 ----
     nav_arr = np.array([nav[d] for d in dates])
@@ -517,7 +518,7 @@ new Chart(document.getElementById('navChart'), {{
     interaction: {{ mode: 'index', intersect: false }},
     scales: {{
       x: {{ type: 'time', time: {{ unit: 'month', displayFormats: {{ month: 'yyyy-MM' }} }} }},
-      y: {{ title: {{ display: true, text: '净值 (归一化=1.0)' }} }}
+      y: {{ title: {{ display: true, text: '净值 (初始资金=1.0)' }} }}
     }},
     plugins: {{ tooltip: {{ callbacks: {{ label: function(ctx) {{ return ctx.dataset.label.split(' (')[0] + ': ' + ctx.parsed.y.toFixed(4); }} }} }} }}
   }}
@@ -659,108 +660,157 @@ def _build_weight_kpis(weights: dict) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="QuantPilot 多段回测 → 综合 HTML 报告")
-    parser.add_argument("--start", default="20170103", help="全量回测起始日 (默认: 20170103)")
-    parser.add_argument("--end", default=datetime.now().strftime("%Y%m%d"),
-                        help="全量回测结束日 (默认: today)")
-    parser.add_argument("--freq", default="SA", choices=["M", "Q", "SA"],
-                        help="调仓频率 (默认: SA)")
-    parser.add_argument("--top-n", type=int, default=30, help="选股数量 (默认: 30)")
+    parser.add_argument("--start", default=None, help="全量回测起始日 YYYYMMDD")
+    parser.add_argument("--end", default=None, help="全量回测结束日 YYYYMMDD")
+    parser.add_argument("--freq", default=None, choices=["M", "Q", "SA"], help="调仓频率")
+    parser.add_argument("--top-n", type=int, default=None, help="选股数量")
+    parser.add_argument(
+        "--config", default=None,
+        help="读取研究阶段产出的配置 JSON (如 data/reports/strategy_weights_config.json)",
+    )
+    parser.add_argument(
+        "--no-config", action="store_true",
+        help="忽略 data/reports/strategy_weights_config.json，使用脚本默认参数和默认权重",
+    )
     args = parser.parse_args()
 
     t0 = time.time()
     cfg = Settings()
     cfg.validate()
 
-    # 策略配置 (与 Settings 解耦)
-    scfg = StrategyConfig(top_n=args.top_n)
+    runtime = resolve_backtest_runtime_config(
+        cfg,
+        default_start="20170103",
+        default_end=datetime.now().strftime("%Y%m%d"),
+        default_freq="SA",
+        default_top_n=30,
+        config_path=args.config,
+        use_config=not args.no_config,
+        prefer_run_config=args.config is not None,
+        start=args.start,
+        end=args.end,
+        freq=args.freq,
+        top_n=args.top_n,
+    )
+
+    scfg = StrategyConfig(top_n=runtime.top_n)
 
     ds = DataStore(cfg)
     fh = FactorHub(ds)
     fh.register_all_defaults()
     bus = SignalBus(ds.data_dir)
-    optimizer = FixedWeightOptimizer(DEFAULT_WEIGHTS)
-    strategy = DividendQualityFCFStrategy(ds, fh, bus,
-                                          weight_optimizer=optimizer,
-                                          strategy_config=scfg)
+    strategy = DividendQualityFCFStrategy(
+        ds,
+        fh,
+        bus,
+        weights=runtime.weights,
+        strategy_config=scfg,
+    )
     engine = BacktestEngine(ds)
 
-    freq_cn = FREQ_LABEL.get(args.freq, args.freq)
+    freq_cn = FREQ_LABEL.get(runtime.freq, runtime.freq)
 
-    # ---- 1. 全量回测 ----
     print("=" * 70)
-    print(f"  全量回测: {args.start} ~ {args.end}, {freq_cn}调仓")
+    print(f"  全量回测: {runtime.start} ~ {runtime.end}, {freq_cn}调仓")
+    if runtime.config_used:
+        print(f"  权重配置: {runtime.config_path}")
+        if runtime.used_run_config and runtime.run_config_source is not None:
+            print(f"  运行参数: {runtime.run_config_source}")
+        print(f"  权重方案: {runtime.method}")
+    else:
+        print("  权重配置: 默认固定权重")
+    active_weights = {k: f"{v:.2%}" for k, v in runtime.weights.items() if v > 0}
+    if active_weights:
+        print(f"  因子权重: {active_weights}")
     print("=" * 70)
 
     full_result = run_one_segment(
-        engine, strategy, args.start, args.end, args.freq, "全量"
+        engine,
+        strategy,
+        runtime.start,
+        runtime.end,
+        runtime.freq,
+        "全量",
     )
     if full_result is None:
         print("全量回测失败, 退出")
         return
     print(full_result.summary())
 
-    # ---- 2. 分段回测 ----
     print("\n" + "=" * 70)
     print("  分段回测: A股历史各阶段")
     print("=" * 70)
 
-    # 过滤出有效的分段 (在全量回测范围内)
     valid_phases = [
-        (s, min(e, args.end), n, d)
-        for s, e, n, d in MARKET_PHASES
-        if s >= args.start and s < args.end
+        (start, min(end, runtime.end), name, desc)
+        for start, end, name, desc in MARKET_PHASES
+        if start >= runtime.start and start < runtime.end
     ]
 
     segment_results = []
     for seg_start, seg_end, seg_name, seg_desc in valid_phases:
-        # 每个分段需要新的 FactorHub 缓存
         fh_seg = FactorHub(ds)
         fh_seg.register_all_defaults()
         bus_seg = SignalBus(ds.data_dir)
         strategy_seg = DividendQualityFCFStrategy(
-            ds, fh_seg, bus_seg,
-            weight_optimizer=optimizer,
+            ds,
+            fh_seg,
+            bus_seg,
+            weights=runtime.weights,
             strategy_config=scfg,
         )
         result = run_one_segment(
-            engine, strategy_seg, seg_start, seg_end, args.freq,
-            f"{seg_name} ({seg_start[:4]}-{seg_end[:4]})"
+            engine,
+            strategy_seg,
+            seg_start,
+            seg_end,
+            runtime.freq,
+            f"{seg_name} ({seg_start[:4]}-{seg_end[:4]})",
         )
         if result is not None:
             segment_results.append((seg_name, seg_desc, result))
 
-    # ---- 3. 生成报告 ----
     print("\n生成综合 HTML 报告...")
     report_dir = cfg.data_dir / "reports"
     report_dir.mkdir(exist_ok=True)
 
     html = build_full_report(
-        full_result, segment_results, DEFAULT_WEIGHTS, args.freq,
+        full_result,
+        segment_results,
+        runtime.weights,
+        runtime.freq,
     )
-    end_d = full_result.metrics.get("end_date", args.end)
-    html_file = report_dir / f"backtest_full_{args.start}_{end_d}.html"
+    end_d = full_result.metrics.get("end_date", runtime.end)
+    html_file = report_dir / f"backtest_full_{runtime.start}_{end_d}.html"
     html_file.write_text(html, encoding="utf-8")
 
-    # JSON 汇总
     json_data = {
         "type": "multi_segment_backtest",
-        "start": args.start, "end": args.end, "freq": args.freq,
+        "start": runtime.start,
+        "end": runtime.end,
+        "freq": runtime.freq,
+        "top_n": runtime.top_n,
+        "config_file": str(runtime.config_path) if runtime.config_path else None,
+        "weights_source": str(runtime.weights_source) if runtime.weights_source else None,
+        "run_config_source": str(runtime.run_config_source) if runtime.run_config_source else None,
+        "weights_method": runtime.method,
+        "weights": runtime.weights,
         "full_metrics": full_result.metrics,
         "segments": [
-            {"name": n, "desc": d, "metrics": r.metrics}
-            for n, d, r in segment_results
+            {"name": name, "desc": desc, "metrics": result.metrics}
+            for name, desc, result in segment_results
         ],
     }
-    json_file = report_dir / f"backtest_full_{args.start}_{end_d}.json"
+    json_file = report_dir / f"backtest_full_{runtime.start}_{end_d}.json"
     json_file.write_text(json.dumps(json_data, ensure_ascii=False, indent=2, default=str))
 
     elapsed = time.time() - t0
-    print(f"\n{'='*70}")
-    print(f"  ✅ 总耗时: {elapsed/60:.1f} 分钟")
+    print(f"\n{'=' * 70}")
+    print(f"  ✅ 总耗时: {elapsed / 60:.1f} 分钟")
     print(f"  📊 HTML 报告: {html_file}")
     print(f"     浏览器打开: file://{html_file.resolve()}")
     print(f"  📋 JSON 数据: {json_file}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":
