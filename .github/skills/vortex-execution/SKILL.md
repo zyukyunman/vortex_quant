@@ -1,27 +1,34 @@
 ---
 name: vortex-execution
-description: 执行域技能。用于回测执行、xqshare-miniQMT 实盘下单、成交回报与对账。
+description: 执行域技能。用于回测执行、模拟盘、miniQMT 实盘与对账，强调统一订单协议与网关可替换。
 ---
 
 # Vortex Execution Skill
 
 ## 目标
-- 统一模拟与实盘执行语义，确保订单可控、回报可追踪
+
+1. 统一模拟盘与实盘执行语义。
+2. Gateway 可替换，miniQMT 只是默认实现之一。
 
 ## 必做清单
-1. 模拟盘与实盘必须共用 OrderPlan 协议
-2. 实盘下单前必须做二次风控校验
-3. 下单必须支持幂等键避免重复提交
-4. 成交回报必须结构化落库
-5. 当日执行结束必须自动对账并给出差异明细
+
+1. 所有执行入口必须消费同一 OrderPlan 协议。
+2. 下单前必须执行二次风控校验。
+3. 下单必须幂等（plan_hash + account + trade_date）。
+4. 成交回报必须结构化落库。
+5. 日终必须自动对账并输出差异。
 
 ## 输出产物
-- order_plan.json
-- execution_report.json
-- reconcile_report.json
+
+1. order_plan.json
+2. execution_report.json
+3. reconcile_report.json
 
 ## 接口约定
+
 - submit_orders(order_plan)
+- cancel_order(order_id)
 - query_positions(account)
 - query_asset(account)
+- query_fills(account, date)
 - reconcile(date, account)
