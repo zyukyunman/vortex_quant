@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>回测报告 — Vortex Backtest Report</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+/* ═══════════════════ 复用因子报告的设计系统 ═══════════════════ */
+:root {
+  --primary: #1a73e8;
+  --primary-light: #e8f0fe;
+  --primary-hover: #1557b0;
+  --bg: #f5f6fa;
+  --surface: #ffffff;
+  --surface-hover: #f8f9ff;
+  --text: #1f2937;
+  --text-secondary: #6b7280;
+  --text-hint: #9ca3af;
+  --border: #e5e7eb;
+  --shadow: 0 1px 3px rgba(0,0,0,.08);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,.1);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --green: #10b981;
+  --red: #ef4444;
+  --amber: #f59e0b;
+  --purple: #8b5cf6;
+  --cyan: #06b6d4;
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Noto Sans SC', sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  --transition: .2s ease;
+}
+[data-theme="dark"] {
+  --bg: #0f1117; --surface: #1a1d2e; --surface-hover: #252840;
+  --text: #e5e7eb; --text-secondary: #9ca3af; --text-hint: #6b7280;
+  --border: #2d3148; --shadow: 0 1px 3px rgba(0,0,0,.3); --shadow-lg: 0 4px 12px rgba(0,0,0,.4);
+  --primary-light: #1e2a4a;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.6; transition: background var(--transition), color var(--transition); }
+
+/* ═══════════ 顶部导航 ═══════════ */
+.top-bar {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow); padding: 0 24px;
+  display: flex; align-items: center; gap: 8px; height: 56px;
+  transition: background var(--transition);
+}
+.logo { font-weight: 700; font-size: 16px; color: var(--primary); margin-right: 16px; letter-spacing: -.3px; white-space: nowrap; }
+.logo span { opacity: .5; font-weight: 400; }
+.nav-tabs { display: flex; gap: 2px; overflow-x: auto; flex: 1; scrollbar-width: none; }
+.nav-tabs::-webkit-scrollbar { display: none; }
+.nav-tab {
+  padding: 8px 14px; font-size: 13px; font-weight: 500;
+  color: var(--text-secondary); border-radius: var(--radius-sm);
+  cursor: pointer; white-space: nowrap; transition: all var(--transition);
+  border: none; background: none; position: relative;
+}
+.nav-tab:hover { color: var(--primary); background: var(--primary-light); }
+.nav-tab.active { color: var(--primary); background: var(--primary-light); font-weight: 600; }
+.nav-tab.active::after { content: ''; position: absolute; bottom: -9px; left: 50%; transform: translateX(-50%); width: 24px; height: 3px; background: var(--primary); border-radius: 2px; }
+.theme-toggle {
+  width: 36px; height: 36px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 1px solid var(--border); cursor: pointer;
+  font-size: 18px; flex-shrink: 0; transition: all var(--transition); color: var(--text-secondary);
+}
+.theme-toggle:hover { background: var(--primary-light); color: var(--primary); }
+
+/* ═══════════ 通用组件 ═══════════ */
+.page { display: none; padding: 24px; max-width: 1400px; margin: 0 auto; }
+.page.active { display: block; }
+.page-header { margin-bottom: 20px; }
+.page-title { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+.page-subtitle { font-size: 13px; color: var(--text-hint); line-height: 1.5; }
+
+.layout-main { display: grid; grid-template-columns: 1fr 320px; gap: 20px; margin-bottom: 20px; }
+.layout-full { margin-bottom: 20px; }
+.aux-row { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); margin-bottom: 20px; }
+@media (max-width: 960px) { .layout-main { grid-template-columns: 1fr; } }
+@media (max-width: 800px) { .badge-row[style*="grid-template-columns"] { grid-template-columns: repeat(2, 1fr) !important; } }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 20px; transition: all var(--transition); position: relative; }
+.card:hover { box-shadow: var(--shadow-lg); }
+/* 双击全屏提示：hover 时在卡片右下角显示 */
+.card::after {
+  content: '双击全屏'; position: absolute; bottom: 8px; right: 12px;
+  font-size: 10px; color: var(--text-hint); opacity: 0;
+  transition: opacity .2s ease; pointer-events: none;
+}
+.card:hover::after { opacity: 0.6; }
+.card.fullscreen::after { content: 'ESC 退出'; opacity: 0.8; bottom: 12px; right: 16px; font-size: 11px; }
+.card-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.card-hint { font-size: 12px; color: var(--text-hint); margin-bottom: 14px; }
+.chart-box { width: 100%; min-height: 360px; aspect-ratio: 16 / 8; }
+.chart-box-sm { width: 100%; min-height: 260px; aspect-ratio: 16 / 7; }
+
+.sidebar { display: flex; flex-direction: column; gap: 12px; }
+.metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; transition: all var(--transition); }
+.metric-card:hover { border-color: var(--primary); }
+.metric-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+.metric-value { font-size: 24px; font-weight: 700; font-family: var(--mono); }
+.metric-value.positive { color: var(--green); }
+.metric-value.negative { color: var(--red); }
+.metric-value.neutral { color: var(--primary); }
+.metric-sub { font-size: 11px; color: var(--text-hint); margin-top: 2px; }
+
+.badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+.badge-score { background: var(--primary); color: #fff; font-size: 14px; padding: 6px 14px; }
+.badge-a { background: var(--green); color: #fff; font-size: 14px; padding: 6px 14px; }
+.badge-type { background: var(--primary-light); color: var(--primary); }
+
+/* 雷达图占位 */
+.radar-container { display: flex; justify-content: center; align-items: center; min-height: 280px; }
+
+/* 表格 */
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th { text-align: left; padding: 10px 12px; font-weight: 600; color: var(--text-secondary); border-bottom: 2px solid var(--border); font-size: 12px; text-transform: uppercase; letter-spacing: .3px; }
+.data-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 13px; }
+.data-table tr:hover td { background: var(--surface-hover); }
+.data-table .positive { color: var(--green); }
+.data-table .negative { color: var(--red); }
+
+/* Footer */
+.footer { margin-top: 32px; padding: 16px 24px; background: var(--surface); border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-hint); flex-wrap: wrap; gap: 8px; }
+.footer-item { display: flex; align-items: center; gap: 4px; }
+.footer-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); display: inline-block; }
+
+/* ═══════════ 图表工具栏 ═══════════ */
+.card-toolbar {
+  position: absolute; top: 12px; right: 12px;
+  display: flex; gap: 4px; opacity: 0; transition: opacity .2s ease;
+}
+.card:hover .card-toolbar { opacity: 1; }
+/* 并排卡片（aux-row内）的工具栏仅全屏时显示，避免小卡片交互拥挤 */
+.aux-row .card-toolbar { display: none; }
+.aux-row .card.fullscreen .card-toolbar { display: flex; opacity: 1; }
+.card-btn {
+  width: 28px; height: 28px; border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg); border: 1px solid var(--border);
+  cursor: pointer; font-size: 14px; transition: all .2s ease;
+  color: var(--text-secondary);
+}
+.card-btn:hover { background: var(--primary-light); color: var(--primary); border-color: var(--primary); }
+
+/* ═══════════ 基准切换 ═══════════ */
+.benchmark-select {
+  padding: 4px 8px; font-size: 12px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--surface);
+  color: var(--text); margin-left: 12px; cursor: pointer;
+  font-family: var(--font);
+}
+.benchmark-select:focus { outline: none; border-color: var(--primary); }
+
+/* ═══════════ 流水线开关 ═══════════ */
+.stage-toggles { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.stage-toggle {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 12px; cursor: pointer; color: var(--text-secondary);
+}
+.stage-toggle input { accent-color: var(--primary); }
+.stage-toggle.checked { color: var(--text); font-weight: 500; }
+
+/* ═══════════ 全屏覆盖 ═══════════ */
+.card.fullscreen {
+  position: fixed !important; top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 200; border-radius: 0; margin: 0;
+  display: flex; flex-direction: column; overflow: auto;
+}
+.card.fullscreen .chart-box,
+.card.fullscreen .chart-box-sm { flex: 1; min-height: unset; aspect-ratio: unset; }
+.card.fullscreen .card-toolbar { opacity: 1; }
+
+/* ═══════════ 键盘提示 ═══════════ */
+.kbd-hint {
+  position: fixed; bottom: 16px; right: 16px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 12px;
+  font-size: 11px; color: var(--text-hint);
+  box-shadow: var(--shadow); z-index: 50; opacity: 0.7;
+}
+.kbd-hint:hover { opacity: 1; }
+kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; font-size: 11px; font-family: var(--mono); }
+
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.page.active .card { animation: fadeIn .3s ease forwards; }
+.page.active .card:nth-child(2) { animation-delay: .05s; }
+.page.active .card:nth-child(3) { animation-delay: .1s; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════ 顶部导航 ═══════════ -->
+<nav class="top-bar">
+  <div class="logo">Vortex <span>Backtest Report</span></div>
+  <div class="nav-tabs" id="navTabs">
+    <button class="nav-tab active" data-page="dashboard">综合仪表盘</button>
+    <button class="nav-tab" data-page="monthly">月度热力图</button>
+    <button class="nav-tab" data-page="rolling">滚动指标</button>
+    <button class="nav-tab" data-page="risk">风险归因</button>
+    <button class="nav-tab" data-page="trades">交易分析</button>
+    <button class="nav-tab" data-page="pipeline">流水线拆解</button>
+  </div>
+  <button class="theme-toggle" id="themeToggle" title="切换深色/浅色模式">🌙</button>
+</nav>
+
+<!-- 概览 -->
+<div style="max-width:1400px; margin:0 auto; padding:16px 24px 0;">
+  <div class="badge-row">
+    <span class="badge badge-a">A 级</span>
+    <span class="badge badge-score">76 / 100</span>
+    <span class="badge badge-type">📋 style_rotation_momentum</span>
+    <span class="badge badge-type">📅 2020-01-02 → 2026-04-03</span>
+    <span class="badge badge-type">📊 沪深全 A × 月频调仓</span>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     页面一：综合仪表盘
+     3 秒内让研究员做出判断——核心指标、资金曲线、质量雷达图。
+     ═══════════════════════════════════════════════════════════════ -->
+<section class="page active" id="page-dashboard">
+  <div class="page-header">
+    <h2 class="page-title">综合仪表盘</h2>
+    <p class="page-subtitle">回测的第一屏——核心指标 + 资金曲线 + 质量评分雷达图，3 秒内做出判断。</p>
+  </div>
+
+  <div class="layout-main">
+    <div class="card">
+      <div class="card-toolbar"><button class="card-btn" onclick="toggleFullscreen(this)" title="全屏">⛶</button><button class="card-btn" onclick="exportPNG('chart-nav','资金曲线')" title="导出PNG">📷</button></div>
+      <div class="card-title">资金曲线 vs 基准
+        <select class="benchmark-select" id="benchmarkSelect" onchange="renderDashboard()">
+          <option value="both">双基准对比</option>
+          <option value="index">仅指数基准</option>
+          <option value="alpha">仅 Alpha 基准</option>
+        </select>
+      </div>
+      <div class="card-hint">策略净值（实线）对比基准（虚线），阴影区域为回撤区间。支持 §4.5 双基准对照</div>
+      <div class="chart-box" id="chart-nav"></div>
+    </div>
+    <div class="sidebar">
+      <div class="metric-card">
+        <div class="metric-label">年化收益</div>
+        <div class="metric-value positive">28.3%</div>
+        <div class="metric-sub">vs 基准 6.2%</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Sharpe Ratio</div>
+        <div class="metric-value positive">1.42</div>
+        <div class="metric-sub">> 1.0 → 风险调整后优秀</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">最大回撤</div>
+        <div class="metric-value negative">-16.8%</div>
+        <div class="metric-sub">回撤持续 42 个交易日</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">年化换手</div>
+        <div class="metric-value neutral">4.2x</div>
+        <div class="metric-sub">月频调仓，成本可控</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Calmar Ratio</div>
+        <div class="metric-value positive">1.68</div>
+        <div class="metric-sub">收益/最大回撤</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="aux-row">
+    <div class="card">
+      <div class="card-title">质量评分雷达图</div>
+      <div class="card-hint">五维度评分：收益风险比、稳定性、回撤控制、成本效率、过拟合风险</div>
+      <div class="radar-container">
+        <div class="chart-box-sm" id="chart-radar"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">超额收益曲线</div>
+      <div class="card-hint">策略相对基准的累积超额收益。持续向上 → alpha 稳定</div>
+      <div class="chart-box-sm" id="chart-excess"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">核心指标汇总</div>
+      <div class="card-hint">策略与基准的关键指标对比</div>
+      <table class="data-table">
+        <thead><tr><th>指标</th><th>策略</th><th>基准</th></tr></thead>
+        <tbody>
+          <tr><td>年化收益</td><td class="positive">28.3%</td><td>6.2%</td></tr>
+          <tr><td>年化波动</td><td>19.8%</td><td>22.4%</td></tr>
+          <tr><td>Sharpe</td><td class="positive">1.42</td><td>0.28</td></tr>
+          <tr><td>最大回撤</td><td class="negative">-16.8%</td><td class="negative">-34.2%</td></tr>
+          <tr><td>胜率（月）</td><td class="positive">68%</td><td>52%</td></tr>
+          <tr><td>盈亏比</td><td class="positive">1.83</td><td>0.94</td></tr>
+          <tr><td>Alpha</td><td class="positive">22.1%</td><td>—</td></tr>
+          <tr><td>Beta</td><td>0.72</td><td>1.00</td></tr>
+          <tr><td>信息比率</td><td class="positive">1.56</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     页面二：月度收益热力图
+     ═══════════════════════════════════════════════════════════════ -->
+<section class="page" id="page-monthly">
+  <div class="page-header">
+    <h2 class="page-title">月度收益热力图</h2>
+    <p class="page-subtitle">按月/年展示收益，快速识别季节性效应和异常月份。绿色正收益、红色负收益。</p>
+  </div>
+  <div class="aux-row">
+    <div class="card">
+      <div class="card-title">策略月度收益</div>
+      <div class="card-hint">每月收益率（%）。持续绿色 → 收益稳定；红色集中 → 存在季节性弱势</div>
+      <div class="chart-box" id="chart-monthly-strat"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">超额月度收益（策略 - 基准）</div>
+      <div class="card-hint">超额为正 → 跑赢基准。连续红色 → alpha 衰退期</div>
+      <div class="chart-box" id="chart-monthly-excess"></div>
+    </div>
+  </div>
+  <div class="layout-full card">
+    <div class="card-title">年度收益汇总</div>
+    <table class="data-table">
+      <thead><tr><th>年份</th><th>策略</th><th>基准</th><th>超额</th><th>最大回撤</th><th>Sharpe</th></tr></thead>
+      <tbody id="yearlyTable"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     页面三：滚动指标
+     ═══════════════════════════════════════════════════════════════ -->
+<section class="page" id="page-rolling">
+  <div class="page-header">
+    <h2 class="page-title">滚动指标</h2>
+    <p class="page-subtitle">120 日滚动窗口下的 Sharpe、Beta、波动率变化趋势。检验策略特征是否在时间维度上稳定。</p>
+  </div>
+  <div class="aux-row">
+    <div class="card">
+      <div class="card-title">滚动 Sharpe (120d)</div>
+      <div class="card-hint">稳定 > 1 → 策略持续有效；频繁跌破 0 → 不稳定</div>
+      <div class="chart-box-sm" id="chart-roll-sharpe"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">滚动 Beta (120d)</div>
+      <div class="card-hint">Beta 稳定 → 市场暴露可控；剧烈波动 → 策略风格漂移</div>
+      <div class="chart-box-sm" id="chart-roll-beta"></div>
+    </div>
+  </div>
+  <div class="aux-row">
+    <div class="card">
+      <div class="card-title">滚动波动率 (60d)</div>
+      <div class="card-hint">策略波动率 vs 基准波动率。策略更低 → 风控有效</div>
+      <div class="chart-box-sm" id="chart-roll-vol"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">滚动最大回撤 (120d)</div>
+      <div class="card-hint">回撤在某段时间突然加深 → 需检查该时段策略行为</div>
+      <div class="chart-box-sm" id="chart-roll-dd"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     页面四：风险归因
+     ═══════════════════════════════════════════════════════════════ -->
+<section class="page" id="page-risk">
+  <div class="page-header">
+    <h2 class="page-title">风险归因</h2>
+    <p class="page-subtitle">行业暴露、风格暴露、个股集中度的时序分解。了解策略的收益来自哪些风险暴露。</p>
+  </div>
+  <div class="badge-row" style="display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; margin-bottom:20px;">
+    <div class="metric-card">
+      <div class="metric-label">行业集中度</div>
+      <div class="metric-value neutral">0.38</div>
+      <div class="metric-sub">HHI 指数，< 0.25 → 分散</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">最大行业偏离</div>
+      <div class="metric-value negative" style="font-size:16px;">电力设备 +8.2%</div>
+      <div class="metric-sub">相对基准偏离</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">市值暴露</div>
+      <div class="metric-value neutral">-0.34</div>
+      <div class="metric-sub">负值 → 偏小盘</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Top5 个股集中度</div>
+      <div class="metric-value neutral">18.6%</div>
+      <div class="metric-sub">< 25% → 可接受</div>
+    </div>
+  </div>
+  <div class="layout-full card">
+    <div class="card-title">行业暴露热力图</div>
+    <div class="card-hint">按时间展示各行业的持仓权重。颜色越深 → 集中度越高</div>
+    <div class="chart-box" id="chart-industry"></div>
+  </div>
+  <div class="layout-full card">
+    <div class="card-title">风格因子暴露</div>
+    <div class="card-hint">策略在各风格因子（市值/价值/动量/波动/质量/流动性）上的平均暴露</div>
+    <div class="chart-box" id="chart-style-exposure"></div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     页面五：交易分析
+     ═══════════════════════════════════════════════════════════════ -->
+<section class="page" id="page-trades">
+  <div class="page-header">
+    <h2 class="page-title">交易分析</h2>
+    <p class="page-subtitle">持仓周期分布、盈亏比、最大连续亏损、换手率时序——评估策略的交易行为特征。</p>
+  </div>
+  <div class="aux-row">
+    <div class="card">
+      <div class="card-title">持仓周期分布</div>
+      <div class="card-hint">每笔交易的持仓天数分布。过短 → 交易成本高；过长 → 响应慢</div>
+      <div class="chart-box-sm" id="chart-holding-dist"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">单笔盈亏分布</div>
+      <div class="card-hint">每笔交易的收益率分布。右偏且均值为正 → 截断亏损、放大盈利</div>
+      <div class="chart-box-sm" id="chart-pnl-dist"></div>
+    </div>
+  </div>
+  <div class="aux-row">
+    <div class="card">
+      <div class="card-title">换手率时序</div>
+      <div class="card-hint">每期的双边换手率。突然飙升 → 可能是因子信号大幅变动或市场极端事件</div>
+      <div class="chart-box-sm" id="chart-turnover-ts"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">连续盈亏统计</div>
+      <div class="card-hint">最大连续盈利/亏损的笔数和金额。连续亏损越长 → 心理压力越大</div>
+      <div class="chart-box-sm" id="chart-streak"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     页面六：流水线拆解
+     ═══════════════════════════════════════════════════════════════ -->
+<section class="page" id="page-pipeline">
+  <div class="page-header">
+    <h2 class="page-title">流水线拆解</h2>
+    <p class="page-subtitle">Vortex 策略流水线：Universe → Alpha → Portfolio → Risk。分析各阶段对最终表现的贡献。</p>
+  </div>
+  <div class="layout-main">
+    <div class="card">
+      <div class="card-toolbar"><button class="card-btn" onclick="toggleFullscreen(this)" title="全屏">⛶</button><button class="card-btn" onclick="exportPNG('chart-pipeline-cum','流水线')" title="导出PNG">📷</button></div>
+      <div class="card-title">各阶段累积贡献</div>
+      <div class="card-hint">勾选/取消阶段可对比各步骤累积净值。至少保留一个阶段。</div>
+      <div class="stage-toggles" id="stageToggles"></div>
+      <div class="chart-box" id="chart-pipeline-cum"></div>
+    </div>
+    <div class="sidebar">
+      <div class="metric-card">
+        <div class="metric-label">Universe 贡献</div>
+        <div class="metric-value positive" style="font-size:18px;">+3.2%</div>
+        <div class="metric-sub">行业/市值筛选</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Alpha 贡献</div>
+        <div class="metric-value positive" style="font-size:18px;">+18.6%</div>
+        <div class="metric-sub">因子选股（核心收益来源）</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Portfolio 贡献</div>
+        <div class="metric-value positive" style="font-size:18px;">+4.1%</div>
+        <div class="metric-sub">权重优化</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Risk 贡献</div>
+        <div class="metric-value neutral" style="font-size:18px;">-1.8%</div>
+        <div class="metric-sub">风控约束（降收益换回撤控制）</div>
+      </div>
+    </div>
+  </div>
+  <div class="layout-full card">
+    <div class="card-title">流水线阶段指标对比</div>
+    <table class="data-table">
+      <thead><tr><th>阶段</th><th>年化收益</th><th>年化波动</th><th>Sharpe</th><th>最大回撤</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>全市场等权</td><td>6.2%</td><td>22.4%</td><td>0.28</td><td class="negative">-34.2%</td><td>基准线</td></tr>
+        <tr><td>+ Universe</td><td>9.4%</td><td>21.8%</td><td>0.43</td><td class="negative">-30.1%</td><td>行业/市值筛选</td></tr>
+        <tr><td>+ Alpha</td><td class="positive">28.0%</td><td>20.6%</td><td class="positive">1.36</td><td class="negative">-19.4%</td><td>因子选股</td></tr>
+        <tr><td>+ Portfolio</td><td class="positive">30.1%</td><td>19.2%</td><td class="positive">1.57</td><td class="negative">-17.6%</td><td>权重优化</td></tr>
+        <tr><td>+ Risk</td><td class="positive">28.3%</td><td>19.8%</td><td class="positive">1.42</td><td class="negative">-16.8%</td><td>风控约束（最终结果）</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════ 键盘快捷键提示 ═══════════ -->
+<div class="kbd-hint"><kbd>←</kbd> <kbd>→</kbd> 翻页 &nbsp;|&nbsp; <kbd>D</kbd> 切换主题 &nbsp;|&nbsp; 双击图表 全屏</div>
+
+<!-- ═══════════ 底部 ═══════════ -->
+<div class="footer">
+  <div class="footer-item"><span class="footer-dot"></span> Vortex Backtest Report</div>
+  <div class="footer-item">run_id: <code>backtest_20260403_231501_d8e3</code></div>
+  <div class="footer-item">策略: <code>style_rotation_momentum</code></div>
+  <div class="footer-item">调仓频率: <code>月频</code></div>
+  <div class="footer-item">生成时间: <code>2026-04-03 23:25:18</code></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+const isDark = () => document.documentElement.getAttribute('data-theme') === 'dark';
+const c = { primary: '#1a73e8', green: '#10b981', red: '#ef4444', amber: '#f59e0b', purple: '#8b5cf6', cyan: '#06b6d4' };
+
+function bl(extra = {}) {
+  const dk = isDark();
+  return Object.assign({
+    paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
+    font: { family: "'Inter','PingFang SC','Noto Sans SC',sans-serif", color: dk ? '#e5e7eb' : '#1f2937', size: 12 },
+    margin: { t: 24, r: 16, b: 56, l: 48 },
+    xaxis: { gridcolor: dk ? '#2d3148' : '#e5e7eb', zerolinecolor: dk ? '#3b3f5c' : '#d1d5db' },
+    yaxis: { gridcolor: dk ? '#2d3148' : '#e5e7eb', zerolinecolor: dk ? '#3b3f5c' : '#d1d5db' },
+    legend: { bgcolor: 'transparent', orientation: 'h', y: -0.15, x: 0.5, xanchor: 'center' },
+    hoverlabel: { font: { size: 12 } },
+  }, extra);
+}
+const pc = { responsive: true, displaylogo: false, modeBarButtonsToRemove: ['lasso2d','select2d'] };
+
+function genDates(start, n) {
+  const dates = []; let d = new Date(start);
+  for (let i = 0; i < n; i++) { dates.push(d.toISOString().slice(0,10)); d.setDate(d.getDate()+1); if(d.getDay()===0) d.setDate(d.getDate()+1); if(d.getDay()===6) d.setDate(d.getDate()+2); }
+  return dates;
+}
+function genSeries(n, mean, std, trend=0) {
+  const s = [];
+  for(let i=0;i<n;i++) s.push(mean+trend*i/n+std*(Math.random()+Math.random()+Math.random()-1.5)*0.816);
+  return s;
+}
+function cumsum(arr, base=1) { const r=[base]; for(let i=0;i<arr.length;i++) r.push(r[r.length-1]*(1+arr[i])); return r.slice(1); }
+
+const N = 500;
+const dates = genDates('2020-01-02', N);
+
+// ═══════════ 导航 ═══════════
+$('#navTabs').addEventListener('click', e => {
+  const tab = e.target.closest('.nav-tab');
+  if(!tab) return;
+  $$('.nav-tab').forEach(t => t.classList.remove('active'));
+  $$('.page').forEach(p => p.classList.remove('active'));
+  tab.classList.add('active');
+  $(`#page-${tab.dataset.page}`).classList.add('active');
+});
+$('#themeToggle').addEventListener('click', () => {
+  const next = isDark() ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  $('#themeToggle').textContent = next === 'dark' ? '☀️' : '🌙';
+  renderAll();
+});
+
+function renderAll() {
+  renderDashboard();
+  renderMonthly();
+  renderRolling();
+  renderRisk();
+  renderTrades();
+  renderPipeline();
+}
+
+// ─── 综合仪表盘 ───
+function renderDashboard() {
+  const stratRet = genSeries(N, 0.0004, 0.012);
+  const benchRetIndex = genSeries(N, 0.0001, 0.014);
+  const benchRetAlpha = genSeries(N, 0.00015, 0.013);
+  const stratNav = cumsum(stratRet);
+  const benchNavIndex = cumsum(benchRetIndex);
+  const benchNavAlpha = cumsum(benchRetAlpha);
+  // 回撤阴影
+  let peak = stratNav[0];
+  const dd = stratNav.map(v => { peak = Math.max(peak, v); return v / peak - 1; });
+
+  // 基准切换
+  const benchMode = $('#benchmarkSelect')?.value || 'both';
+  const navTraces = [
+    { x: dates, y: stratNav, name: '策略净值', line: { color: c.primary, width: 2.5 } },
+  ];
+  if (benchMode === 'both' || benchMode === 'index') {
+    navTraces.push({ x: dates, y: benchNavIndex, name: '指数基准（沪深300）', line: { color: c.amber, width: 1.5, dash: 'dash' } });
+  }
+  if (benchMode === 'both' || benchMode === 'alpha') {
+    navTraces.push({ x: dates, y: benchNavAlpha, name: 'Alpha 基准（成分股仿真）', line: { color: c.purple, width: 1.5, dash: 'dot' } });
+  }
+  navTraces.push({ x: dates, y: dd.map(v => v * stratNav[stratNav.length-1] + stratNav[stratNav.length-1]), name: '回撤', fill: 'tonexty', fillcolor: isDark() ? 'rgba(239,68,68,0.08)' : 'rgba(239,68,68,0.05)', line: { width: 0 }, showlegend: false });
+
+  Plotly.newPlot('chart-nav', navTraces, bl({
+    xaxis: { gridcolor: isDark() ? '#2d3148' : '#e5e7eb', rangeslider: { visible: true, thickness: 0.06 } },
+  }), pc);
+
+  // 雷达图
+  const dims = ['收益风险比', '稳定性', '回撤控制', '成本效率', '过拟合风险'];
+  const scores = [82, 71, 79, 68, 74];
+  Plotly.newPlot('chart-radar', [{
+    type: 'scatterpolar', r: [...scores, scores[0]], theta: [...dims, dims[0]],
+    fill: 'toself', fillcolor: isDark() ? 'rgba(26,115,232,0.15)' : 'rgba(26,115,232,0.1)',
+    line: { color: c.primary, width: 2 },
+    marker: { size: 6, color: c.primary },
+  }], bl({
+    polar: {
+      radialaxis: { visible: true, range: [0, 100], gridcolor: isDark() ? '#2d3148' : '#e5e7eb' },
+      angularaxis: { gridcolor: isDark() ? '#2d3148' : '#e5e7eb' },
+      bgcolor: 'transparent',
+    },
+  }), pc);
+
+  // 超额
+  const excessRet = stratRet.map((v, i) => v - benchRetIndex[i]);
+  Plotly.newPlot('chart-excess', [{
+    x: dates, y: cumsum(excessRet),
+    name: '累积超额', line: { color: c.green, width: 2 },
+    fill: 'tozeroy', fillcolor: isDark() ? 'rgba(16,185,129,0.1)' : 'rgba(16,185,129,0.06)',
+  }], bl(), pc);
+}
+
+// ─── 月度热力图 ───
+function renderMonthly() {
+  const months = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+  const years = ['2020','2021','2022','2023','2024','2025'];
+  const zStrat = years.map(() => months.map(() => (Math.random()-0.3)*10));
+  const zExcess = years.map(() => months.map(() => (Math.random()-0.35)*6));
+
+  Plotly.newPlot('chart-monthly-strat', [{
+    z: zStrat, x: months, y: years, type: 'heatmap',
+    colorscale: [[0,'#ef4444'],[0.5,'#fef3c7'],[1,'#10b981']],
+    text: zStrat.map(r => r.map(v => v.toFixed(1)+'%')), texttemplate: '%{text}',
+  }], bl({ yaxis: { autorange: 'reversed' } }), pc);
+
+  Plotly.newPlot('chart-monthly-excess', [{
+    z: zExcess, x: months, y: years, type: 'heatmap',
+    colorscale: [[0,'#ef4444'],[0.5,'#fef3c7'],[1,'#10b981']],
+    text: zExcess.map(r => r.map(v => v.toFixed(1)+'%')), texttemplate: '%{text}',
+  }], bl({ yaxis: { autorange: 'reversed' } }), pc);
+
+  // 年度表
+  const tbody = $('#yearlyTable');
+  tbody.innerHTML = years.map(y => {
+    const sr = (Math.random()*40-5).toFixed(1);
+    const br = (Math.random()*20-5).toFixed(1);
+    const ex = (parseFloat(sr)-parseFloat(br)).toFixed(1);
+    const dd = -(Math.random()*25+5).toFixed(1);
+    const sh = (Math.random()*2).toFixed(2);
+    return `<tr><td>${y}</td><td class="${sr>0?'positive':'negative'}">${sr}%</td><td>${br}%</td><td class="${ex>0?'positive':'negative'}">${ex}%</td><td class="negative">${dd}%</td><td>${sh}</td></tr>`;
+  }).join('');
+}
+
+// ─── 滚动指标 ───
+function renderRolling() {
+  const win = 120;
+  const stratRet = genSeries(N, 0.0004, 0.012);
+  const benchRet = genSeries(N, 0.0001, 0.014);
+
+  function rolling(arr, w, fn) {
+    return arr.map((_, i) => i < w ? null : fn(arr.slice(i-w, i)));
+  }
+  const mean = a => a.reduce((s,v)=>s+v,0)/a.length;
+  const std = a => { const m=mean(a); return Math.sqrt(a.reduce((s,v)=>s+(v-m)**2,0)/a.length); };
+
+  const rSharpe = rolling(stratRet, win, s => mean(s)/std(s)*Math.sqrt(252));
+  const rBeta = rolling(stratRet, win, (s, i) => 0.72 + (Math.random()-0.5)*0.3);
+  const rVol = rolling(stratRet, 60, s => std(s)*Math.sqrt(252)*100);
+  const rVolB = rolling(benchRet, 60, s => std(s)*Math.sqrt(252)*100);
+
+  Plotly.newPlot('chart-roll-sharpe', [
+    { x: dates, y: rSharpe, line: { color: c.primary, width: 2 } },
+    { x: dates, y: Array(N).fill(1), line: { color: c.green, dash: 'dash', width: 1 }, name: '1.0 线' },
+    { x: dates, y: Array(N).fill(0), line: { color: c.red, dash: 'dot', width: 1 }, name: '0 线' },
+  ], bl({ yaxis: { title: 'Sharpe' } }), pc);
+
+  Plotly.newPlot('chart-roll-beta', [
+    { x: dates, y: rBeta, line: { color: c.purple, width: 2 } },
+    { x: dates, y: Array(N).fill(1), line: { color: c.amber, dash: 'dash', width: 1 }, name: 'Beta=1' },
+  ], bl({ yaxis: { title: 'Beta' } }), pc);
+
+  Plotly.newPlot('chart-roll-vol', [
+    { x: dates, y: rVol, name: '策略波动率', line: { color: c.primary, width: 2 } },
+    { x: dates, y: rVolB, name: '基准波动率', line: { color: c.amber, width: 1.5, dash: 'dash' } },
+  ], bl({ yaxis: { title: '年化波动率(%)' } }), pc);
+
+  // 滚动最大回撤
+  const nav = cumsum(stratRet);
+  const rDD = rolling(nav, win, s => { let pk = s[0]; let dd = 0; s.forEach(v => { pk = Math.max(pk, v); dd = Math.min(dd, v/pk-1); }); return dd * 100; });
+  Plotly.newPlot('chart-roll-dd', [
+    { x: dates, y: rDD, fill: 'tozeroy', fillcolor: isDark() ? 'rgba(239,68,68,0.1)' : 'rgba(239,68,68,0.06)', line: { color: c.red, width: 2 } },
+  ], bl({ yaxis: { title: '滚动最大回撤(%)' } }), pc);
+}
+
+// ─── 风险归因 ───
+function renderRisk() {
+  const industries = ['银行','食品饮料','电力设备','医药','电子','计算机','非银金融','房地产'];
+  const periods = ['2020H1','2020H2','2021H1','2021H2','2022H1','2022H2','2023H1','2023H2','2024H1','2024H2','2025H1','2025H2'];
+  const z = periods.map(() => industries.map(() => Math.random() * 15));
+
+  Plotly.newPlot('chart-industry', [{
+    z, x: industries, y: periods, type: 'heatmap',
+    colorscale: 'Blues',
+    text: z.map(r => r.map(v => v.toFixed(1)+'%')), texttemplate: '%{text}',
+  }], bl({ margin: { t: 16, b: 80, l: 80, r: 24 } }), pc);
+
+  // 风格暴露
+  const styles = ['市值', '价值', '动量', '波动率', '质量', '流动性'];
+  const exposures = [-0.34, 0.28, 0.52, -0.18, 0.41, -0.08];
+  Plotly.newPlot('chart-style-exposure', [{
+    x: styles, y: exposures, type: 'bar',
+    marker: { color: exposures.map(v => v >= 0 ? c.primary : c.red) },
+    text: exposures.map(v => v.toFixed(2)),
+    textposition: 'outside',
+  }], bl({ yaxis: { title: '平均暴露' } }), pc);
+}
+
+// ─── 交易分析 ───
+function renderTrades() {
+  // 持仓分布
+  const holdings = genSeries(500, 22, 8).map(v => Math.max(1, Math.round(v)));
+  Plotly.newPlot('chart-holding-dist', [{
+    x: holdings, type: 'histogram', nbinsx: 30,
+    marker: { color: c.primary, opacity: 0.7 },
+  }], bl({ xaxis: { title: '持仓天数' }, yaxis: { title: '频次' } }), pc);
+
+  // 盈亏分布
+  const pnls = genSeries(500, 0.02, 0.08);
+  Plotly.newPlot('chart-pnl-dist', [{
+    x: pnls, type: 'histogram', nbinsx: 40,
+    marker: { color: pnls.map(v => v >= 0 ? c.green : c.red), opacity: 0.7 },
+  }], bl({ xaxis: { title: '单笔收益率', tickformat: '.0%' }, yaxis: { title: '频次' } }), pc);
+
+  // 换手率时序
+  const turnover = genSeries(N, 0.35, 0.12).map(v => Math.max(0, v));
+  Plotly.newPlot('chart-turnover-ts', [{
+    x: dates, y: turnover, type: 'bar',
+    marker: { color: turnover.map(v => v > 0.5 ? c.amber : c.primary), opacity: 0.7 },
+  }], bl({ yaxis: { title: '双边换手率', tickformat: '.0%' } }), pc);
+
+  // 连续盈亏
+  const streakTypes = ['最大连续盈利', '最大连续亏损', '平均连续盈利', '平均连续亏损'];
+  const streakVals = [8, -6, 3.2, -2.1];
+  Plotly.newPlot('chart-streak', [{
+    x: streakTypes, y: streakVals.map(Math.abs), type: 'bar',
+    marker: { color: streakVals.map(v => v >= 0 ? c.green : c.red) },
+    text: streakVals.map(v => v >= 0 ? `${v} 笔` : `${Math.abs(v)} 笔`),
+    textposition: 'outside',
+  }], bl({ yaxis: { title: '笔数' } }), pc);
+}
+
+// ─── 流水线拆解 ───
+const pipelineStages = ['全市场等权', '+ Universe', '+ Alpha', '+ Portfolio', '+ Risk'];
+const pipelineColors = [c.amber, c.cyan, c.primary, c.purple, c.green];
+let stageVisible = [true, true, true, true, true];
+
+function initStageToggles() {
+  const container = $('#stageToggles');
+  if (!container) return;
+  container.innerHTML = pipelineStages.map((name, i) => `
+    <label class="stage-toggle checked">
+      <input type="checkbox" checked onchange="toggleStage(${i}, this.checked)">
+      <span style="color:${pipelineColors[i]}">●</span> ${name}
+    </label>
+  `).join('');
+}
+
+function toggleStage(idx, checked) {
+  const visibleCount = stageVisible.filter(Boolean).length;
+  if (!checked && visibleCount <= 1) {
+    // 至少保留一个
+    $$('#stageToggles input')[idx].checked = true;
+    return;
+  }
+  stageVisible[idx] = checked;
+  $$('#stageToggles .stage-toggle')[idx].classList.toggle('checked', checked);
+  renderPipeline();
+}
+
+function renderPipeline() {
+  const stages = pipelineStages;
+  const navSets = [];
+  const baseRet = genSeries(N, 0.0001, 0.014);
+  navSets.push(cumsum(baseRet));
+  const uniRet = baseRet.map(v => v + 0.00005 + Math.random()*0.0001);
+  navSets.push(cumsum(uniRet));
+  const alphaRet = uniRet.map(v => v + 0.0003 + Math.random()*0.0002);
+  navSets.push(cumsum(alphaRet));
+  const portRet = alphaRet.map(v => v + 0.00005 + Math.random()*0.0001);
+  navSets.push(cumsum(portRet));
+  const riskRet = portRet.map(v => v - 0.00002 + Math.random()*0.0001);
+  navSets.push(cumsum(riskRet));
+
+  const traces = stages.map((name, i) => ({
+    x: dates, y: navSets[i], name,
+    line: { color: pipelineColors[i], width: i === stages.length-1 ? 2.5 : 1.5, dash: i < stages.length-1 ? 'dot' : 'solid' },
+    visible: stageVisible[i] ? true : 'legendonly',
+  }));
+
+  Plotly.newPlot('chart-pipeline-cum', traces, bl(), pc);
+}
+
+// ═══════════ 新增交互：键盘翻页 ═══════════
+const btPageOrder = ['dashboard','monthly','rolling','risk','trades','pipeline'];
+document.addEventListener('keydown', e => {
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    e.preventDefault();
+    const current = document.querySelector('.nav-tab.active');
+    const idx = btPageOrder.indexOf(current.dataset.page);
+    const next = e.key === 'ArrowRight'
+      ? btPageOrder[(idx + 1) % btPageOrder.length]
+      : btPageOrder[(idx - 1 + btPageOrder.length) % btPageOrder.length];
+    $$('.nav-tab').forEach(t => t.classList.remove('active'));
+    $$('.page').forEach(p => p.classList.remove('active'));
+    const tab = document.querySelector(`.nav-tab[data-page="${next}"]`);
+    tab.classList.add('active');
+    $(`#page-${next}`).classList.add('active');
+    tab.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  }
+  if (e.key === 'd' || e.key === 'D') {
+    $('#themeToggle').click();
+  }
+  if (e.key === 'Escape') {
+    const fs = document.querySelector('.card.fullscreen');
+    if (fs) {
+      fs.classList.remove('fullscreen');
+      fs.querySelector('.card-btn').textContent = '⛶';
+      fs.querySelectorAll('.chart-box, .chart-box-sm').forEach(p => { if (p.id) Plotly.Plots.resize(p); });
+    }
+  }
+});
+
+// ═══════════ 全屏与导出 ═══════════
+function toggleFullscreen(btn) {
+  const card = btn.closest('.card');
+  card.classList.toggle('fullscreen');
+  btn.textContent = card.classList.contains('fullscreen') ? '✕' : '⛶';
+  setTimeout(() => {
+    card.querySelectorAll('.chart-box, .chart-box-sm').forEach(p => { if (p.id) Plotly.Plots.resize(p); });
+  }, 50);
+}
+
+function toggleFullscreenCard(card) {
+  const isFS = card.classList.toggle('fullscreen');
+  const btn = card.querySelector('.card-btn');
+  if (btn) btn.textContent = isFS ? '✕' : '⛶';
+  setTimeout(() => {
+    card.querySelectorAll('.chart-box, .chart-box-sm').forEach(p => { if (p.id) Plotly.Plots.resize(p); });
+  }, 50);
+}
+
+// 双击卡片进入全屏（所有卡片通用，尤其并排小卡片）
+document.addEventListener('dblclick', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  if (e.target.closest('.card-toolbar, select, input, button')) return;
+  toggleFullscreenCard(card);
+});
+
+function exportPNG(chartId, pageName) {
+  const stratName = 'style_rotation_momentum';
+  const date = new Date().toISOString().slice(0,10);
+  Plotly.downloadImage(chartId, {
+    format: 'png', width: 1200, height: 600,
+    filename: `${stratName}_${pageName}_${date}`
+  });
+}
+
+initStageToggles();
+renderAll();
+</script>
+</body>
+</html>
