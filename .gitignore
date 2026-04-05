@@ -21,6 +21,7 @@ reports/
 # IDE
 .idea/
 .vscode/settings.json
+.vscode/.feishu-mcp.env
 
 # 临时文件
 tmp_*.py
