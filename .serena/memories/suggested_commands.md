@@ -1,0 +1,1 @@
+Frozen product CLI commands live in docs/产品原型/v0.2/06-产品功能冻结文档-v1.md. Key commands: vortex profile resolve/explain; vortex data bootstrap/update/backfill/repair/publish/status; vortex research run/inspect/compare/publish-signal/status; vortex strategy backtest/inspect/compare/compile/status; vortex trade paper rebalance/live rebalance/inspect/retry/reconcile/status.

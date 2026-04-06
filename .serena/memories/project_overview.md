@@ -1,0 +1,1 @@
+Vortex Quant is a quantitative trading platform organized around config, data, research, strategy, trade, and notification domains. Current codebase is an early Python implementation centered on profile resolution under vortex/config/profile, while docs/架构设计 and docs/产品原型/v0.2 carry the frozen architecture and CLI/product contracts.
