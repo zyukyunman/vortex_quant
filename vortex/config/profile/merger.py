@@ -1,57 +1,63 @@
-"""Profile 默认值、继承链与 override 合并。"""
+"""配置合并器：把多来源配置折叠成一个最终 dict。
 
+这里的关键词是“优先级”：
+
+    defaults < parent < user < overrides
+
+也就是说，越靠右的来源越“强”，后写入的值会覆盖前面的值。
+
+注意：这里只做字典层面的合并，不做类型校验、不做业务语义判断。
+"""
 from __future__ import annotations
 
-from copy import deepcopy
-from typing import Any
-
-from .defaults import ProfileDefaultsProvider
-from .exceptions import ProfileValidationError
-from .loader import ProfileLoader
-from .models import BaseProfile, profile_from_dict
-from .overrides import RuntimeOverride
-
-
-def deep_merge(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    merged = deepcopy(base)
-    for key, value in incoming.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge(merged[key], value)
-        else:
-            merged[key] = deepcopy(value)
-    return merged
+import copy
 
 
 class ProfileMerger:
-    def __init__(self, loader: ProfileLoader, defaults_provider: ProfileDefaultsProvider) -> None:
-        self.loader = loader
-        self.defaults_provider = defaults_provider
+    """合并 defaults + parent + user + CLI override。"""
 
-    def expand(
+    def merge(
         self,
-        profile: BaseProfile,
-        override: RuntimeOverride | None = None,
-    ) -> BaseProfile:
-        merged_payload = self._expand_to_dict(profile=profile, seen=set())
-        if override and override.values:
-            merged_payload = deep_merge(merged_payload, override.values)
-        return profile_from_dict(merged_payload)
+        defaults: dict,
+        parent: dict | None,
+        user: dict,
+        overrides: dict | None = None,
+    ) -> dict:
+        """按优先级合并配置。
 
-    def _expand_to_dict(self, profile: BaseProfile, seen: set[str]) -> dict[str, Any]:
-        if profile.name in seen:
-            raise ProfileValidationError(f"检测到循环继承: {profile.name}")
+        对于 dict 类型的值做递归浅合并，其余类型直接覆盖。
+        """
+        # 第一步永远从默认值模板起步，保证“未显式填写的字段也有兜底”。
+        result = copy.deepcopy(defaults)
+        # 第二步应用父配置，让子配置可以继承一份基础模板。
+        if parent:
+            result = self._deep_merge(result, parent)
+        # 第三步应用用户自己的 YAML，这通常是最主要的显式配置来源。
+        result = self._deep_merge(result, user)
+        # 最后再应用临时 override，例如 CLI 上用 `--set` 传入的值。
+        if overrides:
+            result = self._deep_merge(result, overrides)
+        return result
 
-        # 这里刻意读取原始 YAML，而不是直接使用 dataclass 实例的 `to_dict()`。
-        # 原因是 dataclass 会把未填写字段补成空字符串/空列表，
-        # 那样在继承场景下，子 profile 会错误地把父模板的有效值覆盖掉。
-        raw_profile_mapping = self.loader.load_mapping(name=profile.name, profile_type=profile.type)
-        payload = self.defaults_provider.get_defaults(
-            profile_type=profile.type,
-            market=raw_profile_mapping.get("market"),
-        )
+    @staticmethod
+    def _deep_merge(base: dict, overlay: dict) -> dict:
+        """递归合并 overlay 到 base，overlay 优先。
 
-        if profile.extends:
-            parent = self.loader.load(name=profile.extends, profile_type=profile.type)
-            payload = deep_merge(payload, self._expand_to_dict(parent, seen | {profile.name}))
+        合并规则：
 
-        return deep_merge(payload, raw_profile_mapping)
+        - 如果两边同名字段都是 dict：继续往下一层递归合并
+        - 其他类型（标量、list、None 等）：直接用 overlay 覆盖 base
+        """
+        merged = copy.deepcopy(base)
+        for key, value in overlay.items():
+            if (
+                key in merged
+                and isinstance(merged[key], dict)
+                and isinstance(value, dict)
+            ):
+                # 两边都是字典时，保留已有结构并递归补丁式合并。
+                merged[key] = ProfileMerger._deep_merge(merged[key], value)
+            else:
+                # 非 dict 值直接覆盖，例如 list、字符串、数字、None。
+                merged[key] = copy.deepcopy(value)
+        return merged

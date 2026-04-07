@@ -1,5 +1,5 @@
-# 数据目录 (Parquet 文件, 本地不提交)
-data/
+# 数据目录 (Parquet 文件, 仅忽略仓库根 data/，不要误伤源码包 vortex/data/)
+/data/
 
 # 环境配置 (含 Token)
 .env

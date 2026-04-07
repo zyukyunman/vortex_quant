@@ -1,5 +1,4 @@
-from .cli import main
+"""允许 python -m vortex 执行 CLI。"""
+from vortex.cli import main
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+main()
