@@ -1,0 +1,1 @@
+Repository currently contains a small Python package under vortex/ with CLI entrypoints and profile resolution modules: models, defaults, loader, merger, validator, resolver, service, store. Architecture/spec docs are under docs/架构设计, and product/freeze docs are under docs/产品原型/v0.2.

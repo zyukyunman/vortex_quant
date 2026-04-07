@@ -51,6 +51,11 @@ body {
   line-height: 1.6;
   transition: background var(--transition), color var(--transition);
 }
+.report-shell {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 16px 24px 0;
+}
 
 /* ═══════════════════════ 顶部导航 ═══════════════════════ */
 .top-bar {
@@ -104,7 +109,7 @@ body {
 .theme-toggle:hover { background: var(--primary-light); color: var(--primary); }
 
 /* ═══════════════════════ 页面容器 ═══════════════════════ */
-.page { display: none; padding: 24px; max-width: 1400px; margin: 0 auto; }
+.page { display: none; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
 .page.active { display: block; }
 .page-header { margin-bottom: 20px; }
 .page-title { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
@@ -118,15 +123,35 @@ body {
   grid-template-columns: 1fr 320px;
   gap: 20px;
   margin-bottom: 20px;
+  align-items: start;
 }
 .layout-full { margin-bottom: 20px; }
 .aux-row {
   display: grid; gap: 20px;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
   margin-bottom: 20px;
+  align-items: start;
 }
+.layout-main > *,
+.aux-row > * { min-width: 0; }
 @media (max-width: 960px) {
-  .layout-main { grid-template-columns: 1fr; }
+  .layout-main { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .top-bar { padding: 0 16px; }
+  .report-shell { padding: 16px 16px 0; }
+  .page { padding: 20px 16px; }
+  .page-title { font-size: 20px; }
+  .card { padding: 16px; }
+  .chart-box,
+  .chart-box-sm {
+    min-height: 240px;
+    aspect-ratio: auto;
+  }
+  .tooltip-bubble {
+    min-width: min(280px, calc(100vw - 32px));
+    max-width: calc(100vw - 32px);
+  }
 }
 
 /* ═══════════════════════ 卡片 ═══════════════════════ */
@@ -138,6 +163,7 @@ body {
   padding: 20px;
   transition: all var(--transition);
   position: relative;
+  min-width: 0;
 }
 .card:hover { box-shadow: var(--shadow-lg); }
 .card::after {
@@ -153,8 +179,10 @@ body {
 .card-hint {
   font-size: 12px; color: var(--text-hint); margin-bottom: 14px;
 }
-.chart-box { width: 100%; min-height: 360px; aspect-ratio: 16 / 8; }
-.chart-box-sm { width: 100%; min-height: 260px; aspect-ratio: 16 / 7; }
+.chart-box { width: 100%; min-height: 360px; aspect-ratio: 16 / 8; min-width: 0; overflow: hidden; }
+.chart-box-sm { width: 100%; min-height: 260px; aspect-ratio: 16 / 7; min-width: 0; overflow: hidden; }
+.chart-box > div,
+.chart-box-sm > div { max-width: 100%; }
 
 /* ═══════════════════════ 侧栏指标卡片 ═══════════════════════ */
 .sidebar { display: flex; flex-direction: column; gap: 12px; }
@@ -166,12 +194,41 @@ body {
   transition: all var(--transition);
 }
 .metric-card:hover { border-color: var(--primary); }
-.metric-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+.metric-label-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; flex-wrap: wrap; }
+.metric-label { font-size: 12px; color: var(--text-secondary); }
 .metric-value { font-size: 24px; font-weight: 700; font-family: var(--mono); }
 .metric-value.positive { color: var(--green); }
 .metric-value.negative { color: var(--red); }
 .metric-value.neutral { color: var(--primary); }
 .metric-sub { font-size: 11px; color: var(--text-hint); margin-top: 2px; }
+.entity-summary {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 2px 4px;
+  color: var(--text-secondary); font-size: 13px;
+}
+.entity-summary strong { color: var(--text); font-size: 15px; }
+.info-wrap { position: relative; display: inline-flex; align-items: center; }
+.info-dot {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: none; background: var(--primary-light); color: var(--primary);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.tooltip-bubble {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 220;
+  min-width: 280px; max-width: 360px; padding: 12px 14px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); font-size: 12px; line-height: 1.65;
+  opacity: 0; pointer-events: none; transform: translateY(-6px);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.tooltip-title { font-weight: 700; margin-bottom: 6px; }
+.tooltip-section + .tooltip-section { margin-top: 6px; }
+.info-wrap:hover .tooltip-bubble,
+.info-wrap:focus-within .tooltip-bubble {
+  opacity: 1; pointer-events: auto; transform: translateY(0);
+}
 
 /* ═══════════════════════ 评级徽章 ═══════════════════════ */
 .badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -203,6 +260,14 @@ body {
 .data-table tr:hover td { background: var(--surface-hover); }
 .data-table .positive { color: var(--green); }
 .data-table .negative { color: var(--red); }
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 4px;
+}
+.table-wrap .data-table { min-width: 760px; }
 
 /* ═══════════════════════ 截面快照滑块 ═══════════════════════ */
 .slider-row {
@@ -330,11 +395,11 @@ kbd {
 <nav class="top-bar">
   <div class="logo">Vortex <span>Tear Sheet</span></div>
   <div class="nav-tabs" id="navTabs">
-    <button class="nav-tab active" data-page="ic">IC 分析</button>
-    <button class="nav-tab" data-page="group">分组收益</button>
-    <button class="nav-tab" data-page="xsection">截面分布</button>
+    <button class="nav-tab active" data-page="ic_analysis">IC 分析</button>
+    <button class="nav-tab" data-page="group_return">分组收益</button>
+    <button class="nav-tab" data-page="distribution">截面分布</button>
     <button class="nav-tab" data-page="snapshot">截面快照</button>
-    <button class="nav-tab" data-page="corr">相关性矩阵</button>
+    <button class="nav-tab" data-page="correlation">相关性矩阵</button>
     <button class="nav-tab" data-page="regime">Regime 分析</button>
     <button class="nav-tab" data-page="capacity">容量与实用性</button>
   </div>
@@ -342,12 +407,25 @@ kbd {
 </nav>
 
 <!-- ═══════════ 概览信息栏 ═══════════ -->
-<div style="max-width:1400px; margin:0 auto; padding:16px 24px 0;">
+<div class="report-shell">
   <div class="badge-row">
     <span class="badge badge-score" id="overallScore">综合评级 72 分</span>
-    <span class="badge badge-type" id="factorType">动量因子</span>
+    <span class="badge badge-type" id="factorType">复合选股因子</span>
     <span class="badge badge-type">📅 2020-01-02 → 2026-04-03</span>
     <span class="badge badge-type">📊 沪深全 A</span>
+  </div>
+  <div class="entity-summary">
+    <strong>FCF+低波复合因子 <span style="font-weight:500; color:var(--text-hint)">(composite_fcf_lowvol)</span></strong>
+    <span class="info-wrap">
+      <button class="info-dot" type="button" aria-label="查看因子说明">?</button>
+      <span class="tooltip-bubble">
+        <div class="tooltip-title">因子说明</div>
+        <div class="tooltip-section"><strong>含义：</strong>先把自由现金流收益率与低波动率倒数做截面标准化，再按 0.6 / 0.4 加权，兼顾“便宜”和“稳”。</div>
+        <div class="tooltip-section"><strong>怎么看：</strong>它更适合定义长期候选池，再由动量信号决定调仓先后顺序。</div>
+        <div class="tooltip-section"><strong>注意：</strong>复合因子分数更适合做排序，不适合直接解释成某个财务绝对值。</div>
+      </span>
+    </span>
+    <span>高分代表同时满足价值吸引力与波动稳定性。</span>
   </div>
 </div>
 
@@ -355,7 +433,7 @@ kbd {
      页面一：IC 分析
      IC 衡量因子排名与未来收益排名的截面相关性，越高说明预测能力越强。
      ═══════════════════════════════════════════════════════════════ -->
-<section class="page active" id="page-ic">
+<section class="page active" id="page-ic_analysis">
   <div class="page-header">
     <h2 class="page-title">IC 分析</h2>
     <p class="page-subtitle">IC（信息系数）：因子排名与未来收益排名的截面相关性，越高说明预测能力越强。IC > 0.03 通常被认为有效。</p>
@@ -370,17 +448,17 @@ kbd {
     </div>
     <div class="sidebar">
       <div class="metric-card">
-        <div class="metric-label">IC_5d 均值</div>
+        <div class="metric-label-row"><div class="metric-label">IC_5d 均值</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">IC_5d 均值</div><div class="tooltip-section"><strong>含义：</strong>同一截面上，因子值排序与未来 5 日收益排序的相关性均值。</div><div class="tooltip-section"><strong>怎么看：</strong>持续为正，说明高因子值股票未来更容易跑赢。</div><div class="tooltip-section"><strong>注意：</strong>要和 ICIR、覆盖率一起看，不能只看单个均值。</div></span></span></div>
         <div class="metric-value positive" id="ic5dMean">0.068</div>
         <div class="metric-sub">同类 72 百分位</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">RankIC_5d 均值</div>
+        <div class="metric-label-row"><div class="metric-label">RankIC_5d 均值</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">RankIC_5d 均值</div><div class="tooltip-section"><strong>含义：</strong>把原值改成排序后再算 IC，更抗极端值。</div><div class="tooltip-section"><strong>怎么看：</strong>如果 RankIC 比 IC 更稳，说明因子方向可靠但绝对幅度受离群点影响。</div></span></span></div>
         <div class="metric-value positive" id="rankIcMean">0.075</div>
         <div class="metric-sub">更稳健，抵抗极端值</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">ICIR</div>
+        <div class="metric-label-row"><div class="metric-label">ICIR</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">ICIR</div><div class="tooltip-section"><strong>含义：</strong>IC 均值除以 IC 标准差，衡量因子有效性是否稳定。</div><div class="tooltip-section"><strong>怎么看：</strong>通常 > 0.5 才说明因子不是“偶尔有效”。</div><div class="tooltip-section"><strong>注意：</strong>IC 均值不错但 ICIR 很低，说明波动很大，实盘体验往往不稳定。</div></span></span></div>
         <div class="metric-value neutral" id="icirValue">0.62</div>
         <div class="metric-sub">> 0.5 → 因子持续有效</div>
       </div>
@@ -420,7 +498,7 @@ kbd {
      页面二：分组收益
      按因子值分成 N 组，看各组收益是否单调——这是截面分析最直观的表达。
      ═══════════════════════════════════════════════════════════════ -->
-<section class="page" id="page-group">
+<section class="page" id="page-group_return">
   <div class="page-header">
     <h2 class="page-title">分组收益</h2>
     <p class="page-subtitle">按因子值从低到高分 5 组（或 10 组），观察各组收益是否呈单调递增/递减。各组呈扇形展开且不交叉 → 单调性好。</p>
@@ -440,12 +518,12 @@ kbd {
     </div>
     <div class="sidebar">
       <div class="metric-card">
-        <div class="metric-label">多空年化收益</div>
+        <div class="metric-label-row"><div class="metric-label">多空年化收益</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">多空年化收益</div><div class="tooltip-section"><strong>含义：</strong>做多最高分组、做空最低分组后，把组合收益折算成年化结果。</div><div class="tooltip-section"><strong>怎么看：</strong>它是判断信号强度是否足够的核心指标，但要结合 Sharpe、换手和容量一起看。</div><div class="tooltip-section"><strong>注意：</strong>这不是最终策略收益，因为还没叠加你的风控、调仓和交易成本约束。</div></span></span></div>
         <div class="metric-value positive">32.4%</div>
         <div class="metric-sub">Top - Bottom 组</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">多空 Sharpe</div>
+        <div class="metric-label-row"><div class="metric-label">多空 Sharpe</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">多空 Sharpe</div><div class="tooltip-section"><strong>含义：</strong>多空组合每承受一单位波动换回多少收益。</div><div class="tooltip-section"><strong>怎么看：</strong>通常 > 1 才能说明收益质量比较健康。</div><div class="tooltip-section"><strong>注意：</strong>高收益但 Sharpe 很低，说明盈利主要靠少数极端时段，不够稳定。</div></span></span></div>
         <div class="metric-value positive">1.56</div>
         <div class="metric-sub">> 1.0 → 风险调整后有效</div>
       </div>
@@ -478,16 +556,18 @@ kbd {
   <div class="layout-full card">
     <div class="card-title">分位年化指标表</div>
     <div class="card-hint">各分位的年化收益、Sharpe、最大回撤、换手率。Top 组 Sharpe 显著高 → 因子可实操</div>
-    <table class="data-table">
-      <thead><tr><th>分位</th><th>年化收益</th><th>年化波动</th><th>Sharpe</th><th>最大回撤</th><th>换手率</th></tr></thead>
-      <tbody>
-        <tr><td>Q1 (Bottom)</td><td class="negative">-8.2%</td><td>24.1%</td><td class="negative">-0.34</td><td class="negative">-42.6%</td><td>18.3x</td></tr>
-        <tr><td>Q2</td><td class="negative">-1.5%</td><td>22.8%</td><td class="negative">-0.07</td><td class="negative">-38.1%</td><td>15.2x</td></tr>
-        <tr><td>Q3</td><td>6.7%</td><td>21.5%</td><td>0.31</td><td class="negative">-32.4%</td><td>13.8x</td></tr>
-        <tr><td>Q4</td><td class="positive">14.3%</td><td>22.1%</td><td class="positive">0.65</td><td class="negative">-28.9%</td><td>14.1x</td></tr>
-        <tr><td>Q5 (Top)</td><td class="positive">24.2%</td><td>23.6%</td><td class="positive">1.03</td><td class="negative">-25.3%</td><td>16.7x</td></tr>
-      </tbody>
-    </table>
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr><th>分位</th><th>年化收益</th><th>年化波动</th><th>Sharpe</th><th>最大回撤</th><th>换手率</th></tr></thead>
+        <tbody>
+          <tr><td>Q1 (Bottom)</td><td class="negative">-8.2%</td><td>24.1%</td><td class="negative">-0.34</td><td class="negative">-42.6%</td><td>18.3x</td></tr>
+          <tr><td>Q2</td><td class="negative">-1.5%</td><td>22.8%</td><td class="negative">-0.07</td><td class="negative">-38.1%</td><td>15.2x</td></tr>
+          <tr><td>Q3</td><td>6.7%</td><td>21.5%</td><td>0.31</td><td class="negative">-32.4%</td><td>13.8x</td></tr>
+          <tr><td>Q4</td><td class="positive">14.3%</td><td>22.1%</td><td class="positive">0.65</td><td class="negative">-28.9%</td><td>14.1x</td></tr>
+          <tr><td>Q5 (Top)</td><td class="positive">24.2%</td><td>23.6%</td><td class="positive">1.03</td><td class="negative">-25.3%</td><td>16.7x</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </section>
 
@@ -495,7 +575,7 @@ kbd {
      页面三：截面分布与稳定性
      截面质量直接影响因子可靠性——分布异常或覆盖率不稳定的因子，IC 再高也不可信。
      ═══════════════════════════════════════════════════════════════ -->
-<section class="page" id="page-xsection">
+<section class="page" id="page-distribution">
   <div class="page-header">
     <h2 class="page-title">截面分布与稳定性</h2>
     <p class="page-subtitle">截面质量直接影响因子可靠性——分布异常或覆盖率不稳定的因子，IC 再高也不可信。需重点关注覆盖率持续 > 80%。</p>
@@ -584,7 +664,7 @@ kbd {
 <!-- ═══════════════════════════════════════════════════════════════
      页面五：因子相关性矩阵
      ═══════════════════════════════════════════════════════════════ -->
-<section class="page" id="page-corr">
+<section class="page" id="page-correlation">
   <div class="page-header">
     <h2 class="page-title">因子相关性矩阵</h2>
     <p class="page-subtitle">衡量当前因子与已注册因子库中其他因子的相关性。高相关 → 信息冗余；低相关 → 独立 alpha 来源。</p>
@@ -798,14 +878,38 @@ const N = 300;
 const dates = genDates('2020-01-02', N);
 const colors = { primary: '#1a73e8', green: '#10b981', red: '#ef4444', amber: '#f59e0b', purple: '#8b5cf6', cyan: '#06b6d4' };
 
+function schedulePageResize(pageName) {
+  const page = typeof pageName === 'string' ? document.querySelector(`#page-${pageName}`) : pageName;
+  if (!page) return;
+  const resize = () => {
+    page.querySelectorAll('.chart-box, .chart-box-sm').forEach(plot => {
+      if (plot.id) Plotly.Plots.resize(plot);
+    });
+  };
+  requestAnimationFrame(() => {
+    resize();
+    setTimeout(resize, 80);
+  });
+}
+
+function activatePage(pageName, { scrollTab = false } = {}) {
+  $$('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.page === pageName));
+  $$('.page').forEach(p => p.classList.toggle('active', p.id === `page-${pageName}`));
+  if (scrollTab) {
+    document.querySelector(`.nav-tab[data-page="${pageName}"]`)?.scrollIntoView({
+      behavior: 'smooth',
+      inline: 'center',
+      block: 'nearest',
+    });
+  }
+  schedulePageResize(pageName);
+}
+
 // ═══════════ 导航切换 ═══════════
 $('#navTabs').addEventListener('click', e => {
   const tab = e.target.closest('.nav-tab');
   if (!tab) return;
-  $$('.nav-tab').forEach(t => t.classList.remove('active'));
-  $$('.page').forEach(p => p.classList.remove('active'));
-  tab.classList.add('active');
-  $(`#page-${tab.dataset.page}`).classList.add('active');
+  activatePage(tab.dataset.page);
 });
 
 // ═══════════ 主题切换 ═══════════
@@ -1079,7 +1183,7 @@ function renderCapacityPage() {
 }
 
 // ═══════════ 新增交互：键盘翻页 ═══════════
-const pageOrder = ['ic','group','xsection','snapshot','corr','regime','capacity'];
+const pageOrder = ['ic_analysis','group_return','distribution','snapshot','correlation','regime','capacity'];
 document.addEventListener('keydown', e => {
   // 焦点在 input/range/textarea 时禁用
   const tag = document.activeElement?.tagName;
@@ -1092,12 +1196,7 @@ document.addEventListener('keydown', e => {
     const next = e.key === 'ArrowRight'
       ? pageOrder[(idx + 1) % pageOrder.length]
       : pageOrder[(idx - 1 + pageOrder.length) % pageOrder.length];
-    $$('.nav-tab').forEach(t => t.classList.remove('active'));
-    $$('.page').forEach(p => p.classList.remove('active'));
-    const tab = document.querySelector(`.nav-tab[data-page="${next}"]`);
-    tab.classList.add('active');
-    $(`#page-${next}`).classList.add('active');
-    tab.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+    activatePage(next, { scrollTab: true });
   }
   if (e.key === 'd' || e.key === 'D') {
     $('#themeToggle').click();
@@ -1226,6 +1325,8 @@ function filterCorrelation(query) {
 
 // ─── 初始化 ───
 renderAllCharts();
+schedulePageResize(document.querySelector('.page.active'));
+window.addEventListener('resize', () => schedulePageResize(document.querySelector('.page.active')));
 </script>
 </body>
 </html>
