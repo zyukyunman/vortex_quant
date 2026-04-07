@@ -100,12 +100,40 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); line
 .sidebar { display: flex; flex-direction: column; gap: 12px; }
 .metric-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; transition: all var(--transition); }
 .metric-card:hover { border-color: var(--primary); }
-.metric-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+.metric-label-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; flex-wrap: wrap; }
+.metric-label { font-size: 12px; color: var(--text-secondary); }
 .metric-value { font-size: 24px; font-weight: 700; font-family: var(--mono); }
 .metric-value.positive { color: var(--green); }
 .metric-value.negative { color: var(--red); }
 .metric-value.neutral { color: var(--primary); }
 .metric-sub { font-size: 11px; color: var(--text-hint); margin-top: 2px; }
+.entity-summary {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 2px 4px; color: var(--text-secondary); font-size: 13px;
+}
+.entity-summary strong { color: var(--text); font-size: 15px; }
+.info-wrap { position: relative; display: inline-flex; align-items: center; }
+.info-dot {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: none; background: var(--primary-light); color: var(--primary);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.tooltip-bubble {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 220;
+  min-width: 280px; max-width: 360px; padding: 12px 14px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); font-size: 12px; line-height: 1.65;
+  opacity: 0; pointer-events: none; transform: translateY(-6px);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.tooltip-title { font-weight: 700; margin-bottom: 6px; }
+.tooltip-section + .tooltip-section { margin-top: 6px; }
+.info-wrap:hover .tooltip-bubble,
+.info-wrap:focus-within .tooltip-bubble {
+  opacity: 1; pointer-events: auto; transform: translateY(0);
+}
 
 .badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
@@ -217,6 +245,19 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px
     <span class="badge badge-type">📅 2020-01-02 → 2026-04-03</span>
     <span class="badge badge-type">📊 沪深全 A × 月频调仓</span>
   </div>
+  <div class="entity-summary">
+    <strong>价值选股 + 动量择时实例策略 <span style="font-weight:500; color:var(--text-hint)">(fcf_lowvol_momentum)</span></strong>
+    <span class="info-wrap">
+      <button class="info-dot" type="button" aria-label="查看策略说明">?</button>
+      <span class="tooltip-bubble">
+        <div class="tooltip-title">策略说明</div>
+        <div class="tooltip-section"><strong>含义：</strong>先用价值与低波复合信号定义候选池，再用动量信号决定买卖先后与调仓节奏。</div>
+        <div class="tooltip-section"><strong>怎么看：</strong>回测报告回答的是“这套流程在历史上值不值得继续保留和迭代”，不是直接给出单次交易建议。</div>
+        <div class="tooltip-section"><strong>注意：</strong>高收益也要同时满足可接受的回撤、换手和稳定性，才能进入长期跟踪。</div>
+      </span>
+    </span>
+    <span>先决定“该持有什么”，再决定“现在调不调、先调谁”。</span>
+  </div>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════════
@@ -244,22 +285,22 @@ kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px
     </div>
     <div class="sidebar">
       <div class="metric-card">
-        <div class="metric-label">年化收益</div>
+        <div class="metric-label-row"><div class="metric-label">年化收益</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">年化收益</div><div class="tooltip-section"><strong>含义：</strong>把整个回测区间的累计收益折算成一年后的复合增长率。</div><div class="tooltip-section"><strong>怎么看：</strong>它回答“长期复利水平高不高”，要和回撤、换手一起看。</div><div class="tooltip-section"><strong>注意：</strong>样本很短时年化会被放大，不能脱离区间长度单独比较。</div></span></span></div>
         <div class="metric-value positive">28.3%</div>
         <div class="metric-sub">vs 基准 6.2%</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Sharpe Ratio</div>
+        <div class="metric-label-row"><div class="metric-label">Sharpe Ratio</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">Sharpe Ratio</div><div class="tooltip-section"><strong>含义：</strong>每承受一单位波动，策略平均换回多少收益。</div><div class="tooltip-section"><strong>怎么看：</strong>通常 > 1 才能说明风险调整后的收益质量较好。</div><div class="tooltip-section"><strong>注意：</strong>它不直接反映极端尾部风险，必须配合最大回撤一起看。</div></span></span></div>
         <div class="metric-value positive">1.42</div>
         <div class="metric-sub">> 1.0 → 风险调整后优秀</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">最大回撤</div>
+        <div class="metric-label-row"><div class="metric-label">最大回撤</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">最大回撤</div><div class="tooltip-section"><strong>含义：</strong>从历史高点跌到随后最低点的最深亏损幅度。</div><div class="tooltip-section"><strong>怎么看：</strong>它决定了资金和心理上的承受要求，是实盘可持有性的底线指标。</div><div class="tooltip-section"><strong>注意：</strong>高年化但回撤太深、恢复太慢，通常很难长期执行。</div></span></span></div>
         <div class="metric-value negative">-16.8%</div>
         <div class="metric-sub">回撤持续 42 个交易日</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">年化换手</div>
+        <div class="metric-label-row"><div class="metric-label">年化换手</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">年化换手</div><div class="tooltip-section"><strong>含义：</strong>全年大约把组合完整换了多少遍，直接决定交易成本与容量压力。</div><div class="tooltip-section"><strong>怎么看：</strong>换手越低越不一定更好，但高换手必须用更高 Sharpe 与更高超额来证明自己。</div><div class="tooltip-section"><strong>注意：</strong>如果收益只是靠高频换手“买”出来，实盘后往往会被滑点侵蚀。</div></span></span></div>
         <div class="metric-value neutral">4.2x</div>
         <div class="metric-sub">月频调仓，成本可控</div>
       </div>

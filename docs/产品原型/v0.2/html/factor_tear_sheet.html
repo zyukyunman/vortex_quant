@@ -166,12 +166,41 @@ body {
   transition: all var(--transition);
 }
 .metric-card:hover { border-color: var(--primary); }
-.metric-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 2px; }
+.metric-label-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; flex-wrap: wrap; }
+.metric-label { font-size: 12px; color: var(--text-secondary); }
 .metric-value { font-size: 24px; font-weight: 700; font-family: var(--mono); }
 .metric-value.positive { color: var(--green); }
 .metric-value.negative { color: var(--red); }
 .metric-value.neutral { color: var(--primary); }
 .metric-sub { font-size: 11px; color: var(--text-hint); margin-top: 2px; }
+.entity-summary {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 2px 4px;
+  color: var(--text-secondary); font-size: 13px;
+}
+.entity-summary strong { color: var(--text); font-size: 15px; }
+.info-wrap { position: relative; display: inline-flex; align-items: center; }
+.info-dot {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: none; background: var(--primary-light); color: var(--primary);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.tooltip-bubble {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 220;
+  min-width: 280px; max-width: 360px; padding: 12px 14px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); font-size: 12px; line-height: 1.65;
+  opacity: 0; pointer-events: none; transform: translateY(-6px);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.tooltip-title { font-weight: 700; margin-bottom: 6px; }
+.tooltip-section + .tooltip-section { margin-top: 6px; }
+.info-wrap:hover .tooltip-bubble,
+.info-wrap:focus-within .tooltip-bubble {
+  opacity: 1; pointer-events: auto; transform: translateY(0);
+}
 
 /* ═══════════════════════ 评级徽章 ═══════════════════════ */
 .badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -345,9 +374,22 @@ kbd {
 <div style="max-width:1400px; margin:0 auto; padding:16px 24px 0;">
   <div class="badge-row">
     <span class="badge badge-score" id="overallScore">综合评级 72 分</span>
-    <span class="badge badge-type" id="factorType">动量因子</span>
+    <span class="badge badge-type" id="factorType">复合选股因子</span>
     <span class="badge badge-type">📅 2020-01-02 → 2026-04-03</span>
     <span class="badge badge-type">📊 沪深全 A</span>
+  </div>
+  <div class="entity-summary">
+    <strong>FCF+低波复合因子 <span style="font-weight:500; color:var(--text-hint)">(composite_fcf_lowvol)</span></strong>
+    <span class="info-wrap">
+      <button class="info-dot" type="button" aria-label="查看因子说明">?</button>
+      <span class="tooltip-bubble">
+        <div class="tooltip-title">因子说明</div>
+        <div class="tooltip-section"><strong>含义：</strong>先把自由现金流收益率与低波动率倒数做截面标准化，再按 0.6 / 0.4 加权，兼顾“便宜”和“稳”。</div>
+        <div class="tooltip-section"><strong>怎么看：</strong>它更适合定义长期候选池，再由动量信号决定调仓先后顺序。</div>
+        <div class="tooltip-section"><strong>注意：</strong>复合因子分数更适合做排序，不适合直接解释成某个财务绝对值。</div>
+      </span>
+    </span>
+    <span>高分代表同时满足价值吸引力与波动稳定性。</span>
   </div>
 </div>
 
@@ -370,17 +412,17 @@ kbd {
     </div>
     <div class="sidebar">
       <div class="metric-card">
-        <div class="metric-label">IC_5d 均值</div>
+        <div class="metric-label-row"><div class="metric-label">IC_5d 均值</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">IC_5d 均值</div><div class="tooltip-section"><strong>含义：</strong>同一截面上，因子值排序与未来 5 日收益排序的相关性均值。</div><div class="tooltip-section"><strong>怎么看：</strong>持续为正，说明高因子值股票未来更容易跑赢。</div><div class="tooltip-section"><strong>注意：</strong>要和 ICIR、覆盖率一起看，不能只看单个均值。</div></span></span></div>
         <div class="metric-value positive" id="ic5dMean">0.068</div>
         <div class="metric-sub">同类 72 百分位</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">RankIC_5d 均值</div>
+        <div class="metric-label-row"><div class="metric-label">RankIC_5d 均值</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">RankIC_5d 均值</div><div class="tooltip-section"><strong>含义：</strong>把原值改成排序后再算 IC，更抗极端值。</div><div class="tooltip-section"><strong>怎么看：</strong>如果 RankIC 比 IC 更稳，说明因子方向可靠但绝对幅度受离群点影响。</div></span></span></div>
         <div class="metric-value positive" id="rankIcMean">0.075</div>
         <div class="metric-sub">更稳健，抵抗极端值</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">ICIR</div>
+        <div class="metric-label-row"><div class="metric-label">ICIR</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">ICIR</div><div class="tooltip-section"><strong>含义：</strong>IC 均值除以 IC 标准差，衡量因子有效性是否稳定。</div><div class="tooltip-section"><strong>怎么看：</strong>通常 > 0.5 才说明因子不是“偶尔有效”。</div><div class="tooltip-section"><strong>注意：</strong>IC 均值不错但 ICIR 很低，说明波动很大，实盘体验往往不稳定。</div></span></span></div>
         <div class="metric-value neutral" id="icirValue">0.62</div>
         <div class="metric-sub">> 0.5 → 因子持续有效</div>
       </div>
@@ -440,12 +482,12 @@ kbd {
     </div>
     <div class="sidebar">
       <div class="metric-card">
-        <div class="metric-label">多空年化收益</div>
+        <div class="metric-label-row"><div class="metric-label">多空年化收益</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">多空年化收益</div><div class="tooltip-section"><strong>含义：</strong>做多最高分组、做空最低分组后，把组合收益折算成年化结果。</div><div class="tooltip-section"><strong>怎么看：</strong>它是判断信号强度是否足够的核心指标，但要结合 Sharpe、换手和容量一起看。</div><div class="tooltip-section"><strong>注意：</strong>这不是最终策略收益，因为还没叠加你的风控、调仓和交易成本约束。</div></span></span></div>
         <div class="metric-value positive">32.4%</div>
         <div class="metric-sub">Top - Bottom 组</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">多空 Sharpe</div>
+        <div class="metric-label-row"><div class="metric-label">多空 Sharpe</div><span class="info-wrap"><button class="info-dot" type="button">?</button><span class="tooltip-bubble"><div class="tooltip-title">多空 Sharpe</div><div class="tooltip-section"><strong>含义：</strong>多空组合每承受一单位波动换回多少收益。</div><div class="tooltip-section"><strong>怎么看：</strong>通常 > 1 才能说明收益质量比较健康。</div><div class="tooltip-section"><strong>注意：</strong>高收益但 Sharpe 很低，说明盈利主要靠少数极端时段，不够稳定。</div></span></span></div>
         <div class="metric-value positive">1.56</div>
         <div class="metric-sub">> 1.0 → 风险调整后有效</div>
       </div>
