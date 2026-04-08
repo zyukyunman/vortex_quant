@@ -25,6 +25,11 @@ def _build_data_defaults() -> dict:
         "pit_pack": "default",
         "publish_pack": "default",
         "storage_pack": "default",
+        "notification": {
+            "enabled": True,
+            "level": "warning",
+            "channel": "feishu",
+        },
     }
 
 

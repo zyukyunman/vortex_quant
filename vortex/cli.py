@@ -1187,6 +1187,164 @@ def _smoke_test_tushare(token: str) -> bool:
 
 
 # ------------------------------------------------------------------
+# 通知 / Agent 交互配置
+# ------------------------------------------------------------------
+
+
+def _init_step_feishu() -> dict[str, str]:
+    """Init 向导 Step 5: 飞书通知配置。
+
+    逐项引导用户填写飞书开放平台的凭证信息。
+    任何一项留空都视为跳过整个飞书配置。
+
+    Returns:
+        配置成功时返回环境变量字典，跳过时返回空字典。
+    """
+    print("📌 Step 5/6: 飞书通知配置")
+    print("   飞书通知可以在数据更新完成、失败等事件时自动推送消息。")
+    print("   如需配置，请先在飞书开放平台 (open.feishu.cn) 创建一个应用。")
+    print()
+    if not _prompt_yes_no("是否配置飞书通知？", default=False):
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    print()
+    print("   逐项填写飞书配置（任意一项留空即跳过整个飞书配置）：")
+    print()
+
+    app_id = _prompt(
+        "   App ID\n"
+        "   （在飞书开放平台 → 应用管理 → 凭证与基础信息页面获取）",
+    )
+    if not app_id:
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    app_secret = _prompt(
+        "   App Secret\n"
+        "   （同上页面获取，注意保密，不要提交到版本控制）",
+    )
+    if not app_secret:
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    receive_id = _prompt(
+        "   默认接收人 ID\n"
+        "   （在飞书客户端打开目标用户/群组的资料页 → 复制 Open ID 或 Chat ID）",
+    )
+    if not receive_id:
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    receive_id_type = _prompt(
+        "   接收人 ID 类型\n"
+        "   可选值: open_id / user_id / chat_id / email",
+        "open_id",
+    )
+
+    print("   ✅ 飞书通知已配置")
+    return {
+        "FEISHU_APP_ID": app_id,
+        "FEISHU_APP_SECRET": app_secret,
+        "FEISHU_DEFAULT_RECEIVE_ID": receive_id,
+        "FEISHU_DEFAULT_RECEIVE_ID_TYPE": receive_id_type,
+    }
+
+
+def _init_step_agent(root: Path) -> dict[str, str]:
+    """Init 向导 Step 6: AI Agent 配置。
+
+    引导用户配置 AI Agent 后端（当前仅支持 Copilot CLI）。
+    会自动检测 copilot 命令是否可用，不可用时提示安装方法。
+
+    Args:
+        root: 工作区根目录，用作默认 scope
+
+    Returns:
+        配置成功时返回环境变量字典，跳过时返回空字典。
+    """
+    print("📌 Step 6/6: AI Agent 配置")
+    print("   AI Agent 可以在特定事件发生时自动调用 Copilot CLI 进行分析或修复。")
+    print()
+    if not _prompt_yes_no("是否配置 AI Agent？", default=False):
+        print("   已跳过 Agent 配置。")
+        return {}
+
+    # 检测 copilot CLI 是否可用
+    copilot_path = shutil.which("copilot")
+    if copilot_path:
+        print(f"   ✅ 检测到 copilot CLI: {copilot_path}")
+    else:
+        print("   ⚠️  未检测到 copilot 命令。")
+        print("   安装方式：")
+        print("     npm install -g @githubnext/github-copilot-cli")
+        print("   安装后需完成认证：")
+        print("     copilot auth")
+        print()
+        if not _prompt_yes_no("是否仍要配置（安装后即可使用）？", default=True):
+            print("   已跳过 Agent 配置。")
+            return {}
+
+    print()
+    scope = _prompt(
+        "   工作目录范围\n"
+        "   （Agent 执行时的工作目录，通常设为仓库根目录）",
+        str(root),
+    )
+
+    effort = _prompt_choice(
+        "   推理强度：",
+        ["high", "medium", "low"],
+        "high",
+    )
+
+    print(f"   ✅ AI Agent 已配置 (后端=copilot, 强度={effort})")
+    return {
+        "VORTEX_AGENT_ENABLED": "true",
+        "VORTEX_AGENT_BACKEND": "copilot",
+        "VORTEX_AGENT_SCOPE": scope,
+        "VORTEX_AGENT_EFFORT": effort,
+    }
+
+
+def _merge_env_file(env_file: Path, new_vars: dict[str, str]) -> None:
+    """将环境变量合并写入 .env 文件。
+
+    如果 .env 已存在，读取现有内容并更新/追加新变量；
+    如果不存在，创建新文件。保留注释行和空行。
+
+    Args:
+        env_file: .env 文件路径
+        new_vars: 要写入的环境变量字典
+    """
+    lines: list[str] = []
+    existing_keys: set[str] = set()
+
+    if env_file.exists():
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            # 保留注释行和空行
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                lines.append(raw_line)
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in new_vars:
+                # 用新值替换已有的同名变量
+                lines.append(f"{key}={new_vars[key]}")
+                existing_keys.add(key)
+            else:
+                lines.append(raw_line)
+
+    # 追加 .env 中不存在的新变量
+    for key, value in new_vars.items():
+        if key not in existing_keys:
+            lines.append(f"{key}={value}")
+
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ------------------------------------------------------------------
 # 子命令实现
 # ------------------------------------------------------------------
 
@@ -1199,6 +1357,8 @@ def cmd_init(args: argparse.Namespace) -> None:
       2. 选择历史数据起始日
       3. 选择是否立刻开始首次数据更新；若是，则选择本次先同步的数据集
       4. 配置自动更新计划
+      5. 飞书通知配置（可选，逐项填写凭证）
+      6. AI Agent 配置（可选，检测 Copilot CLI 并设置参数）
 
     非交互模式（--non-interactive 或管道输入）：
       使用默认配置，适合 CI/脚本。
@@ -1229,6 +1389,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     bootstrap_datasets: list[str] = []
     write_profile = True
     init_state: dict[str, object] | None = None
+    # 通知/Agent 交互结果，init 成功后统一写入 .env
+    extra_env_vars: dict[str, str] = {}
 
     try:
         if not non_interactive:
@@ -1239,7 +1401,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             print()
 
             # Step 1: TUSHARE_TOKEN
-            print("📌 Step 1/4: 数据源配置")
+            print("📌 Step 1/6: 数据源配置")
             tushare_token = _check_tushare_token()
             if tushare_token:
                 if _smoke_test_tushare(tushare_token):
@@ -1254,13 +1416,13 @@ def cmd_init(args: argparse.Namespace) -> None:
             print()
 
             # Step 2: 历史数据起始日
-            print("📌 Step 2/4: 历史数据范围")
+            print("📌 Step 2/6: 历史数据范围")
             history_start = _prompt("历史数据起始日 (YYYYMMDD)", "20170101")
             config["history_start"] = history_start
             print()
 
             # Step 3: 首次数据更新
-            print("📌 Step 3/4: 首次数据更新")
+            print("📌 Step 3/6: 首次数据更新")
             print("   默认情况下，初始化只写入配置；后续由你手动触发，或由自动调度更新全量数据集。")
             run_bootstrap_now = _prompt_yes_no("是否现在开始首次数据更新？", default=False)
             if run_bootstrap_now:
@@ -1278,7 +1440,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             print()
 
             # Step 4: 自动更新计划
-            print("📌 Step 4/4: 自动更新计划")
+            print("📌 Step 4/6: 自动更新计划")
             enable_schedule = _prompt_yes_no("是否启用每日自动更新？", default=False)
             if enable_schedule:
                 print("  选择更新时间:")
@@ -1300,6 +1462,24 @@ def cmd_init(args: argparse.Namespace) -> None:
                     _print_cron_help()
                     cron = _prompt("Cron 表达式（例如 0 18 * * 1-5）", "0 18 * * 1-5")
                     config["schedule"] = cron
+            print()
+
+            # Step 5: 飞书通知配置
+            feishu_env = _init_step_feishu()
+            if feishu_env:
+                extra_env_vars.update(feishu_env)
+                # 在 profile 配置中启用通知
+                config["notification"] = {
+                    "enabled": True,
+                    "channel": "feishu",
+                    "level": "warning",
+                }
+            print()
+
+            # Step 6: AI Agent 配置
+            agent_env = _init_step_agent(root)
+            if agent_env:
+                extra_env_vars.update(agent_env)
             print()
 
             if default_profile.exists():
@@ -1327,9 +1507,14 @@ def cmd_init(args: argparse.Namespace) -> None:
                 print("   初始化已完成，你可以稍后手动执行 `vortex data bootstrap`。")
 
         # 仅在整个 init 成功收尾后再写入 .env，避免取消时留下半成品。
-        if tushare_token and not env_file.exists():
-            env_file.write_text(f"TUSHARE_TOKEN={tushare_token}\n")
-            print(f"💡 已将 TUSHARE_TOKEN 写入 {env_file}")
+        env_to_write: dict[str, str] = {}
+        if tushare_token:
+            env_to_write["TUSHARE_TOKEN"] = tushare_token
+        env_to_write.update(extra_env_vars)
+        if env_to_write:
+            _merge_env_file(env_file, env_to_write)
+            written_keys = ", ".join(env_to_write.keys())
+            print(f"💡 已将 {written_keys} 写入 {env_file}")
             print("   ⚠️  请确保 .env 已加入 .gitignore！")
 
         print()

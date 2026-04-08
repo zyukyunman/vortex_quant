@@ -305,7 +305,8 @@ class TestInitCancellation:
         monkeypatch.setattr(cli, "_smoke_test_tushare", lambda _token: True)
         monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
 
-        answers = iter([True, False])
+        # answers: step3 run_bootstrap=True, step4 schedule=False, step5 feishu=False, step6 agent=False
+        answers = iter([True, False, False, False])
         monkeypatch.setattr(
             cli,
             "_prompt_yes_no",

@@ -68,6 +68,8 @@ class DataProfile(BaseProfile):
     publish_pack: str = "default"
     # 存储后端/存储布局的规则包名称。
     storage_pack: str = "default"
+    # 域级通知配置。v2 统一采用 notification: dict，替代早期 notify 字段。
+    notification: dict = field(default_factory=dict)
 
     @property
     def effective_datasets(self) -> list[str]:
