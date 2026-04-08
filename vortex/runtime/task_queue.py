@@ -46,6 +46,9 @@ class TaskProgress:
     message: str = ""
     log_path: str | None = None
     pid: int | None = None
+    retry_attempt: int = 0
+    max_retry_attempts: int = 0
+    next_retry_at: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

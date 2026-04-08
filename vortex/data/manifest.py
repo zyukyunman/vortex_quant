@@ -65,6 +65,24 @@ CREATE TABLE IF NOT EXISTS health_report (
 );
 """
 
+_DATASET_PARTITION_COVERAGE_DDL = """\
+CREATE TABLE IF NOT EXISTS dataset_partition_coverage (
+    dataset          TEXT NOT NULL,
+    partition_key    TEXT NOT NULL,
+    partition_value  TEXT NOT NULL,
+    as_of_end        TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    run_id           TEXT NOT NULL,
+    source_rows      INTEGER DEFAULT 0,
+    materialized_rows INTEGER DEFAULT 0,
+    detail           TEXT,
+    updated_at       TEXT NOT NULL,
+    schema_version   TEXT DEFAULT '1',
+    PRIMARY KEY (dataset, partition_key, partition_value, as_of_end),
+    FOREIGN KEY (run_id) REFERENCES sync_manifest(run_id)
+);
+"""
+
 
 class SyncManifest:
     """数据同步清单管理。控制面 SQLite 数据库操作。
@@ -100,7 +118,10 @@ class SyncManifest:
         """创建控制面 DDL 表（幂等）。"""
         with self.conn:
             self.conn.executescript(
-                _SYNC_MANIFEST_DDL + _SNAPSHOT_DESCRIPTORS_DDL + _HEALTH_REPORT_DDL
+                _SYNC_MANIFEST_DDL
+                + _SNAPSHOT_DESCRIPTORS_DDL
+                + _HEALTH_REPORT_DDL
+                + _DATASET_PARTITION_COVERAGE_DDL
             )
 
     # ------------------------------------------------------------------
@@ -174,6 +195,77 @@ class SyncManifest:
         )
         row = cursor.fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # dataset_partition_coverage
+    # ------------------------------------------------------------------
+
+    def record_partition_coverage(
+        self,
+        *,
+        run_id: str,
+        dataset: str,
+        partition_key: str,
+        partition_value: str,
+        as_of_end: str,
+        status: str,
+        source_rows: int = 0,
+        materialized_rows: int = 0,
+        detail: dict | None = None,
+    ) -> None:
+        """记录某个分区在给定 as_of_end 下的抓取覆盖结果。"""
+        now = datetime.now().isoformat()
+        detail_json = json.dumps(detail, ensure_ascii=False) if detail is not None else None
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO dataset_partition_coverage
+                   (dataset, partition_key, partition_value, as_of_end, status, run_id,
+                    source_rows, materialized_rows, detail, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(dataset, partition_key, partition_value, as_of_end)
+                   DO UPDATE SET
+                       status = excluded.status,
+                       run_id = excluded.run_id,
+                       source_rows = excluded.source_rows,
+                       materialized_rows = excluded.materialized_rows,
+                       detail = excluded.detail,
+                       updated_at = excluded.updated_at""",
+                (
+                    dataset,
+                    partition_key,
+                    partition_value,
+                    as_of_end,
+                    status,
+                    run_id,
+                    source_rows,
+                    materialized_rows,
+                    detail_json,
+                    now,
+                ),
+            )
+
+    def list_partition_coverages(
+        self,
+        *,
+        dataset: str,
+        partition_key: str,
+        as_of_end: str,
+        statuses: tuple[str, ...],
+    ) -> set[str]:
+        """返回在给定 as_of_end 及之后已登记覆盖的分区值集合。"""
+        if not statuses:
+            return set()
+        placeholders = ", ".join("?" for _ in statuses)
+        cursor = self.conn.execute(
+            f"""SELECT partition_value
+                FROM dataset_partition_coverage
+                WHERE dataset = ?
+                  AND partition_key = ?
+                  AND as_of_end >= ?
+                  AND status IN ({placeholders})""",
+            (dataset, partition_key, as_of_end, *statuses),
+        )
+        return {str(row["partition_value"]) for row in cursor.fetchall()}
 
     # ------------------------------------------------------------------
     # snapshot_descriptors

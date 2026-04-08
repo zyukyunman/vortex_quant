@@ -30,6 +30,7 @@ from vortex.data.provider.tushare_registry import (
     TUSHARE_DATASET_REGISTRY,
     TUSHARE_FUND_MARKETS,
     TUSHARE_INDEX_MARKETS,
+    TUSHARE_STOCK_EXCHANGES,
     get_default_tushare_datasets,
     get_tushare_api_access_rule,
     get_tushare_dataset_spec,
@@ -47,6 +48,14 @@ _RATE_LIMIT_SECONDS = 0.3
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0
 _SAFE_RPM_FACTOR = 0.8
+_QUARTER_VIP_APIS = {
+    "income",
+    "balancesheet",
+    "cashflow",
+    "fina_indicator",
+    "forecast",
+    "express",
+}
 
 
 def _try_import_tushare() -> Any:
@@ -70,6 +79,13 @@ def _try_import_tushare() -> Any:
 
 def _to_yyyymmdd(d: date) -> str:
     return d.strftime("%Y%m%d")
+
+
+def _parse_yyyymmdd(value: str) -> date:
+    normalized = _normalize_date_key(value)
+    if normalized is None or len(normalized) != 8:
+        raise ValueError(f"invalid yyyymmdd value: {value}")
+    return datetime.strptime(normalized, "%Y%m%d").date()
 
 
 def _normalize_date_key(value: object) -> str | None:
@@ -114,12 +130,18 @@ class TushareProvider:
             os.environ.get("TUSHARE_EXTRA_PERMISSIONS")
         )
         self._account_rpm = resolve_tushare_points_rpm(self._account_points)
-        self._last_call_time_by_api: dict[str, float] = {}
+        self._global_effective_rpm = (
+            max(1, int(self._account_rpm * _SAFE_RPM_FACTOR))
+            if self._account_rpm
+            else 0
+        )
+        self._last_call_time = 0.0
         self._frame_cache: dict[str, pd.DataFrame] = {}
         logger.info(
-            "Tushare 权限档位: points=%s, regular_rpm=%s, extra_permissions=%s",
+            "Tushare 权限档位: points=%s, regular_rpm=%s, effective_global_rpm=%s, extra_permissions=%s",
             self._account_points,
             self._account_rpm,
+            self._global_effective_rpm,
             sorted(self._extra_permissions),
         )
 
@@ -188,12 +210,17 @@ class TushareProvider:
             allowed = permission_key in self._extra_permissions
             max_rpm = int(rule.get("rpm", 0)) if allowed else 0
             reason = None if allowed else f"缺少独立权限: {permission_key}"
+            effective_rpm = (
+                min(self._global_effective_rpm, max(1, int(max_rpm * _SAFE_RPM_FACTOR)))
+                if max_rpm and self._global_effective_rpm
+                else 0
+            )
             return {
                 "allowed": allowed,
                 "access": access_kind,
                 "permission_key": permission_key,
                 "max_rpm": max_rpm,
-                "effective_rpm": max(1, int(max_rpm * _SAFE_RPM_FACTOR)) if max_rpm else 0,
+                "effective_rpm": effective_rpm,
                 "reason": reason,
             }
 
@@ -204,13 +231,18 @@ class TushareProvider:
             int(rule.get("rpm", self._account_rpm or 0)),
         ) if allowed else 0
         reason = None if allowed else f"当前积分 {self._account_points} 低于接口要求 {min_points}"
+        effective_rpm = (
+            min(self._global_effective_rpm, max(1, int(max_rpm * _SAFE_RPM_FACTOR)))
+            if max_rpm and self._global_effective_rpm
+            else 0
+        )
         return {
             "allowed": allowed,
             "access": access_kind,
             "min_points": min_points,
             "account_points": self._account_points,
             "max_rpm": max_rpm,
-            "effective_rpm": max(1, int(max_rpm * _SAFE_RPM_FACTOR)) if max_rpm else 0,
+            "effective_rpm": effective_rpm,
             "reason": reason,
         }
 
@@ -276,12 +308,17 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        trading_days: list[date] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> pd.DataFrame:
         """获取日线行情。"""
         self._check_market(market)
-        trading_days = self.fetch_calendar(market, start, end)
+        trading_days = (
+            list(trading_days)
+            if trading_days is not None
+            else self.fetch_calendar(market, start, end)
+        )
         df = self._fetch_trade_day_all(
             "daily",
             trading_days,
@@ -306,42 +343,32 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> pd.DataFrame:
         """获取利润表数据。"""
         self._check_market(market)
-        all_dfs: list[pd.DataFrame] = []
         api_fields = "ts_code,ann_date,end_date," + ",".join(fields)
-        quarter_ranges = self._split_by_quarter(start, end)
-        total_steps = len(quarter_ranges) * len(symbols)
-        current_step = 0
-        for q_start, q_end in quarter_ranges:
-            for symbol in symbols:
-                self._check_cancel_requested(cancel_check)
-                df = self._call_dataset_api(
-                    "income",
-                    ts_code=symbol,
-                    start_date=_to_yyyymmdd(q_start),
-                    end_date=_to_yyyymmdd(q_end),
-                    fields=api_fields,
-                )
-                if df is not None and not df.empty:
-                    all_dfs.append(df)
-                current_step += 1
-                self._emit_loop_progress(
-                    progress_callback,
-                    current_step,
-                    total_steps,
-                    f"fundamental {symbol} {q_start:%Y%m%d}-{q_end:%Y%m%d}",
-                )
-
+        raw = self._fetch_quarter_statement_range(
+            "income",
+            symbols,
+            start,
+            end,
+            fields=api_fields,
+            partition_values=partition_values,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            progress_label="fundamental",
+        )
         result = self._normalize_dataset_frame(
             "fundamental",
-            _concat_frames(all_dfs),
+            raw,
             start=start,
             end=end,
         )
+        if symbols and "symbol" in result.columns:
+            result = result[result["symbol"].isin(symbols)]
         if result.empty:
             return pd.DataFrame(columns=["symbol", "ann_date", "report_date"] + fields)
         required = ["symbol", "ann_date", "report_date"] + fields
@@ -395,6 +422,7 @@ class TushareProvider:
         *,
         symbols: list[str] | None = None,
         trading_days: list[date] | None = None,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> pd.DataFrame:
@@ -419,6 +447,7 @@ class TushareProvider:
                 "1d",
                 start,
                 end,
+                trading_days=trading_days,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
             )
@@ -429,6 +458,7 @@ class TushareProvider:
                 ["revenue", "net_profit", "total_assets"],
                 start,
                 end,
+                partition_values=partition_values,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
             )
@@ -466,10 +496,25 @@ class TushareProvider:
                 cancel_check=cancel_check,
                 progress_label=canonical,
             )
+        elif mode == "exchange_reference":
+            raw = self._fetch_exchange_reference(
+                str(spec["api"]),
+                str(spec.get("param_name", "exchange")),
+                [
+                    str(value)
+                    for value in (
+                        spec.get("loop_values")
+                        or TUSHARE_STOCK_EXCHANGES
+                    )
+                ],
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+                progress_label=canonical,
+            )
         elif mode == "trade_day_all":
             raw = self._fetch_trade_day_all(
                 str(spec["api"]),
-                trading_days or self.fetch_calendar("cn_stock", start, end),
+                trading_days or self.fetch_calendar(market, start, end),
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -498,6 +543,7 @@ class TushareProvider:
                 symbols,
                 start,
                 end,
+                partition_values=partition_values,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -636,6 +682,31 @@ class TushareProvider:
                 index,
                 total_steps,
                 f"{progress_label or api_name} market={market}",
+        )
+        return _concat_frames(frames)
+
+    def _fetch_exchange_reference(
+        self,
+        api_name: str,
+        param_name: str,
+        loop_values: list[str],
+        *,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        progress_label: str | None = None,
+    ) -> pd.DataFrame:
+        frames = []
+        total_steps = len(loop_values)
+        for index, value in enumerate(loop_values, start=1):
+            self._check_cancel_requested(cancel_check)
+            df = self._call_dataset_api(api_name, **{param_name: value})
+            if df is not None and not df.empty:
+                frames.append(df)
+            self._emit_loop_progress(
+                progress_callback,
+                index,
+                total_steps,
+                f"{progress_label or api_name} {param_name}={value}",
             )
         return _concat_frames(frames)
 
@@ -733,6 +804,31 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        partition_values: list[str] | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        progress_label: str | None = None,
+    ) -> pd.DataFrame:
+        return self._fetch_quarter_statement_range(
+            api_name,
+            symbols,
+            start,
+            end,
+            partition_values=partition_values,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+            progress_label=progress_label,
+        )
+
+    def _fetch_quarter_statement_range(
+        self,
+        api_name: str,
+        symbols: list[str],
+        start: date,
+        end: date,
+        *,
+        fields: str | None = None,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
@@ -740,18 +836,49 @@ class TushareProvider:
         if not symbols:
             return pd.DataFrame()
         frames = []
-        quarter_ranges = self._split_by_quarter(start, end)
+        quarter_ranges = self._resolve_quarter_ranges(
+            start,
+            end,
+            partition_values=partition_values,
+        )
+        fetch_api_name = self._resolve_quarter_fetch_api(api_name)
+        if fetch_api_name != api_name:
+            logger.info(
+                "%s 使用季度批量接口: api=%s, quarters=%d",
+                progress_label or api_name,
+                fetch_api_name,
+                len(quarter_ranges),
+            )
+            total_steps = len(quarter_ranges)
+            for index, (_q_start, q_end) in enumerate(quarter_ranges, start=1):
+                self._check_cancel_requested(cancel_check)
+                params: dict[str, Any] = {"period": _to_yyyymmdd(q_end)}
+                if fields:
+                    params["fields"] = fields
+                df = self._call_dataset_api(fetch_api_name, **params)
+                if df is not None and not df.empty:
+                    frames.append(df)
+                self._emit_loop_progress(
+                    progress_callback,
+                    index,
+                    total_steps,
+                    f"{progress_label or api_name} period={q_end:%Y%m%d} via={fetch_api_name}",
+                )
+            return _concat_frames(frames)
+
         total_steps = len(quarter_ranges) * len(symbols)
         current_step = 0
         for q_start, q_end in quarter_ranges:
             for symbol in symbols:
                 self._check_cancel_requested(cancel_check)
-                df = self._call_dataset_api(
-                    api_name,
-                    ts_code=symbol,
-                    start_date=_to_yyyymmdd(q_start),
-                    end_date=_to_yyyymmdd(q_end),
-                )
+                params: dict[str, Any] = {
+                    "ts_code": symbol,
+                    "start_date": _to_yyyymmdd(q_start),
+                    "end_date": _to_yyyymmdd(q_end),
+                }
+                if fields:
+                    params["fields"] = fields
+                df = self._call_dataset_api(api_name, **params)
                 if df is not None and not df.empty:
                     frames.append(df)
                 current_step += 1
@@ -762,6 +889,28 @@ class TushareProvider:
                     f"{progress_label or api_name} {symbol} {q_start:%Y%m%d}-{q_end:%Y%m%d}",
                 )
         return _concat_frames(frames)
+
+    def _resolve_quarter_ranges(
+        self,
+        start: date,
+        end: date,
+        *,
+        partition_values: list[str] | None = None,
+    ) -> list[tuple[date, date]]:
+        if not partition_values:
+            return self._split_by_quarter(start, end)
+        quarter_ranges: list[tuple[date, date]] = []
+        seen: set[str] = set()
+        for partition_value in partition_values:
+            if partition_value in seen:
+                continue
+            seen.add(partition_value)
+            quarter_end = _parse_yyyymmdd(partition_value)
+            quarter_start_month = quarter_end.month - 2
+            quarter_ranges.append(
+                (date(quarter_end.year, quarter_start_month, 1), quarter_end)
+            )
+        return quarter_ranges
 
     def _fetch_index_loop_range(
         self,
@@ -998,24 +1147,51 @@ class TushareProvider:
         canonical = self.resolve_dataset(dataset)
         spec = get_tushare_dataset_spec(canonical)
         result = df.copy()
+        date_candidates = tuple(
+            spec.get("date_field_priority")
+            or ("trade_date", "cal_date", "ex_date", "pub_date", "pub_time", "ann_date", "start_date", "end_date", "month")
+        )
+        report_date_candidates = tuple(
+            spec.get("report_date_field_priority")
+            or ("end_date", "report_date", "trade_date", "date")
+        )
+        symbol_candidates = tuple(
+            spec.get("symbol_field_priority")
+            or ("ts_code", "con_code", "code")
+        )
 
         rename_map = {
-            "ts_code": "symbol",
-            "con_code": "symbol",
             "vol": "volume",
         }
+        if "symbol" not in result.columns:
+            for source in symbol_candidates:
+                if source in result.columns:
+                    rename_map[source] = "symbol"
+                    break
         if spec.get("partition_by") == "date":
-            for source in ("trade_date", "cal_date", "ex_date", "pub_date", "pub_time", "ann_date", "start_date", "end_date", "month"):
+            for source in date_candidates:
                 if source in result.columns and "date" not in result.columns:
                     rename_map[source] = "date"
                     break
         if spec.get("partition_by") == "report_date":
-            for source in ("end_date", "report_date", "trade_date", "date"):
+            for source in report_date_candidates:
                 if source in result.columns and "report_date" not in result.columns:
                     rename_map[source] = "report_date"
                     break
 
         result = result.rename(columns=rename_map)
+        if spec.get("partition_by") == "date":
+            result = self._coalesce_date_column(
+                result,
+                target_column="date",
+                candidate_columns=date_candidates,
+            )
+        elif spec.get("partition_by") == "report_date":
+            result = self._coalesce_date_column(
+                result,
+                target_column="report_date",
+                candidate_columns=report_date_candidates,
+            )
 
         if start is not None and end is not None:
             if "date" in result.columns:
@@ -1047,10 +1223,39 @@ class TushareProvider:
     ) -> pd.DataFrame:
         start_key = _to_yyyymmdd(start)
         end_key = _to_yyyymmdd(end)
-        mask = df[column].map(_normalize_date_key).map(
-            lambda key: key is not None and start_key <= key <= end_key
-        )
+        mask = [
+            isinstance(key, str) and start_key <= key <= end_key
+            for key in (_normalize_date_key(value) for value in df[column].tolist())
+        ]
         return df.loc[mask].reset_index(drop=True)
+
+    @staticmethod
+    def _coalesce_date_column(
+        df: pd.DataFrame,
+        *,
+        target_column: str,
+        candidate_columns: tuple[str, ...],
+    ) -> pd.DataFrame:
+        source_columns: list[str] = []
+        for column in (target_column, *candidate_columns):
+            if column in df.columns and column not in source_columns:
+                source_columns.append(column)
+        if not source_columns:
+            return df
+
+        values: list[str | None] = []
+        for row in df[source_columns].itertuples(index=False, name=None):
+            normalized = None
+            for value in row:
+                key = _normalize_date_key(value)
+                if key is not None:
+                    normalized = key
+                    break
+            values.append(normalized)
+
+        result = df.copy()
+        result[target_column] = values
+        return result
 
     # ------------------------------------------------------------------
     # API 调用与工具
@@ -1096,16 +1301,25 @@ class TushareProvider:
         if self._should_log_progress(current, safe_total):
             logger.info("%s: %d/%d", label, current, safe_total)
 
+    def _resolve_quarter_fetch_api(self, api_name: str) -> str:
+        if api_name not in _QUARTER_VIP_APIS:
+            return api_name
+        vip_api_name = f"{api_name}_vip"
+        vip_access = self._describe_api_access(vip_api_name)
+        if vip_access.get("allowed"):
+            return vip_api_name
+        return api_name
+
     def _rate_limit(self, api_name: str) -> None:
         access = self._assert_api_access(api_name)
         effective_rpm = int(access.get("effective_rpm", 0) or 0)
         interval = _RATE_LIMIT_SECONDS
         if effective_rpm > 0:
             interval = 60.0 / float(effective_rpm)
-        elapsed = time.monotonic() - self._last_call_time_by_api.get(api_name, 0.0)
+        elapsed = time.monotonic() - self._last_call_time
         if elapsed < interval:
             time.sleep(interval - elapsed)
-        self._last_call_time_by_api[api_name] = time.monotonic()
+        self._last_call_time = time.monotonic()
 
     def _call_with_retry(self, api_name: str, func: Any, **kwargs: Any) -> pd.DataFrame:
         last_exc: Exception | None = None

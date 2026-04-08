@@ -12,7 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # 当前 schema 版本，每次变更 DDL 时递增
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ------------------------------------------------------------------
 # 迁移注册表：key = 目标版本号，value = SQL 列表
@@ -55,6 +55,23 @@ _MIGRATIONS: dict[int, list[str]] = {
         # ALTER TABLE ADD COLUMN 对已有列不报错需先检测，此处用安全写法
         "_migrate_add_column:task_queue:resource_key:TEXT",
         "CREATE INDEX IF NOT EXISTS idx_task_queue_resource_key ON task_queue(resource_key, status)",
+    ],
+    # v2 → v3: 新增 notification_log（通知审计）
+    3: [
+        """
+        CREATE TABLE IF NOT EXISTS notification_log (
+            notification_id TEXT PRIMARY KEY,
+            event_type      TEXT NOT NULL,
+            severity        TEXT NOT NULL,
+            channel         TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            sent_at         TEXT NOT NULL DEFAULT (datetime('now')),
+            message_summary TEXT,
+            detail          TEXT,
+            schema_version  TEXT DEFAULT '1'
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_notification_log_event ON notification_log(event_type, sent_at)",
     ],
 }
 

@@ -1,358 +1,27 @@
-"""CLI 交互辅助测试。"""
+"""CLI 后台任务 / server 测试。"""
 from __future__ import annotations
 
 import argparse
-import io
 import json
+import logging
 import signal
 
+import pandas as pd
 import pytest
 
 import vortex.cli as cli
 from vortex.config.profile.models import DataProfile
+from vortex.data.manifest import SyncManifest
 from vortex.data.pipeline import RunReport
+from vortex.data.storage.parquet_duckdb import ParquetDuckDBBackend
 from vortex.runtime.database import Database
-from vortex.runtime.task_queue import TaskProgress, TaskQueue
+from vortex.runtime.task_queue import TaskProgress, TaskQueue, TaskStatus
 from vortex.runtime.workspace import Workspace
+from vortex.shared.errors import DataError
 from vortex.cli import (
-    InitCancelled,
-    _apply_multi_select_command,
-    _apply_dataset_override,
-    _apply_multi_select_key,
-    _build_data_task_action,
-    _build_default_data_config,
     _collect_data_status,
-    _format_selection_summary,
-    _multi_select_window,
-    _parse_dataset_override,
-    _prompt,
-    _redraw_multi_select,
-    _run_initial_bootstrap,
-    _resolve_data_profile_name,
     _submit_data_background_task,
-    _truncate_terminal_line,
 )
-
-
-class TestApplyMultiSelectCommand:
-    def test_toggle_with_spaces_and_commas(self):
-        options = ["instruments", "calendar", "bars", "fundamental", "events"]
-        current = ["instruments", "calendar", "bars"]
-
-        updated, error = _apply_multi_select_command(
-            current=current,
-            options=options,
-            defaults=current,
-            answer="2, 4 5",
-        )
-
-        assert error is None
-        assert updated == ["instruments", "bars", "fundamental", "events"]
-
-    def test_select_all(self):
-        options = ["a1", "a2", "a3"]
-        updated, error = _apply_multi_select_command(
-            current=["a1"],
-            options=options,
-            defaults=["a1"],
-            answer="a",
-        )
-
-        assert error is None
-        assert updated == options
-
-    def test_clear_all(self):
-        options = ["a1", "a2", "a3"]
-        updated, error = _apply_multi_select_command(
-            current=["a1", "a2"],
-            options=options,
-            defaults=["a1"],
-            answer="n",
-        )
-
-        assert error is None
-        assert updated == []
-
-    def test_restore_defaults(self):
-        options = ["a1", "a2", "a3"]
-        defaults = ["a1", "a3"]
-        updated, error = _apply_multi_select_command(
-            current=["a2"],
-            options=options,
-            defaults=defaults,
-            answer="d",
-        )
-
-        assert error is None
-        assert updated == defaults
-
-    def test_reject_invalid_token(self):
-        options = ["a1", "a2", "a3"]
-        current = ["a1"]
-        updated, error = _apply_multi_select_command(
-            current=current,
-            options=options,
-            defaults=current,
-            answer="1 foo",
-        )
-
-        assert updated == current
-        assert error == "无法识别的输入: foo"
-
-    def test_reject_out_of_range_index(self):
-        options = ["a1", "a2", "a3"]
-        current = ["a1"]
-        updated, error = _apply_multi_select_command(
-            current=current,
-            options=options,
-            defaults=current,
-            answer="4",
-        )
-
-        assert updated == current
-        assert error == "编号超出范围: 4"
-
-
-class TestApplyMultiSelectKey:
-    def test_space_toggles_current_option(self):
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=1,
-            current=["instruments"],
-            options=["instruments", "calendar", "bars"],
-            defaults=["instruments"],
-            key="space",
-        )
-
-        assert cursor == 1
-        assert selected == ["instruments", "calendar"]
-        assert done is False
-
-    def test_up_down_move_cursor(self):
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=0,
-            current=["instruments"],
-            options=["instruments", "calendar", "bars"],
-            defaults=["instruments"],
-            key="down",
-        )
-        assert cursor == 1
-        assert selected == ["instruments"]
-        assert done is False
-
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=cursor,
-            current=selected,
-            options=["instruments", "calendar", "bars"],
-            defaults=["instruments"],
-            key="up",
-        )
-        assert cursor == 0
-        assert selected == ["instruments"]
-        assert done is False
-
-    def test_a_n_d_and_enter(self):
-        options = ["instruments", "calendar", "bars"]
-
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=0,
-            current=["instruments"],
-            options=options,
-            defaults=["instruments", "bars"],
-            key="a",
-        )
-        assert selected == options
-        assert done is False
-
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=cursor,
-            current=selected,
-            options=options,
-            defaults=["instruments", "bars"],
-            key="n",
-        )
-        assert selected == []
-        assert done is False
-
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=cursor,
-            current=selected,
-            options=options,
-            defaults=["instruments", "bars"],
-            key="d",
-        )
-        assert selected == ["instruments", "bars"]
-        assert done is False
-
-        cursor, selected, done = _apply_multi_select_key(
-            cursor=cursor,
-            current=selected,
-            options=options,
-            defaults=["instruments", "bars"],
-            key="enter",
-        )
-        assert selected == ["instruments", "bars"]
-        assert done is True
-
-
-class TestDataCliHelpers:
-    def test_build_default_data_config_is_minimal(self):
-        config = _build_default_data_config(history_start="20120101")
-
-        assert config == {
-            "name": "default",
-            "type": "data",
-            "provider": "tushare",
-            "history_start": "20120101",
-        }
-
-    def test_build_default_data_config_keeps_schedule_only_when_set(self):
-        config = _build_default_data_config(
-            history_start="20120101",
-            schedule="0 18 * * 1-5",
-        )
-
-        assert config["schedule"] == "0 18 * * 1-5"
-        assert "quality_pack" not in config
-        assert "pit_pack" not in config
-        assert "publish_pack" not in config
-        assert "storage_pack" not in config
-
-    def test_resolve_data_profile_name_defaults_to_default(self):
-        assert _resolve_data_profile_name(None) == "default"
-        assert _resolve_data_profile_name("") == "default"
-
-    def test_resolve_data_profile_name_accepts_yaml_path(self):
-        assert (
-            _resolve_data_profile_name(
-                "/Users/demo/vortex_workspace/profiles/default.yaml"
-            )
-            == "default"
-        )
-
-    def test_parse_dataset_override(self):
-        assert _parse_dataset_override("bars, valuation ,calendar") == [
-            "bars",
-            "valuation",
-            "calendar",
-        ]
-
-    def test_apply_dataset_override(self):
-        profile = DataProfile(name="default")
-        updated = _apply_dataset_override(profile, ["bars", "valuation"])
-        assert updated.datasets == ["bars", "valuation"]
-        assert updated.exclude_datasets == []
-        assert updated.priority_datasets == ["bars", "valuation"]
-
-    def test_multi_select_window_pages_around_cursor(self):
-        start, end = _multi_select_window(total_options=61, cursor=30, visible_count=10)
-        assert end - start == 10
-        assert start <= 30 < end
-
-    def test_format_selection_summary_truncates_preview(self):
-        text = _format_selection_summary(
-            ["a", "b", "c", "d", "e", "f"],
-            max_items=3,
-        )
-        assert text == "已选择 6 项：a, b, c ..."
-
-    def test_truncate_terminal_line_respects_display_width(self):
-        assert _truncate_terminal_line("操作说明：↑↓ 移动；空格 勾选/取消；回车 确认", 20).endswith(
-            "..."
-        )
-        assert _truncate_terminal_line("top_list", 20) == "top_list"
-
-    def test_redraw_multi_select_uses_crlf_in_raw_terminal(self, monkeypatch):
-        buffer = io.StringIO()
-        monkeypatch.setattr(cli.sys, "stdout", buffer)
-        _redraw_multi_select(["line1", "line2"])
-        assert "\r\n" in buffer.getvalue()
-
-    def test_build_data_task_action_with_ranges(self):
-        assert _build_data_task_action("bootstrap") == "bootstrap"
-        assert _build_data_task_action(
-            "backfill",
-            start="20250101",
-            end="20250131",
-        ) == "backfill:20250101-20250131"
-        assert _build_data_task_action("publish", as_of="20250407") == "publish:20250407"
-
-
-class TestInitCancellation:
-    def test_prompt_keyboard_interrupt_raises_init_cancelled(self, monkeypatch):
-        def _raise(_: str) -> str:
-            raise KeyboardInterrupt
-
-        monkeypatch.setattr("builtins.input", _raise)
-        with pytest.raises(InitCancelled):
-            _prompt("请输入", "x")
-
-    def test_cmd_init_cancelled_before_workspace_write(self, monkeypatch, tmp_path, capsys):
-        root = tmp_path / "workspace"
-
-        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
-        monkeypatch.setattr(cli, "_check_tushare_token", lambda: None)
-        monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
-
-        def _cancel(*_args, **_kwargs):
-            raise InitCancelled
-
-        monkeypatch.setattr(cli, "_prompt_yes_no", _cancel)
-
-        cli.cmd_init(argparse.Namespace(root=str(root), non_interactive=False))
-
-        assert not root.exists()
-        assert "已取消初始化" in capsys.readouterr().out
-
-    def test_cmd_init_bootstrap_launch_failure_keeps_workspace(
-        self, monkeypatch, tmp_path, capsys
-    ):
-        root = tmp_path / "workspace"
-
-        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
-        monkeypatch.setattr(cli, "_check_tushare_token", lambda: "token")
-        monkeypatch.setattr(cli, "_smoke_test_tushare", lambda _token: True)
-        monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
-
-        answers = iter([True, False])
-        monkeypatch.setattr(
-            cli,
-            "_prompt_yes_no",
-            lambda *_args, **_kwargs: next(answers),
-        )
-        monkeypatch.setattr(cli, "_prompt_multi_select", lambda *_args, **_kwargs: ["bars"])
-
-        def _launch_fail(*_args, **_kwargs):
-            raise RuntimeError("launch failed")
-
-        monkeypatch.setattr(cli, "_run_initial_bootstrap", _launch_fail)
-
-        cli.cmd_init(argparse.Namespace(root=str(root), non_interactive=False))
-
-        assert root.exists()
-        assert "default.yaml" in {p.name for p in (root / "profiles").iterdir()}
-        assert "首次数据更新启动失败" in capsys.readouterr().out
-
-
-class TestInitialBootstrapLaunch:
-    def test_run_initial_bootstrap_uses_shared_submit_helper(
-        self, monkeypatch, tmp_path, capsys
-    ):
-        captured: dict[str, object] = {}
-
-        def _fake_submit(**kwargs):
-            captured.update(kwargs)
-            return {"status": "submitted"}
-
-        monkeypatch.setattr(cli, "_submit_data_background_task", _fake_submit)
-
-        root = tmp_path / "workspace"
-        _run_initial_bootstrap(root, "default", ["bars", "valuation"])
-
-        assert captured["root"] == root
-        assert captured["profile_name"] == "default"
-        assert captured["action"] == "bootstrap"
-        assert captured["datasets"] == ["bars", "valuation"]
-        assert "数据集: 已选择 2 项" in capsys.readouterr().out
 
 
 class TestServerStart:
@@ -532,6 +201,43 @@ class TestDataBackgroundTasks:
         assert task["written_rows"] == 123456
         assert task["log_path"] == result["log_path"]
 
+    def test_collect_data_status_treats_alive_orphan_task_as_active(
+        self, monkeypatch, tmp_path
+    ):
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        manifest.create_run("run_orphan", "default", "bootstrap")
+        manifest.update_status("run_orphan", "running")
+        manifest.close()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task_queue = TaskQueue(db)
+        task_id = task_queue.submit("data", "bootstrap", "default", "run_orphan")
+        task_queue.update_progress(
+            task_id,
+            TaskProgress(
+                run_id="run_orphan",
+                current_stage="fetch",
+                current_dataset="events",
+                log_path=str(root / "state" / "logs" / "bootstrap.log"),
+                pid=86420,
+            ),
+        )
+        task_queue.update_status(task_id, TaskStatus.FAILED, error="interrupted: server crashed")
+        db.close()
+
+        monkeypatch.setattr(cli, "_is_pid_alive", lambda pid: int(pid) == 86420)
+
+        status = _collect_data_status(root, "default")
+        assert len(status["active_tasks"]) == 1
+        task = status["active_tasks"][0]
+        assert task["task_id"] == task_id
+        assert task["status"] == "running"
+        assert "task_queue 状态已过期" in str(task["message"])
+
     def test_print_data_logs_returns_tail_as_json(self, monkeypatch, tmp_path, capsys):
         class _Proc:
             pid = 54321
@@ -610,6 +316,10 @@ class TestDataBackgroundTasks:
             fmt="json",
         )
         capsys.readouterr()
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        manifest.create_run(str(result["run_id"]), "default", "bootstrap")
+        manifest.update_status(str(result["run_id"]), "running")
+        manifest.close()
 
         cli._cancel_data_task(
             root,
@@ -629,6 +339,68 @@ class TestDataBackgroundTasks:
         db.close()
         assert task is not None
         assert task["status"] == "cancelled"
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        run = manifest.get_run(str(result["run_id"]))
+        manifest.close()
+        assert run is not None
+        assert run["status"] == "cancelled"
+
+    def test_cancel_data_task_can_cancel_alive_orphan_worker(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        signals: list[tuple[int, int]] = []
+
+        def _fake_kill(pid, sig):
+            signals.append((int(pid), int(sig)))
+
+        monkeypatch.setattr(cli.os, "kill", _fake_kill)
+        monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(cli, "_is_pid_alive", lambda pid: int(pid) == 45678)
+
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        manifest.create_run("run_orphan", "default", "bootstrap")
+        manifest.update_status("run_orphan", "running")
+        manifest.close()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task_queue = TaskQueue(db)
+        task_id = task_queue.submit("data", "bootstrap", "default", "run_orphan")
+        task_queue.update_progress(
+            task_id,
+            TaskProgress(
+                run_id="run_orphan",
+                current_stage="fetch",
+                current_dataset="events",
+                log_path=str(root / "state" / "logs" / "bootstrap.log"),
+                pid=45678,
+            ),
+        )
+        task_queue.update_status(task_id, TaskStatus.FAILED, error="interrupted: server crashed")
+        db.close()
+
+        cli._cancel_data_task(root, "default", task_id=None, fmt="json")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["task_id"] == task_id
+        assert payload["signal_sent"] is True
+        assert (45678, int(signal.SIGTERM)) in signals
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task = TaskQueue(db).get_task(task_id)
+        db.close()
+        assert task is not None
+        assert task["status"] == "cancelled"
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        run = manifest.get_run("run_orphan")
+        manifest.close()
+        assert run is not None
+        assert run["status"] == "cancelled"
 
     def test_cmd_data_status_watch_routes_to_helper(self, monkeypatch, tmp_path):
         captured: dict[str, object] = {}
@@ -772,3 +544,378 @@ class TestDataBackgroundTasks:
         assert progress.written_rows == 5678
         assert progress.log_path and progress.log_path.endswith("bootstrap.log")
         assert progress.pid == 12345
+
+    def test_cmd_data_foreground_worker_marks_cancelled_without_failed_log(
+        self, monkeypatch, tmp_path, capsys, caplog
+    ):
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task_queue = TaskQueue(db)
+        run_id = "data_cancel_run"
+        task_id = task_queue.submit("data", "bootstrap", "default", run_id)
+        task_queue.update_progress(
+            task_id,
+            TaskProgress(
+                run_id=run_id,
+                log_path=str(root / "state" / "logs" / "bootstrap.log"),
+                pid=12345,
+            ),
+        )
+        db.close()
+
+        class _Manifest:
+            def close(self) -> None:
+                return
+
+        class _Pipeline:
+            def __init__(self, progress_callback):
+                self._progress_callback = progress_callback
+
+            def bootstrap(self, profile, dry_run=False, run_id=None):
+                self._progress_callback(
+                    force=True,
+                    current_stage="fetch",
+                    total_stages=5,
+                    completed_stages=1,
+                    current_dataset="dc_hot",
+                    total_datasets=52,
+                    completed_datasets=31,
+                    current_chunk=486,
+                    total_chunks=545,
+                    written_rows=123456,
+                    message="dc_hot trade_date=20260105",
+                )
+                raise DataError(
+                    code="DATA_TASK_CANCELLED",
+                    message="数据任务已取消",
+                )
+
+        def _fake_build_data_pipeline(*_args, **kwargs):
+            return None, _Manifest(), _Pipeline(kwargs["progress_callback"]), DataProfile(name="default")
+
+        monkeypatch.setattr(cli, "_build_data_pipeline", _fake_build_data_pipeline)
+        caplog.set_level(logging.INFO)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.cmd_data(
+                argparse.Namespace(
+                    data_action="bootstrap",
+                    root=str(root),
+                    profile=None,
+                    datasets=None,
+                    verbose=False,
+                    dry_run=False,
+                    format="text",
+                    foreground=True,
+                    task_id=task_id,
+                    run_id=run_id,
+                )
+            )
+
+        assert exc_info.value.code == 130
+        err = capsys.readouterr().err
+        assert "🛑 [DATA_TASK_CANCELLED] 数据任务已取消" in err
+        assert "data bootstrap 已取消" in caplog.text
+        assert "data bootstrap 失败" not in caplog.text
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task = TaskQueue(db).get_task(task_id)
+        db.close()
+
+        assert task is not None
+        assert task["status"] == "cancelled"
+        assert task["error"] == "[DATA_TASK_CANCELLED] 数据任务已取消"
+        progress = TaskProgress.from_dict(json.loads(task["progress_json"]))
+        assert progress.current_stage == "cancelled"
+        assert progress.current_dataset == "dc_hot"
+
+    def test_cmd_data_foreground_worker_auto_recovers_retryable_partial_success(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task_queue = TaskQueue(db)
+        task_id = task_queue.submit("data", "bootstrap", "default", "data_initial_run")
+        db.close()
+
+        class _Manifest:
+            def close(self) -> None:
+                return
+
+        class _Pipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def bootstrap(self, profile, dry_run=False, run_id=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return RunReport(
+                        run_id=run_id or "data_first_attempt",
+                        action="bootstrap",
+                        status="partial_success",
+                        total_rows=12,
+                        error="1 个 dataset 被跳过",
+                        detail={
+                            "skipped_datasets": [
+                                {
+                                    "dataset": "events",
+                                    "reason": "[DATA_PROVIDER_FETCH_FAILED] timeout",
+                                }
+                            ]
+                        },
+                    )
+                return RunReport(
+                    run_id=run_id or "data_second_attempt",
+                    action="bootstrap",
+                    status="success",
+                    total_rows=24,
+                )
+
+        pipeline = _Pipeline()
+        notifications: list[object] = []
+
+        class _NotificationService:
+            def __init__(self, _db):
+                return
+
+            def notify(self, message, profile_notification=None):
+                notifications.append((message, profile_notification))
+                return [{"status": "sent"}]
+
+        def _fake_build_data_pipeline(*_args, **_kwargs):
+            return None, _Manifest(), pipeline, DataProfile(
+                name="default",
+                notification={"enabled": True, "level": "warning", "channel": "feishu"},
+            )
+
+        monkeypatch.setattr(cli, "_build_data_pipeline", _fake_build_data_pipeline)
+        monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            "vortex.notification.service.NotificationService",
+            _NotificationService,
+        )
+
+        cli.cmd_data(
+            argparse.Namespace(
+                data_action="bootstrap",
+                root=str(root),
+                profile=None,
+                datasets=None,
+                verbose=False,
+                dry_run=False,
+                format="json",
+                foreground=True,
+                task_id=task_id,
+                run_id="data_initial_run",
+            )
+        )
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task = TaskQueue(db).get_task(task_id)
+        db.close()
+
+        assert pipeline.calls == 2
+        assert not notifications
+        assert task is not None
+        assert task["status"] == "success"
+        progress = TaskProgress.from_dict(json.loads(task["progress_json"]))
+        assert progress.retry_attempt == 2
+        assert progress.max_retry_attempts == 4
+        assert progress.next_retry_at is None
+
+    def test_cmd_data_foreground_worker_notifies_non_retryable_partial_success(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task_queue = TaskQueue(db)
+        task_id = task_queue.submit("data", "bootstrap", "default", "data_warning_run")
+        db.close()
+
+        class _Manifest:
+            def close(self) -> None:
+                return
+
+        class _Pipeline:
+            calls = 0
+
+            def bootstrap(self, profile, dry_run=False, run_id=None):
+                self.calls += 1
+                return RunReport(
+                    run_id=run_id or "data_warning_run",
+                    action="bootstrap",
+                    status="partial_success",
+                    total_rows=10,
+                    error="1 个 dataset 被跳过",
+                    detail={
+                        "skipped_datasets": [
+                            {
+                                "dataset": "limit_step",
+                                "reason": "[DATA_PROVIDER_PERMISSION_DENIED] no access",
+                            }
+                        ]
+                    },
+                )
+
+        notifications: list[object] = []
+
+        class _NotificationService:
+            def __init__(self, _db):
+                return
+
+            def notify(self, message, profile_notification=None):
+                notifications.append((message, profile_notification))
+                return [{"status": "sent"}]
+
+        def _fake_build_data_pipeline(*_args, **_kwargs):
+            return None, _Manifest(), _Pipeline(), DataProfile(
+                name="default",
+                notification={"enabled": True, "level": "warning", "channel": "feishu"},
+            )
+
+        monkeypatch.setattr(cli, "_build_data_pipeline", _fake_build_data_pipeline)
+        monkeypatch.setattr(
+            "vortex.notification.service.NotificationService",
+            _NotificationService,
+        )
+
+        cli.cmd_data(
+            argparse.Namespace(
+                data_action="bootstrap",
+                root=str(root),
+                profile=None,
+                datasets=None,
+                verbose=False,
+                dry_run=False,
+                format="json",
+                foreground=True,
+                task_id=task_id,
+                run_id="data_warning_run",
+            )
+        )
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        task = TaskQueue(db).get_task(task_id)
+        db.close()
+
+        assert task is not None
+        assert task["status"] == "partial_success"
+        assert len(notifications) == 1
+        message, profile_notification = notifications[0]
+        assert message.event_type == "data.sync.partial_failed"
+        assert message.severity == "warning"
+        assert "部分完成" in message.summary
+        assert profile_notification == {
+            "enabled": True,
+            "level": "warning",
+            "channel": "feishu",
+        }
+
+    def test_cmd_data_inspect_returns_dataset_summary_and_preview(
+        self, tmp_path, capsys
+    ):
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+        storage = ParquetDuckDBBackend(root / "data")
+        storage.initialize()
+        storage.upsert(
+            "bars",
+            pd.DataFrame(
+                {
+                    "symbol": ["000001.SZ", "600519.SH"],
+                    "date": ["20260407", "20260407"],
+                    "close": [12.3, 1800.0],
+                }
+            ),
+            {"date": "20260407"},
+        )
+
+        cli.cmd_data(
+            argparse.Namespace(
+                data_action="inspect",
+                root=str(root),
+                profile=None,
+                datasets=None,
+                dry_run=False,
+                format="json",
+                dataset="bars",
+                columns="symbol,date,close",
+                filters=["symbol=000001.SZ"],
+                limit=5,
+            )
+        )
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dataset"] == "bars"
+        assert payload["api"] == "daily"
+        assert payload["api_doc_url"] == "https://tushare.pro/document/2?doc_id=27"
+        assert "不复权日线" in payload["note"]
+        assert payload["materialized"] is True
+        assert payload["total_rows"] == 2
+        assert payload["matching_rows"] == 1
+        assert payload["preview_rows"][0]["symbol"] == "000001.SZ"
+        assert any(item["name"] == "close" for item in payload["columns"])
+        assert any(
+            item["name"] == "close" and "收盘价" in item["description"]
+            for item in payload["columns"]
+        )
+
+    def test_cmd_data_inspect_without_dataset_lists_materialized_tables(
+        self, tmp_path, capsys
+    ):
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+        storage = ParquetDuckDBBackend(root / "data")
+        storage.initialize()
+        storage.upsert(
+            "bars",
+            pd.DataFrame({"symbol": ["000001.SZ"], "date": ["20260407"], "close": [12.3]}),
+            {"date": "20260407"},
+        )
+        storage.upsert(
+            "instruments",
+            pd.DataFrame({"symbol": ["000001.SZ"], "name": ["平安银行"]}),
+            {},
+        )
+
+        cli.cmd_data(
+            argparse.Namespace(
+                data_action="inspect",
+                root=str(root),
+                profile=None,
+                datasets=None,
+                dry_run=False,
+                format="json",
+                dataset=None,
+                columns=None,
+                filters=[],
+                limit=10,
+            )
+        )
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["mode"] == "catalog"
+        assert {item["dataset"] for item in payload["datasets"]} == {"bars", "instruments"}
+        assert any(
+            item["dataset"] == "bars"
+            and item["api"] == "daily"
+            and item["api_doc_url"] == "https://tushare.pro/document/2?doc_id=27"
+            and item["note"]
+            for item in payload["datasets"]
+        )

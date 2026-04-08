@@ -1,14 +1,16 @@
 """Phase 0 — runtime 模块测试（workspace / database / task_queue / server）。"""
 from __future__ import annotations
 
+import json
 import os
 import signal
 from pathlib import Path
 
 import pytest
 
+from vortex.data.manifest import SyncManifest
 from vortex.runtime.database import Database
-from vortex.runtime.task_queue import TaskQueue, TaskStatus, make_resource_key
+from vortex.runtime.task_queue import TaskProgress, TaskQueue, TaskStatus, make_resource_key
 from vortex.runtime.workspace import Workspace
 
 
@@ -240,27 +242,86 @@ class TestServer:
         server._draining = False
         server.stop()
 
-    def test_stale_task_recovery(self, tmp_path):
-        """模拟崩溃恢复：启动时 RUNNING 任务应被标记为 interrupted。"""
+    def test_stale_task_recovery_marks_dead_worker_failed_and_syncs_manifest(
+        self, monkeypatch, tmp_path
+    ):
+        """worker 已死时，server 启动应回收 RUNNING 任务并同步 manifest。"""
         from vortex.runtime.server import Server
 
-        server = Server(tmp_path / "ws")
-        server.start()
-        # 直接插入一个 RUNNING 任务模拟崩溃残留
-        server.db.execute(
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        manifest.create_run("run_x", "default", "bootstrap")
+        manifest.update_status("run_x", "running")
+        manifest.close()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        db.execute(
             """INSERT INTO task_queue (task_id, domain, action, profile, status, run_id, resource_key)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             ("stale-task", "data", "bootstrap", "default", "running", "run_x", "data:default:bootstrap"),
         )
-        server.stop()
+        db.execute(
+            "UPDATE task_queue SET progress_json = ? WHERE task_id = ?",
+            (
+                json.dumps(TaskProgress(run_id="run_x", pid=43210).to_dict(), ensure_ascii=False),
+                "stale-task",
+            ),
+        )
+        db.close()
 
-        # 重新启动 — 应恢复 stale task
-        server2 = Server(tmp_path / "ws")
-        server2.start()
-        task = server2.task_queue.get_task("stale-task")
+        monkeypatch.setattr(Server, "_is_pid_alive", lambda self, pid: False)
+
+        server = Server(root)
+        server.start()
+        task = server.task_queue.get_task("stale-task")
         assert task["status"] == "failed"
         assert "interrupted" in task["error"]
-        server2.stop()
+
+        manifest = SyncManifest(root / "state" / "manifests" / "default" / "sync_manifest.db")
+        run = manifest.get_run("run_x")
+        manifest.close()
+        assert run is not None
+        assert run["status"] == "failed"
+        assert "interrupted" in str(run["error_message"])
+
+        server.stop()
+
+    def test_stale_task_recovery_keeps_alive_worker_running(self, monkeypatch, tmp_path):
+        """worker 仍存活时，server 启动不应误判 interrupted。"""
+        from vortex.runtime.server import Server
+
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+
+        db = Database(root / "state" / "control.db")
+        db.initialize_tables()
+        db.execute(
+            """INSERT INTO task_queue (task_id, domain, action, profile, status, run_id, resource_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("alive-task", "data", "bootstrap", "default", "running", "run_alive", "data:default:bootstrap"),
+        )
+        db.execute(
+            "UPDATE task_queue SET progress_json = ? WHERE task_id = ?",
+            (
+                json.dumps(TaskProgress(run_id="run_alive", pid=43210).to_dict(), ensure_ascii=False),
+                "alive-task",
+            ),
+        )
+        db.close()
+
+        monkeypatch.setattr(Server, "_is_pid_alive", lambda self, pid: int(pid) == 43210)
+
+        server = Server(root)
+        server.start()
+        task = server.task_queue.get_task("alive-task")
+        assert task["status"] == "running"
+        assert task["error"] is None
+
+        server.task_queue.update_status("alive-task", TaskStatus.CANCELLED)
+        server.stop()
 
     def test_double_start_fails(self, tmp_path):
         """同一 workspace 不允许启动两个实例（PID 文件互斥）。"""

@@ -17,6 +17,7 @@ from __future__ import annotations
 import secrets
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pandas as pd
@@ -43,6 +44,10 @@ class ParquetDuckDBBackend:
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
         self._catalog_path = self._root / "catalog.duckdb"
+
+    @property
+    def root(self) -> Path:
+        return self._root
 
     # ------------------------------------------------------------------
     # 初始化
@@ -157,7 +162,7 @@ class ParquetDuckDBBackend:
 
     def list_partitions(self, dataset: str) -> list[str]:
         """列出已有分区目录路径（排序）。"""
-        dataset_dir = self._root / dataset
+        dataset_dir = self.dataset_path(dataset)
         if not dataset_dir.exists():
             return []
 
@@ -168,6 +173,129 @@ class ParquetDuckDBBackend:
             partitions.append(str(rel))
 
         return sorted(partitions)
+
+    def list_datasets(self) -> list[str]:
+        """列出当前已落盘的 dataset 名。"""
+        if not self._root.exists():
+            return []
+
+        datasets: list[str] = []
+        for item in sorted(self._root.iterdir()):
+            if not item.is_dir() or item.name in {"authoritative", "raw"}:
+                continue
+            if any(item.rglob("data.parquet")):
+                datasets.append(item.name)
+        return datasets
+
+    def dataset_path(self, dataset: str) -> Path:
+        return self._root / dataset
+
+    def parquet_glob(self, dataset: str) -> str:
+        return str(self.dataset_path(dataset) / "**" / "data.parquet")
+
+    def schema(self, dataset: str) -> list[dict[str, str]]:
+        """返回 dataset 的字段名与 DuckDB 推断类型。"""
+        if not self._dataset_files(dataset):
+            return []
+
+        sql = (
+            "DESCRIBE SELECT * "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true)"
+        )
+        conn = duckdb.connect(database=":memory:", read_only=False)
+        try:
+            result = conn.execute(sql).fetchdf()
+        except duckdb.IOException:
+            return []
+        finally:
+            conn.close()
+
+        return [
+            {
+                "name": str(row["column_name"]),
+                "type": str(row["column_type"]),
+            }
+            for _, row in result.iterrows()
+        ]
+
+    def count_rows(self, dataset: str, filters: dict[str, Any] | None = None) -> int:
+        """返回 dataset 在给定过滤条件下的行数。"""
+        if not self._dataset_files(dataset):
+            return 0
+
+        where_clause, params = self._build_where_clause(filters)
+        sql = (
+            "SELECT COUNT(*) AS row_count "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true) "
+            f"WHERE {where_clause}"
+        )
+        conn = duckdb.connect(database=":memory:", read_only=False)
+        try:
+            row_count = conn.execute(sql, params).fetchone()[0]
+        except duckdb.IOException:
+            return 0
+        finally:
+            conn.close()
+        return int(row_count)
+
+    def query(
+        self,
+        dataset: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        columns: list[str] | None = None,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
+        """按用户口径抽查 dataset，支持字段裁剪、过滤与 limit。"""
+        if not self._dataset_files(dataset):
+            return pd.DataFrame()
+
+        available_columns = {item["name"] for item in self.schema(dataset)}
+        if columns:
+            missing_columns = [col for col in columns if col not in available_columns]
+            if missing_columns:
+                raise KeyError(f"字段不存在: {', '.join(missing_columns)}")
+            selected_columns = columns
+        else:
+            selected_columns = []
+
+        filter_columns = list((filters or {}).keys())
+        missing_filter_columns = [col for col in filter_columns if col not in available_columns]
+        if missing_filter_columns:
+            raise KeyError(f"过滤字段不存在: {', '.join(missing_filter_columns)}")
+
+        col_clause = (
+            ", ".join(self._quote_identifier(col) for col in selected_columns)
+            if selected_columns
+            else "*"
+        )
+        where_clause, params = self._build_where_clause(filters)
+        sql = (
+            f"SELECT {col_clause} "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true) "
+            f"WHERE {where_clause}"
+        )
+
+        order_candidates = [
+            col
+            for col in ["date", "report_date", "end_date", "symbol"]
+            if col in available_columns and (not selected_columns or col in selected_columns)
+        ]
+        if order_candidates:
+            sql += " ORDER BY " + ", ".join(
+                self._quote_identifier(col) for col in order_candidates
+            )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(int(limit), 0))
+
+        conn = duckdb.connect(database=":memory:", read_only=False)
+        try:
+            return conn.execute(sql, params).fetchdf()
+        except duckdb.IOException:
+            return pd.DataFrame()
+        finally:
+            conn.close()
 
     def snapshot(self, profile: str, as_of: date) -> str:
         """发布快照到 authoritative 目录。
@@ -211,3 +339,34 @@ class ParquetDuckDBBackend:
             dest_file = dest / rel
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(parquet_file, dest_file)
+
+    def _dataset_files(self, dataset: str) -> list[Path]:
+        dataset_dir = self.dataset_path(dataset)
+        if not dataset_dir.exists():
+            return []
+        return sorted(dataset_dir.rglob("data.parquet"))
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    @classmethod
+    def _build_where_clause(
+        cls,
+        filters: dict[str, Any] | None,
+    ) -> tuple[str, list[object]]:
+        if not filters:
+            return "1=1", []
+
+        where_parts: list[str] = []
+        params: list[object] = []
+        for col, val in filters.items():
+            identifier = cls._quote_identifier(col)
+            if isinstance(val, tuple) and len(val) == 2:
+                op, operand = val
+                where_parts.append(f"{identifier} {op} ?")
+                params.append(operand)
+            else:
+                where_parts.append(f"{identifier} = ?")
+                params.append(val)
+        return " AND ".join(where_parts), params
