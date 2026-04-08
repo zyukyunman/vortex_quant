@@ -65,6 +65,7 @@ class ProfileValidator:
     def _validate_data(self, p: DataProfile) -> list[ValidationError]:
         """数据域字段校验。"""
         errors: list[ValidationError] = []
+        valid_notification_levels = {"critical", "warning", "warn", "info"}
         if not p.datasets:
             errors.append(
                 ValidationError(
@@ -81,6 +82,24 @@ class ProfileValidator:
                     level="error",
                 )
             )
+        if not isinstance(p.notification, dict):
+            errors.append(
+                ValidationError(
+                    field="notification",
+                    message="notification 必须为 dict",
+                    level="error",
+                )
+            )
+        else:
+            level = p.notification.get("level")
+            if level is not None and str(level) not in valid_notification_levels:
+                errors.append(
+                    ValidationError(
+                        field="notification.level",
+                        message="notification.level 必须为 critical/warning/warn/info 之一",
+                        level="error",
+                    )
+                )
         return errors
 
     def _validate_research(self, p: ResearchProfile) -> list[ValidationError]:

@@ -572,6 +572,42 @@ def _parse_dataset_override(raw: str | None) -> list[str]:
     return [token for token in tokens if token]
 
 
+def _parse_data_filters(raw_filters: list[str] | None) -> dict[str, object]:
+    """解析抽查命令的过滤表达式。
+
+    支持：`col=value`、`col!=value`、`col>=value`、`col<=value`、`col>value`、`col<value`
+    """
+    if not raw_filters:
+        return {}
+
+    parsed: dict[str, object] = {}
+    operators = [">=", "<=", "!=", ">", "<", "="]
+    for raw in raw_filters:
+        expression = raw.strip()
+        if not expression:
+            continue
+        matched = None
+        for op in operators:
+            if op in expression:
+                matched = op
+                break
+        if matched is None:
+            raise ValueError(
+                f"过滤条件格式错误: {expression}（需 col=value / col>=value 等）"
+            )
+        left, right = expression.split(matched, 1)
+        column = left.strip()
+        value = right.strip()
+        if not column or not value:
+            raise ValueError(
+                f"过滤条件格式错误: {expression}（列名和值都不能为空）"
+            )
+        if column in parsed:
+            raise ValueError(f"同一个字段暂不支持重复过滤: {column}")
+        parsed[column] = value if matched == "=" else (matched, value)
+    return parsed
+
+
 def _parse_task_progress(raw: str | None):
     """解析 task_queue.progress_json。"""
     if not raw:
@@ -582,6 +618,217 @@ def _parse_task_progress(raw: str | None):
         return TaskProgress.from_dict(json.loads(raw))
     except Exception:
         return None
+
+
+def _resolve_dataset_metadata(
+    dataset: str,
+) -> tuple[str, str | None, str | None, str | None, str | None, dict[str, str]]:
+    """解析 dataset 的 canonical 名、底层 API、文档链接、说明、备注与字段文档。"""
+    try:
+        from vortex.data.provider.tushare_registry import (
+            get_tushare_dataset_api_doc_url,
+            get_tushare_dataset_field_docs,
+            get_tushare_dataset_note,
+            get_tushare_dataset_spec,
+            resolve_tushare_dataset_name,
+        )
+
+        canonical = resolve_tushare_dataset_name(dataset)
+        spec = get_tushare_dataset_spec(canonical)
+        api_name = str(spec.get("api") or canonical).strip() or None
+        api_doc_url = get_tushare_dataset_api_doc_url(canonical)
+        description = str(spec.get("description") or "").strip() or None
+        note = get_tushare_dataset_note(canonical)
+        field_docs = get_tushare_dataset_field_docs(canonical)
+        return canonical, api_name, api_doc_url, description, note, field_docs
+    except Exception:
+        return dataset, None, None, None, None, {}
+
+
+def _collect_data_inspection(
+    root: Path,
+    *,
+    dataset: str | None,
+    columns: list[str],
+    raw_filters: list[str],
+    limit: int,
+) -> dict[str, object]:
+    """收集用户抽查某张表所需的元信息与样例数据。"""
+    from vortex.data.storage.parquet_duckdb import ParquetDuckDBBackend
+    from vortex.runtime.workspace import Workspace
+
+    ws = Workspace(root)
+    ws.ensure_initialized()
+    storage = ParquetDuckDBBackend(ws.data_dir)
+
+    if dataset is None:
+        catalog = []
+        for name in storage.list_datasets():
+            canonical, api_name, api_doc_url, description, note, _field_docs = (
+                _resolve_dataset_metadata(name)
+            )
+            partitions = [part for part in storage.list_partitions(name) if part != "."]
+            catalog.append(
+                {
+                    "dataset": name,
+                    "canonical_dataset": canonical,
+                    "api": api_name,
+                    "api_doc_url": api_doc_url,
+                    "description": description,
+                    "note": note,
+                    "storage_path": str(storage.dataset_path(name)),
+                    "partition_count": len(partitions) if partitions else 1,
+                }
+            )
+        return {
+            "root": str(root),
+            "mode": "catalog",
+            "dataset_count": len(catalog),
+            "datasets": catalog,
+        }
+
+    canonical, api_name, api_doc_url, description, note, field_docs = (
+        _resolve_dataset_metadata(dataset)
+    )
+    filters = _parse_data_filters(raw_filters)
+    schema = storage.schema(canonical)
+    schema_with_docs = [
+        {
+            **item,
+            "description": field_docs.get(str(item.get("name")), "未登记说明"),
+        }
+        for item in schema
+    ]
+    dataset_files = storage.list_partitions(canonical)
+    materialized = bool(schema) or bool(dataset_files)
+    visible_partitions = [part for part in dataset_files if part != "."]
+    total_rows = storage.count_rows(canonical) if materialized else 0
+    matching_rows = storage.count_rows(canonical, filters=filters) if materialized else 0
+    preview = (
+        storage.query(
+            canonical,
+            filters=filters,
+            columns=columns or None,
+            limit=max(limit, 0),
+        )
+        if materialized
+        else None
+    )
+    preview_rows = (
+        preview.to_dict(orient="records")
+        if preview is not None and not preview.empty
+        else []
+    )
+    return {
+        "root": str(root),
+        "mode": "dataset",
+        "requested_dataset": dataset,
+        "dataset": canonical,
+        "api": api_name,
+        "api_doc_url": api_doc_url,
+        "description": description,
+        "note": note,
+        "storage_path": str(storage.dataset_path(canonical)),
+        "parquet_glob": storage.parquet_glob(canonical),
+        "materialized": materialized,
+        "partition_count": (
+            len(visible_partitions)
+            if visible_partitions
+            else (1 if materialized else 0)
+        ),
+        "partition_examples": visible_partitions[:5],
+        "total_rows": total_rows,
+        "matching_rows": matching_rows,
+        "columns": schema_with_docs,
+        "selected_columns": columns,
+        "filter_expressions": raw_filters,
+        "preview_rows": preview_rows,
+    }
+
+
+def _print_data_inspection(payload: dict[str, object], fmt: str) -> None:
+    if fmt == "json":
+        _print_result(payload, fmt)
+        return
+
+    mode = payload.get("mode")
+    if mode == "catalog":
+        datasets = payload.get("datasets", [])
+        if not isinstance(datasets, list) or not datasets:
+            print("ℹ️  当前还没有已落盘的数据表")
+            return
+        print(f"📚 当前已落盘 {payload.get('dataset_count', len(datasets))} 张表")
+        for item in datasets:
+            if not isinstance(item, dict):
+                continue
+            description = item.get("description") or "未登记说明"
+            print(
+                f"  - {item.get('dataset')}: {description} "
+                f"(partitions={item.get('partition_count')})"
+            )
+            if item.get("api"):
+                print(f"    api: {item.get('api')}")
+            if item.get("api_doc_url"):
+                print(f"    api_doc_url: {item.get('api_doc_url')}")
+            if item.get("note"):
+                print(f"    note: {item.get('note')}")
+            print(f"    path: {item.get('storage_path')}")
+        return
+
+    print(f"🔎 dataset={payload.get('dataset')}")
+    if payload.get("requested_dataset") != payload.get("dataset"):
+        print(f"  alias: {payload.get('requested_dataset')} -> {payload.get('dataset')}")
+    if payload.get("api"):
+        print(f"  api: {payload.get('api')}")
+    if payload.get("api_doc_url"):
+        print(f"  api_doc_url: {payload.get('api_doc_url')}")
+    print(f"  description: {payload.get('description') or '未登记说明'}")
+    if payload.get("note"):
+        print(f"  note: {payload.get('note')}")
+    print(f"  materialized: {payload.get('materialized')}")
+    print(f"  storage_path: {payload.get('storage_path')}")
+    print(f"  parquet_glob: {payload.get('parquet_glob')}")
+    print(f"  partition_count: {payload.get('partition_count')}")
+    partition_examples = payload.get("partition_examples")
+    if isinstance(partition_examples, list) and partition_examples:
+        print(f"  partition_examples: {', '.join(str(item) for item in partition_examples)}")
+    print(f"  total_rows: {payload.get('total_rows')}")
+    print(f"  matching_rows: {payload.get('matching_rows')}")
+
+    filter_expressions = payload.get("filter_expressions")
+    if isinstance(filter_expressions, list) and filter_expressions:
+        print(f"  filters: {', '.join(str(item) for item in filter_expressions)}")
+    selected_columns = payload.get("selected_columns")
+    if isinstance(selected_columns, list) and selected_columns:
+        print(f"  selected_columns: {', '.join(str(item) for item in selected_columns)}")
+
+    columns = payload.get("columns")
+    if isinstance(columns, list) and columns:
+        print("  columns:")
+        for item in columns:
+            if not isinstance(item, dict):
+                continue
+            print(
+                f"    - {item.get('name')} ({item.get('type')}): "
+                f"{item.get('description') or '未登记说明'}"
+            )
+    else:
+        print("  columns: 尚无已落盘字段")
+
+    preview_rows = payload.get("preview_rows")
+    if isinstance(preview_rows, list) and preview_rows:
+        try:
+            import pandas as pd
+
+            preview_df = pd.DataFrame(preview_rows)
+            print("  preview:")
+            print(preview_df.to_string(index=False))
+        except Exception:
+            print("  preview:")
+            for row in preview_rows:
+                print(f"    - {row}")
+    else:
+        print("  preview: 当前无匹配样例")
 
 
 def _is_pid_alive(pid: int | None) -> bool:
@@ -601,7 +848,7 @@ def _task_summary_from_row(row: dict[str, object]) -> dict[str, object]:
         "task_id": row["task_id"],
         "action": row["action"],
         "status": row["status"],
-        "run_id": row.get("run_id"),
+        "run_id": getattr(progress, "run_id", None) or row.get("run_id"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "error": row.get("error"),
@@ -618,7 +865,40 @@ def _task_summary_from_row(row: dict[str, object]) -> dict[str, object]:
         "current_chunk": getattr(progress, "current_chunk", 0),
         "total_chunks": getattr(progress, "total_chunks", 0),
         "written_rows": getattr(progress, "written_rows", 0),
+        "retry_attempt": getattr(progress, "retry_attempt", 0),
+        "max_retry_attempts": getattr(progress, "max_retry_attempts", 0),
+        "next_retry_at": getattr(progress, "next_retry_at", None),
     }
+
+
+def _effective_active_data_tasks(
+    tasks: list[dict[str, object]],
+    latest_run: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    active_tasks = [
+        task for task in tasks if task.get("status") in {"pending", "running"}
+    ]
+    if active_tasks:
+        return active_tasks
+
+    if not latest_run or latest_run.get("status") != "running":
+        return []
+
+    run_id = latest_run.get("run_id")
+    if not run_id:
+        return []
+
+    orphans: list[dict[str, object]] = []
+    for task in tasks:
+        if task.get("run_id") != run_id or not task.get("pid_alive"):
+            continue
+        payload = dict(task)
+        payload["status"] = "running"
+        message = str(payload.get("message") or "").strip()
+        note = "worker alive; task_queue 状态已过期"
+        payload["message"] = f"{message}; {note}" if message else note
+        orphans.append(payload)
+    return orphans
 
 
 def _list_data_task_summaries(root: Path, profile_name: str) -> list[dict[str, object]]:
@@ -650,6 +930,7 @@ def _resolve_data_task_summary(
     task_id: str | None = None,
     active_only: bool = False,
     prefer_active: bool = False,
+    active_candidates: list[dict[str, object]] | None = None,
 ) -> dict[str, object] | None:
     if task_id:
         for task in tasks:
@@ -657,9 +938,11 @@ def _resolve_data_task_summary(
                 return task
         return None
 
-    active_tasks = [
-        task for task in tasks if task.get("status") in {"pending", "running"}
-    ]
+    active_tasks = (
+        list(active_candidates)
+        if active_candidates is not None
+        else [task for task in tasks if task.get("status") in {"pending", "running"}]
+    )
 
     if active_only:
         if len(active_tasks) > 1:
@@ -904,6 +1187,164 @@ def _smoke_test_tushare(token: str) -> bool:
 
 
 # ------------------------------------------------------------------
+# 通知 / Agent 交互配置
+# ------------------------------------------------------------------
+
+
+def _init_step_feishu() -> dict[str, str]:
+    """Init 向导 Step 5: 飞书通知配置。
+
+    逐项引导用户填写飞书开放平台的凭证信息。
+    任何一项留空都视为跳过整个飞书配置。
+
+    Returns:
+        配置成功时返回环境变量字典，跳过时返回空字典。
+    """
+    print("📌 Step 5/6: 飞书通知配置")
+    print("   飞书通知可以在数据更新完成、失败等事件时自动推送消息。")
+    print("   如需配置，请先在飞书开放平台 (open.feishu.cn) 创建一个应用。")
+    print()
+    if not _prompt_yes_no("是否配置飞书通知？", default=False):
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    print()
+    print("   逐项填写飞书配置（任意一项留空即跳过整个飞书配置）：")
+    print()
+
+    app_id = _prompt(
+        "   App ID\n"
+        "   （在飞书开放平台 → 应用管理 → 凭证与基础信息页面获取）",
+    )
+    if not app_id:
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    app_secret = _prompt(
+        "   App Secret\n"
+        "   （同上页面获取，注意保密，不要提交到版本控制）",
+    )
+    if not app_secret:
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    receive_id = _prompt(
+        "   默认接收人 ID\n"
+        "   （在飞书客户端打开目标用户/群组的资料页 → 复制 Open ID 或 Chat ID）",
+    )
+    if not receive_id:
+        print("   已跳过飞书通知配置。")
+        return {}
+
+    receive_id_type = _prompt(
+        "   接收人 ID 类型\n"
+        "   可选值: open_id / user_id / chat_id / email",
+        "open_id",
+    )
+
+    print("   ✅ 飞书通知已配置")
+    return {
+        "FEISHU_APP_ID": app_id,
+        "FEISHU_APP_SECRET": app_secret,
+        "FEISHU_DEFAULT_RECEIVE_ID": receive_id,
+        "FEISHU_DEFAULT_RECEIVE_ID_TYPE": receive_id_type,
+    }
+
+
+def _init_step_agent(root: Path) -> dict[str, str]:
+    """Init 向导 Step 6: AI Agent 配置。
+
+    引导用户配置 AI Agent 后端（当前仅支持 Copilot CLI）。
+    会自动检测 copilot 命令是否可用，不可用时提示安装方法。
+
+    Args:
+        root: 工作区根目录，用作默认 scope
+
+    Returns:
+        配置成功时返回环境变量字典，跳过时返回空字典。
+    """
+    print("📌 Step 6/6: AI Agent 配置")
+    print("   AI Agent 可以在特定事件发生时自动调用 Copilot CLI 进行分析或修复。")
+    print()
+    if not _prompt_yes_no("是否配置 AI Agent？", default=False):
+        print("   已跳过 Agent 配置。")
+        return {}
+
+    # 检测 copilot CLI 是否可用
+    copilot_path = shutil.which("copilot")
+    if copilot_path:
+        print(f"   ✅ 检测到 copilot CLI: {copilot_path}")
+    else:
+        print("   ⚠️  未检测到 copilot 命令。")
+        print("   安装方式：")
+        print("     npm install -g @githubnext/github-copilot-cli")
+        print("   安装后需完成认证：")
+        print("     copilot auth")
+        print()
+        if not _prompt_yes_no("是否仍要配置（安装后即可使用）？", default=True):
+            print("   已跳过 Agent 配置。")
+            return {}
+
+    print()
+    scope = _prompt(
+        "   工作目录范围\n"
+        "   （Agent 执行时的工作目录，通常设为仓库根目录）",
+        str(root),
+    )
+
+    effort = _prompt_choice(
+        "   推理强度：",
+        ["high", "medium", "low"],
+        "high",
+    )
+
+    print(f"   ✅ AI Agent 已配置 (后端=copilot, 强度={effort})")
+    return {
+        "VORTEX_AGENT_ENABLED": "true",
+        "VORTEX_AGENT_BACKEND": "copilot",
+        "VORTEX_AGENT_SCOPE": scope,
+        "VORTEX_AGENT_EFFORT": effort,
+    }
+
+
+def _merge_env_file(env_file: Path, new_vars: dict[str, str]) -> None:
+    """将环境变量合并写入 .env 文件。
+
+    如果 .env 已存在，读取现有内容并更新/追加新变量；
+    如果不存在，创建新文件。保留注释行和空行。
+
+    Args:
+        env_file: .env 文件路径
+        new_vars: 要写入的环境变量字典
+    """
+    lines: list[str] = []
+    existing_keys: set[str] = set()
+
+    if env_file.exists():
+        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            # 保留注释行和空行
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                lines.append(raw_line)
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in new_vars:
+                # 用新值替换已有的同名变量
+                lines.append(f"{key}={new_vars[key]}")
+                existing_keys.add(key)
+            else:
+                lines.append(raw_line)
+
+    # 追加 .env 中不存在的新变量
+    for key, value in new_vars.items():
+        if key not in existing_keys:
+            lines.append(f"{key}={value}")
+
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ------------------------------------------------------------------
 # 子命令实现
 # ------------------------------------------------------------------
 
@@ -916,6 +1357,8 @@ def cmd_init(args: argparse.Namespace) -> None:
       2. 选择历史数据起始日
       3. 选择是否立刻开始首次数据更新；若是，则选择本次先同步的数据集
       4. 配置自动更新计划
+      5. 飞书通知配置（可选，逐项填写凭证）
+      6. AI Agent 配置（可选，检测 Copilot CLI 并设置参数）
 
     非交互模式（--non-interactive 或管道输入）：
       使用默认配置，适合 CI/脚本。
@@ -946,6 +1389,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     bootstrap_datasets: list[str] = []
     write_profile = True
     init_state: dict[str, object] | None = None
+    # 通知/Agent 交互结果，init 成功后统一写入 .env
+    extra_env_vars: dict[str, str] = {}
 
     try:
         if not non_interactive:
@@ -956,7 +1401,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             print()
 
             # Step 1: TUSHARE_TOKEN
-            print("📌 Step 1/4: 数据源配置")
+            print("📌 Step 1/6: 数据源配置")
             tushare_token = _check_tushare_token()
             if tushare_token:
                 if _smoke_test_tushare(tushare_token):
@@ -971,13 +1416,13 @@ def cmd_init(args: argparse.Namespace) -> None:
             print()
 
             # Step 2: 历史数据起始日
-            print("📌 Step 2/4: 历史数据范围")
+            print("📌 Step 2/6: 历史数据范围")
             history_start = _prompt("历史数据起始日 (YYYYMMDD)", "20170101")
             config["history_start"] = history_start
             print()
 
             # Step 3: 首次数据更新
-            print("📌 Step 3/4: 首次数据更新")
+            print("📌 Step 3/6: 首次数据更新")
             print("   默认情况下，初始化只写入配置；后续由你手动触发，或由自动调度更新全量数据集。")
             run_bootstrap_now = _prompt_yes_no("是否现在开始首次数据更新？", default=False)
             if run_bootstrap_now:
@@ -995,7 +1440,7 @@ def cmd_init(args: argparse.Namespace) -> None:
             print()
 
             # Step 4: 自动更新计划
-            print("📌 Step 4/4: 自动更新计划")
+            print("📌 Step 4/6: 自动更新计划")
             enable_schedule = _prompt_yes_no("是否启用每日自动更新？", default=False)
             if enable_schedule:
                 print("  选择更新时间:")
@@ -1017,6 +1462,24 @@ def cmd_init(args: argparse.Namespace) -> None:
                     _print_cron_help()
                     cron = _prompt("Cron 表达式（例如 0 18 * * 1-5）", "0 18 * * 1-5")
                     config["schedule"] = cron
+            print()
+
+            # Step 5: 飞书通知配置
+            feishu_env = _init_step_feishu()
+            if feishu_env:
+                extra_env_vars.update(feishu_env)
+                # 在 profile 配置中启用通知
+                config["notification"] = {
+                    "enabled": True,
+                    "channel": "feishu",
+                    "level": "warning",
+                }
+            print()
+
+            # Step 6: AI Agent 配置
+            agent_env = _init_step_agent(root)
+            if agent_env:
+                extra_env_vars.update(agent_env)
             print()
 
             if default_profile.exists():
@@ -1044,9 +1507,14 @@ def cmd_init(args: argparse.Namespace) -> None:
                 print("   初始化已完成，你可以稍后手动执行 `vortex data bootstrap`。")
 
         # 仅在整个 init 成功收尾后再写入 .env，避免取消时留下半成品。
-        if tushare_token and not env_file.exists():
-            env_file.write_text(f"TUSHARE_TOKEN={tushare_token}\n")
-            print(f"💡 已将 TUSHARE_TOKEN 写入 {env_file}")
+        env_to_write: dict[str, str] = {}
+        if tushare_token:
+            env_to_write["TUSHARE_TOKEN"] = tushare_token
+        env_to_write.update(extra_env_vars)
+        if env_to_write:
+            _merge_env_file(env_file, env_to_write)
+            written_keys = ", ".join(env_to_write.keys())
+            print(f"💡 已将 {written_keys} 写入 {env_file}")
             print("   ⚠️  请确保 .env 已加入 .gitignore！")
 
         print()
@@ -1286,9 +1754,7 @@ def _collect_data_status(root: Path, profile_name: str) -> dict[str, object]:
     manifest.close()
 
     tasks = _list_data_task_summaries(root, profile_name)
-    active_tasks = [
-        task for task in tasks if task.get("status") in {"pending", "running"}
-    ]
+    active_tasks = _effective_active_data_tasks(tasks, latest_run)
     latest_task = tasks[0] if tasks else None
 
     return {
@@ -1348,6 +1814,13 @@ def _print_data_status(status: dict[str, object], fmt: str) -> None:
                 )
             if task.get("written_rows"):
                 print(f"    written_rows: {task['written_rows']}")
+            if task.get("max_retry_attempts"):
+                print(
+                    "    auto_recovery: "
+                    f"{task.get('retry_attempt', 0)}/{task.get('max_retry_attempts', 0)}"
+                )
+            if task.get("next_retry_at"):
+                print(f"    next_retry_at: {task['next_retry_at']}")
             if task.get("pid"):
                 state = "alive" if task.get("pid_alive") else "dead"
                 print(f"    pid: {task['pid']} ({state})")
@@ -1465,15 +1938,28 @@ def _cancel_data_task(
 
     from vortex.data.manifest import SyncManifest
     from vortex.runtime.database import Database
-    from vortex.runtime.task_queue import TaskProgress, TaskQueue
+    from vortex.runtime.task_queue import TaskProgress, TaskQueue, TaskStatus
     from vortex.runtime.workspace import Workspace
 
+    ws = Workspace(root)
+    ws.ensure_initialized()
+    manifest_path = ws.state_dir / "manifests" / profile_name / "sync_manifest.db"
+    latest_run = None
+    if manifest_path.exists():
+        manifest = SyncManifest(manifest_path)
+        try:
+            latest_run = manifest.get_latest_run(profile_name)
+        finally:
+            manifest.close()
+
     tasks = _list_data_task_summaries(root, profile_name)
+    active_candidates = _effective_active_data_tasks(tasks, latest_run)
     try:
         task = _resolve_data_task_summary(
             tasks,
             task_id=task_id,
             active_only=True,
+            active_candidates=active_candidates,
         )
     except ValueError as exc:
         print(f"❌ {exc}", file=sys.stderr)
@@ -1483,16 +1969,26 @@ def _cancel_data_task(
         print("❌ 当前没有可取消的活跃数据任务", file=sys.stderr)
         sys.exit(1)
 
-    ws = Workspace(root)
-    ws.ensure_initialized()
-
     db = Database(ws.db_path)
     db.initialize_tables()
     task_queue = TaskQueue(db)
     row = task_queue.get_task(str(task["task_id"]))
-    if row is None or not task_queue.cancel(str(task["task_id"])):
+    cancelled = row is not None and task_queue.cancel(str(task["task_id"]))
+    if not cancelled:
+        pid = task.get("pid")
+        if row is not None and pid and _is_pid_alive(int(pid)):
+            task_queue.update_status(
+                str(task["task_id"]),
+                TaskStatus.CANCELLED,
+                error="cancelled by user",
+            )
+        else:
+            db.close()
+            print("❌ 任务已不在可取消状态", file=sys.stderr)
+            sys.exit(1)
+
+    if row is None:
         db.close()
-        print("❌ 任务已不在可取消状态", file=sys.stderr)
         sys.exit(1)
 
     progress = _parse_task_progress(row.get("progress_json"))
@@ -1620,6 +2116,21 @@ def cmd_data(args: argparse.Namespace) -> None:
         )
         return
 
+    if args.data_action == "inspect":
+        try:
+            payload = _collect_data_inspection(
+                root,
+                dataset=getattr(args, "dataset", None),
+                columns=_parse_dataset_override(getattr(args, "columns", None)),
+                raw_filters=list(getattr(args, "filters", []) or []),
+                limit=int(getattr(args, "limit", 10)),
+            )
+        except (KeyError, ValueError) as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            sys.exit(1)
+        _print_data_inspection(payload, fmt)
+        return
+
     start_date = None
     end_date = None
     start_str = None
@@ -1661,7 +2172,15 @@ def cmd_data(args: argparse.Namespace) -> None:
 
     import dataclasses
     import signal
+    from datetime import timedelta
 
+    from vortex.data.recovery import (
+        DEFAULT_DATA_AUTO_RECOVERY_DELAYS_SECONDS,
+        build_run_notification_message,
+        evaluate_run_report,
+    )
+    from vortex.shared.errors import DataError
+    from vortex.shared.ids import generate_run_id
     from vortex.runtime.database import Database
     from vortex.runtime.task_queue import TaskProgress, TaskQueue, TaskStatus
     from vortex.runtime.workspace import Workspace
@@ -1670,9 +2189,12 @@ def cmd_data(args: argparse.Namespace) -> None:
     ws.ensure_initialized()
     task_db = None
     task_queue = None
+    notification_db = None
+    notification_service = None
     task_id = getattr(args, "task_id", None)
     run_id = getattr(args, "run_id", None)
     cancel_requested = False
+    profile = None
 
     def _update_task(status: TaskStatus | None, *, message: str, error: str | None = None) -> None:
         if task_queue is None or task_id is None:
@@ -1698,6 +2220,7 @@ def cmd_data(args: argparse.Namespace) -> None:
                 current_stage=current_stage,
                 completed_stages=completed_stages,
                 message=message,
+                next_retry_at=None,
             ),
         )
         if status is not None:
@@ -1758,6 +2281,80 @@ def cmd_data(args: argparse.Namespace) -> None:
             return False
         return task_queue.is_cancelled(task_id)
 
+    def _sleep_with_cancel(delay_seconds: float) -> None:
+        remaining = max(delay_seconds, 0.0)
+        while remaining > 0:
+            if _cancel_check():
+                raise DataError(
+                    code="DATA_TASK_CANCELLED",
+                    message="数据任务已取消",
+                )
+            tick = min(1.0, remaining)
+            time.sleep(tick)
+            remaining -= tick
+
+    def _get_notification_service():
+        nonlocal notification_db, notification_service
+        if notification_service is not None:
+            return notification_service
+        from vortex.notification.service import NotificationService
+
+        if task_db is not None:
+            notification_service = NotificationService(task_db)
+            return notification_service
+        notification_db = Database(ws.db_path)
+        notification_db.initialize_tables()
+        notification_service = NotificationService(notification_db)
+        return notification_service
+
+    def _notify_data_result(result, plan) -> None:
+        if profile is None or not plan.event_type or not plan.severity:
+            return
+        service = _get_notification_service()
+        message = build_run_notification_message(
+            report=result,
+            plan=plan,
+            action=args.data_action,
+            root=root,
+            task_id=task_id,
+        )
+        service.notify(message, getattr(profile, "notification", None))
+
+    def _run_data_action_once(attempt_run_id: str):
+        match args.data_action:
+            case "bootstrap":
+                return pipeline.bootstrap(profile, dry_run=dry_run, run_id=attempt_run_id)
+            case "update":
+                return pipeline.update(profile, dry_run=dry_run, run_id=attempt_run_id)
+            case "backfill":
+                assert start_date is not None and end_date is not None
+                return pipeline.repair(
+                    profile,
+                    (start_date, end_date),
+                    run_id=attempt_run_id,
+                    action="backfill",
+                )
+            case "repair":
+                assert start_date is not None and end_date is not None
+                return pipeline.repair(
+                    profile,
+                    (start_date, end_date),
+                    run_id=attempt_run_id,
+                    action="repair",
+                )
+        raise AssertionError(f"unexpected data action: {args.data_action}")
+
+    def _exit_cancelled(message: str, *, already_printed: bool = False) -> None:
+        logger.warning("data %s 已取消: %s", args.data_action, message)
+        if fmt == "json" and not already_printed:
+            payload: dict[str, object] = {"status": "cancelled", "error": message}
+            if run_id:
+                payload["run_id"] = run_id
+            _print_result(payload, fmt)
+        elif fmt != "json":
+            print(f"🛑 {message}", file=sys.stderr)
+        sys.exit(130)
+
     previous_sigint = None
     previous_sigterm = None
 
@@ -1794,26 +2391,6 @@ def cmd_data(args: argparse.Namespace) -> None:
 
         result = None
         match args.data_action:
-            case "bootstrap":
-                result = pipeline.bootstrap(profile, dry_run=dry_run, run_id=run_id)
-            case "update":
-                result = pipeline.update(profile, dry_run=dry_run, run_id=run_id)
-            case "backfill":
-                assert start_date is not None and end_date is not None
-                result = pipeline.repair(
-                    profile,
-                    (start_date, end_date),
-                    run_id=run_id,
-                    action="backfill",
-                )
-            case "repair":
-                assert start_date is not None and end_date is not None
-                result = pipeline.repair(
-                    profile,
-                    (start_date, end_date),
-                    run_id=run_id,
-                    action="repair",
-                )
             case "publish":
                 snapshot_id = pipeline.publish(profile, as_of, run_id=run_id)
                 payload = {"snapshot_id": snapshot_id, "status": "published"}
@@ -1825,26 +2402,95 @@ def cmd_data(args: argparse.Namespace) -> None:
             case "gc":
                 print("⏳ data gc: 后续迭代实现")
                 return
+            case "bootstrap" | "update" | "backfill" | "repair":
+                retry_delays = (
+                    DEFAULT_DATA_AUTO_RECOVERY_DELAYS_SECONDS
+                    if not dry_run
+                    else ()
+                )
+                total_attempts = 1 + len(retry_delays)
+                for attempt in range(1, total_attempts + 1):
+                    attempt_run_id = (
+                        run_id
+                        if attempt == 1 and run_id
+                        else str(generate_run_id("data"))
+                    )
+                    _emit_task_progress(
+                        force=True,
+                        run_id=attempt_run_id,
+                        retry_attempt=attempt,
+                        max_retry_attempts=total_attempts,
+                        next_retry_at=None,
+                        message=f"{args.data_action} attempt {attempt}/{total_attempts}",
+                    )
+                    result = _run_data_action_once(attempt_run_id)
+                    plan = evaluate_run_report(
+                        result,
+                        attempt=attempt,
+                        retry_delays=retry_delays,
+                    )
+                    if plan.should_retry:
+                        next_retry_at = (
+                            datetime.now()
+                            + timedelta(seconds=plan.next_delay_seconds or 0.0)
+                        ).isoformat(timespec="seconds")
+                        retry_reason = "; ".join(
+                            failure.reason
+                            for failure in plan.retryable_failures[:3]
+                        )
+                        _emit_task_progress(
+                            force=True,
+                            run_id=attempt_run_id,
+                            retry_attempt=attempt,
+                            max_retry_attempts=plan.max_attempts,
+                            next_retry_at=next_retry_at,
+                            message=(
+                                f"{args.data_action} 将自动恢复: "
+                                f"{retry_reason or '存在可恢复失败'}"
+                            ),
+                        )
+                        logger.warning(
+                            "data %s 第 %d/%d 次执行未完全完成，%ss 后自动恢复: %s",
+                            args.data_action,
+                            attempt,
+                            plan.max_attempts,
+                            int(plan.next_delay_seconds or 0),
+                            retry_reason or "存在可恢复失败",
+                        )
+                        _sleep_with_cancel(plan.next_delay_seconds or 0.0)
+                        continue
+                    break
             case _:
                 print(f"❌ 未知操作: {args.data_action}", file=sys.stderr)
                 sys.exit(1)
 
         if result is not None:
+            plan = evaluate_run_report(result, attempt=1, retry_delays=())
+            if plan.event_type:
+                _notify_data_result(result, plan)
             _print_result(dataclasses.asdict(result), fmt)
             if result.status == "success":
                 _update_task(TaskStatus.SUCCESS, message=result.status)
             elif result.status == "partial_success":
                 _update_task(
                     TaskStatus.PARTIAL_SUCCESS,
-                    message=result.status,
+                    message=result.error or result.status,
                     error=result.error,
                 )
             elif result.status == "cancelled":
                 _update_task(TaskStatus.CANCELLED, message=result.status, error=result.error)
-                sys.exit(1)
+                _exit_cancelled(result.error or "数据任务已取消", already_printed=True)
             else:
                 _update_task(TaskStatus.FAILED, message=result.status, error=result.error)
                 sys.exit(1)
+    except DataError as e:
+        if e.code == "DATA_TASK_CANCELLED":
+            _update_task(TaskStatus.CANCELLED, message="cancelled", error=str(e))
+            _exit_cancelled(str(e))
+        _update_task(TaskStatus.FAILED, message=f"failed {args.data_action}", error=str(e))
+        logger.error("data %s 失败: %s", args.data_action, e, exc_info=True)
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         _update_task(TaskStatus.FAILED, message=f"failed {args.data_action}", error=str(e))
         logger.error("data %s 失败: %s", args.data_action, e, exc_info=True)
@@ -1857,6 +2503,8 @@ def cmd_data(args: argparse.Namespace) -> None:
             signal.signal(signal.SIGTERM, previous_sigterm)
         if manifest is not None:
             manifest.close()
+        if notification_db is not None:
+            notification_db.close()
         if task_db is not None:
             task_db.close()
 
@@ -2022,6 +2670,21 @@ def main() -> None:
     cancel_sub.add_argument("--profile", help=argparse.SUPPRESS)
     cancel_sub.add_argument("--task-id", help="任务 ID；默认取消唯一活跃任务")
     cancel_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    # inspect
+    inspect_sub = data_sub.add_parser("inspect", parents=[root_parser], help="抽查某张表的字段与样例数据")
+    inspect_sub.add_argument("--profile", help=argparse.SUPPRESS)
+    inspect_sub.add_argument("--dataset", help="dataset 名；不传则列出当前已落盘表")
+    inspect_sub.add_argument("--columns", help="只展示这些列，逗号分隔")
+    inspect_sub.add_argument(
+        "--filter",
+        dest="filters",
+        action="append",
+        default=[],
+        help="过滤条件，支持 col=value / col>=value / col<=value / col>value / col<value / col!=value",
+    )
+    inspect_sub.add_argument("--limit", type=int, default=10, help="样例行数（默认 10，0 表示只看元信息）")
+    inspect_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     args = parser.parse_args()
 

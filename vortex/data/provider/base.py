@@ -114,6 +114,7 @@ class DataProvider(Protocol):
         *,
         symbols: list[str] | None = None,
         trading_days: list[date] | None = None,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> DataFrame:

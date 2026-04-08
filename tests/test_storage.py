@@ -96,6 +96,49 @@ class TestRead:
         assert "close" in result.columns
         # open 可能不在返回列中（取决于实现是否支持 column pruning）
 
+    def test_query_returns_preview_rows(self, storage):
+        for d in ["20260401", "20260402"]:
+            df = pd.DataFrame({
+                "symbol": ["600519.SH"],
+                "date": [d],
+                "close": [1800.0],
+            })
+            storage.upsert("bars", df, {"date": d})
+
+        result = storage.query(
+            "bars",
+            filters={"date": (">=", "20260402")},
+            columns=["symbol", "date", "close"],
+            limit=1,
+        )
+        assert len(result) == 1
+        assert list(result.columns) == ["symbol", "date", "close"]
+        assert str(result.iloc[0]["date"]) == "20260402"
+
+    def test_query_rejects_missing_columns(self, storage):
+        df = pd.DataFrame({
+            "symbol": ["600519.SH"],
+            "date": ["20260401"],
+            "close": [1800.0],
+        })
+        storage.upsert("bars", df, {"date": "20260401"})
+
+        with pytest.raises(KeyError):
+            storage.query("bars", columns=["missing_col"], limit=5)
+
+    def test_schema_and_count_rows(self, storage):
+        df = pd.DataFrame({
+            "symbol": ["600519.SH", "000001.SZ"],
+            "date": ["20260401", "20260401"],
+            "close": [1800.0, 15.0],
+        })
+        storage.upsert("bars", df, {"date": "20260401"})
+
+        schema = storage.schema("bars")
+        assert {"name": "symbol", "type": "VARCHAR"} in schema
+        assert storage.count_rows("bars") == 2
+        assert storage.count_rows("bars", filters={"symbol": "600519.SH"}) == 1
+
 
 class TestListPartitions:
     def test_empty_partitions(self, storage):
@@ -109,6 +152,14 @@ class TestListPartitions:
         parts = storage.list_partitions("bars")
         assert len(parts) == 2
         assert all("2026040" in p for p in parts)
+
+    def test_list_datasets_returns_materialized_dataset_names(self, storage):
+        bars = pd.DataFrame({"symbol": ["600519.SH"], "date": ["20260401"], "close": [1800.0]})
+        instruments = pd.DataFrame({"symbol": ["600519.SH"], "name": ["贵州茅台"]})
+        storage.upsert("bars", bars, {"date": "20260401"})
+        storage.upsert("instruments", instruments, {})
+
+        assert storage.list_datasets() == ["bars", "instruments"]
 
 
 class TestSnapshot:

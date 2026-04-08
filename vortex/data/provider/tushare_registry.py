@@ -18,6 +18,7 @@ from typing import Any
 
 TUSHARE_INDEX_MARKETS = ["MS", "SSE", "SZSE", "CSI", "CICC", "SW", "OTH"]
 TUSHARE_FUND_MARKETS = ["E", "O"]
+TUSHARE_STOCK_EXCHANGES = ["SSE", "SZSE", "BSE"]
 
 # 当前仓库默认按用户现有 Tushare 档位建模；仍可通过环境变量覆盖。
 DEFAULT_TUSHARE_POINTS = 5000
@@ -54,6 +55,12 @@ TUSHARE_API_ACCESS_RULES: dict[str, dict[str, Any]] = {
     "express": {"access": "points", "min_points": 2000},
     "dividend": {"access": "points", "min_points": 2000},
     "fina_indicator": {"access": "points", "min_points": 2000},
+    "income_vip": {"access": "points", "min_points": 5000},
+    "balancesheet_vip": {"access": "points", "min_points": 5000},
+    "cashflow_vip": {"access": "points", "min_points": 5000},
+    "fina_indicator_vip": {"access": "points", "min_points": 5000},
+    "forecast_vip": {"access": "points", "min_points": 5000},
+    "express_vip": {"access": "points", "min_points": 5000},
     "disclosure_date": {"access": "points", "min_points": 2000},
     "fund_basic": {"access": "points", "min_points": 2000},
     "index_basic": {"access": "points", "min_points": 2000},
@@ -66,15 +73,15 @@ TUSHARE_API_ACCESS_RULES: dict[str, dict[str, Any]] = {
     "moneyflow_ind_dc": {"access": "points", "min_points": 2000},
     "moneyflow_mkt_dc": {"access": "points", "min_points": 2000},
     "limit_list_d": {"access": "points", "min_points": 2000},
-    "limit_step": {"access": "points", "min_points": 2000},
+    "limit_step": {"access": "points", "min_points": 8000},
     "kpl_list": {"access": "points", "min_points": 2000},
     "dc_hot": {"access": "points", "min_points": 2000},
     "ths_hot": {"access": "points", "min_points": 2000},
     "adj_factor": {"access": "points", "min_points": 2000},
     "namechange": {"access": "points", "min_points": 2000},
-    "stock_company": {"access": "points", "min_points": 2000},
+    "stock_company": {"access": "points", "min_points": 120},
     "stock_st": {"access": "points", "min_points": 2000},
-    "st": {"access": "points", "min_points": 2000},
+    "st": {"access": "points", "min_points": 6000},
     "sw_daily": {"access": "points", "min_points": 2000},
     "ths_index": {"access": "points", "min_points": 2000},
     "ths_member": {"access": "points", "min_points": 2000},
@@ -107,6 +114,198 @@ TUSHARE_DATASET_ALIASES: dict[str, str] = {
     "income": "fundamental",
     "dividend": "events",
     "daily_basic": "valuation",
+}
+
+TUSHARE_API_DOC_URLS: dict[str, str] = {
+    "adj_factor": "https://tushare.pro/wctapi/documents/28.md",
+    "anns_d": "https://tushare.pro/wctapi/documents/176.md",
+    "balancesheet": "https://tushare.pro/wctapi/documents/36.md",
+    "cashflow": "https://tushare.pro/wctapi/documents/44.md",
+    "cn_cpi": "https://tushare.pro/wctapi/documents/228.md",
+    "cn_gdp": "https://tushare.pro/wctapi/documents/227.md",
+    "cn_m": "https://tushare.pro/wctapi/documents/242.md",
+    "cn_pmi": "https://tushare.pro/wctapi/documents/325.md",
+    "cn_ppi": "https://tushare.pro/wctapi/documents/245.md",
+    "daily": "https://tushare.pro/wctapi/documents/27.md",
+    "daily_basic": "https://tushare.pro/wctapi/documents/32.md",
+    "dc_hot": "https://tushare.pro/wctapi/documents/321.md",
+    "dc_index": "https://tushare.pro/wctapi/documents/362.md",
+    "dc_member": "https://tushare.pro/wctapi/documents/363.md",
+    "disclosure_date": "https://tushare.pro/wctapi/documents/162.md",
+    "dividend": "https://tushare.pro/wctapi/documents/103.md",
+    "express": "https://tushare.pro/wctapi/documents/46.md",
+    "fina_indicator": "https://tushare.pro/wctapi/documents/79.md",
+    "forecast": "https://tushare.pro/wctapi/documents/45.md",
+    "fund_basic": "https://tushare.pro/wctapi/documents/19.md",
+    "hk_daily": "https://tushare.pro/wctapi/documents/192.md",
+    "hsgt_top10": "https://tushare.pro/wctapi/documents/48.md",
+    "income": "https://tushare.pro/wctapi/documents/33.md",
+    "index_basic": "https://tushare.pro/wctapi/documents/94.md",
+    "index_classify": "https://tushare.pro/wctapi/documents/181.md",
+    "index_daily": "https://tushare.pro/wctapi/documents/95.md",
+    "index_global": "https://tushare.pro/wctapi/documents/211.md",
+    "index_member_all": "https://tushare.pro/wctapi/documents/335.md",
+    "index_weight": "https://tushare.pro/wctapi/documents/96.md",
+    "irm_qa_sh": "https://tushare.pro/wctapi/documents/366.md",
+    "irm_qa_sz": "https://tushare.pro/wctapi/documents/367.md",
+    "kpl_list": "https://tushare.pro/wctapi/documents/347.md",
+    "limit_list_d": "https://tushare.pro/wctapi/documents/298.md",
+    "limit_step": "https://tushare.pro/wctapi/documents/356.md",
+    "major_news": "https://tushare.pro/wctapi/documents/195.md",
+    "moneyflow": "https://tushare.pro/wctapi/documents/170.md",
+    "moneyflow_hsgt": "https://tushare.pro/wctapi/documents/47.md",
+    "moneyflow_ind_dc": "https://tushare.pro/wctapi/documents/344.md",
+    "moneyflow_mkt_dc": "https://tushare.pro/wctapi/documents/345.md",
+    "monthly": "https://tushare.pro/wctapi/documents/145.md",
+    "namechange": "https://tushare.pro/wctapi/documents/100.md",
+    "news": "https://tushare.pro/wctapi/documents/143.md",
+    "npr": "https://tushare.pro/wctapi/documents/406.md",
+    "pro_bar": "https://tushare.pro/wctapi/documents/146.md",
+    "research_report": "https://tushare.pro/wctapi/documents/415.md",
+    "rt_k": "https://tushare.pro/wctapi/documents/372.md",
+    "sf_month": "https://tushare.pro/wctapi/documents/310.md",
+    "shibor": "https://tushare.pro/wctapi/documents/149.md",
+    "shibor_lpr": "https://tushare.pro/wctapi/documents/151.md",
+    "st": "https://tushare.pro/wctapi/documents/423.md",
+    "stk_mins": "https://tushare.pro/wctapi/documents/387.md",
+    "stock_basic": "https://tushare.pro/wctapi/documents/25.md",
+    "stock_company": "https://tushare.pro/wctapi/documents/112.md",
+    "stock_st": "https://tushare.pro/wctapi/documents/397.md",
+    "sw_daily": "https://tushare.pro/wctapi/documents/327.md",
+    "ths_hot": "https://tushare.pro/wctapi/documents/320.md",
+    "ths_index": "https://tushare.pro/wctapi/documents/259.md",
+    "ths_member": "https://tushare.pro/wctapi/documents/261.md",
+    "top_inst": "https://tushare.pro/wctapi/documents/107.md",
+    "top_list": "https://tushare.pro/wctapi/documents/106.md",
+    "trade_cal": "https://tushare.pro/wctapi/documents/137.md",
+    "us_daily": "https://tushare.pro/wctapi/documents/254.md",
+    "us_tycr": "https://tushare.pro/wctapi/documents/219.md",
+    "weekly": "https://tushare.pro/wctapi/documents/144.md",
+}
+
+TUSHARE_COMMON_FIELD_DOCS: dict[str, str] = {
+    "symbol": "统一证券代码，A 股形如 600519.SH / 000001.SZ。",
+    "name": "证券或实体名称。",
+    "date": "统一日期字段，默认使用 YYYYMMDD；若是分区表，通常也是分区键。",
+    "report_date": "报告期，对应财报所属季度/年度，通常来自 Tushare 的 end_date。",
+    "ann_date": "公告日期，即财报或事件正式披露日期。",
+    "list_date": "上市日期。",
+    "delist_date": "退市日期；为空通常表示仍在上市。",
+    "open": "开盘价。",
+    "high": "最高价。",
+    "low": "最低价。",
+    "close": "收盘价。",
+    "pre_close": "前收盘价。",
+    "change": "涨跌额。",
+    "pct_chg": "涨跌幅，单位通常为百分比。",
+    "volume": "成交量；A 股日线口径下单位为手。",
+    "amount": "成交额；A 股日线口径下单位为千元。",
+    "turnover_rate": "换手率，单位为百分比。",
+    "turnover_rate_f": "自由流通换手率，单位为百分比。",
+    "volume_ratio": "量比。",
+    "pe": "市盈率（PE）。",
+    "pe_ttm": "滚动市盈率（PE TTM）。",
+    "pb": "市净率（PB）。",
+    "ps": "市销率（PS）。",
+    "ps_ttm": "滚动市销率（PS TTM）。",
+    "dv_ratio": "股息率，单位为百分比。",
+    "dv_ttm": "滚动股息率，单位为百分比。",
+    "total_mv": "总市值，通常单位为万元。",
+    "circ_mv": "流通市值，通常单位为万元。",
+    "is_open": "交易所日历是否开市；1 表示开市，0 表示休市。",
+    "pretrade_date": "上一交易日。",
+    "exchange": "交易所代码，如 SSE / SZSE。",
+    "cal_date": "交易日历日期。",
+    "adj_factor": "复权因子，用于前复权/后复权换算。",
+}
+
+TUSHARE_DATASET_NOTES: dict[str, str] = {
+    "bars": "A 股不复权日线行情；一行对应一个 symbol + date。当前来自 Tushare daily，volume 单位为手，amount 单位为千元。",
+    "fundamental": "利润表数据，report_date 表示报告期，ann_date 表示公告日；该表会经过 PIT 对齐，只允许在当前 as_of 下可见的数据落盘。",
+    "events": "分红事件稀疏表；统一事件日期 date 采用 ex_date -> record_date -> pay_date -> ann_date -> end_date 的优先级回退，不再依赖单一原始日期列。",
+    "valuation": "估值与市值指标表；常用于估值因子、风格分析与横向比较，按交易日分区。",
+    "calendar": "交易日历基准表；用于判断某天是否开市，以及 PIT 对齐和区间切片。",
+    "instruments": "当前证券主数据；默认 universe 以当前仍在上市的标的为主，不等于历史所有曾上市证券。",
+    "adj_factor": "复权因子表；通常与 bars 联合使用，把不复权价格换算成前复权/后复权口径。",
+}
+
+TUSHARE_DATASET_FIELD_DOCS: dict[str, dict[str, str]] = {
+    "instruments": {
+        "symbol": "证券代码。",
+        "name": "证券简称。",
+        "area": "所属地域。",
+        "industry": "所属行业。",
+        "market": "市场板块，如主板/创业板/科创板。",
+        "exchange": "交易所代码。",
+        "list_status": "上市状态；L=上市，D=退市，P=暂停上市。",
+        "list_date": "上市日期。",
+        "delist_date": "退市日期。",
+        "is_hs": "是否沪深港通标的。",
+    },
+    "calendar": {
+        "exchange": "交易所代码。",
+        "cal_date": "日历日期。",
+        "is_open": "是否开市；1 开市，0 休市。",
+        "pretrade_date": "前一个交易日。",
+    },
+    "bars": {
+        "symbol": "证券代码。",
+        "date": "交易日期；也是 bars 的分区键。",
+        "open": "开盘价。",
+        "high": "最高价。",
+        "low": "最低价。",
+        "close": "收盘价。",
+        "volume": "成交量，单位为手。",
+        "amount": "成交额，单位为千元。",
+    },
+    "fundamental": {
+        "symbol": "证券代码。",
+        "ann_date": "公告日期；PIT 对齐时的关键时间字段。",
+        "report_date": "报告期，对应财报所属季度/年度。",
+        "total_revenue": "营业总收入。",
+        "revenue": "营业收入。",
+        "operate_profit": "营业利润。",
+        "n_income": "净利润。",
+        "n_income_attr_p": "归属于母公司股东的净利润（归母净利润）。",
+        "basic_eps": "基本每股收益。",
+        "diluted_eps": "稀释每股收益。",
+    },
+    "events": {
+        "symbol": "证券代码。",
+        "date": "统一事件日期；按 ex_date -> record_date -> pay_date -> ann_date -> end_date 回退生成。",
+        "ann_date": "分红方案公告日。",
+        "end_date": "分红对应的报告期。",
+        "record_date": "股权登记日。",
+        "ex_date": "除权除息日。",
+        "pay_date": "派息日。",
+        "div_listdate": "送转股份上市日。",
+        "cash_div": "每股现金分红（税前）。",
+        "stk_div": "每股送股比例。",
+        "stk_bo_rate": "每股转增比例。",
+        "div_proc": "分红实施进度。",
+    },
+    "valuation": {
+        "symbol": "证券代码。",
+        "date": "交易日期；也是 valuation 的分区键。",
+        "close": "当日收盘价。",
+        "turnover_rate": "换手率（%）。",
+        "turnover_rate_f": "自由流通换手率（%）。",
+        "volume_ratio": "量比。",
+        "pe": "市盈率（PE）。",
+        "pe_ttm": "滚动市盈率（PE TTM）。",
+        "pb": "市净率（PB）。",
+        "ps": "市销率（PS）。",
+        "ps_ttm": "滚动市销率（PS TTM）。",
+        "dv_ratio": "股息率（%）。",
+        "dv_ttm": "滚动股息率（%）。",
+        "total_mv": "总市值，通常单位为万元。",
+        "circ_mv": "流通市值，通常单位为万元。",
+    },
+    "adj_factor": {
+        "symbol": "证券代码。",
+        "date": "交易日期；也是 adj_factor 的分区键。",
+        "adj_factor": "复权因子。",
+    },
 }
 
 DEFAULT_TUSHARE_PRIORITY_DATASETS = [
@@ -161,6 +360,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "1A",
         "fetch_mode": "symbol_once",
         "partition_by": "date",
+        "date_field_priority": ["ex_date", "record_date", "pay_date", "ann_date", "end_date"],
         "default_enabled": True,
     },
     "valuation": {
@@ -194,9 +394,11 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "api": "stock_company",
         "description": "上市公司基本信息",
         "phase": "1B",
-        "fetch_mode": "symbol_once",
+        "fetch_mode": "exchange_reference",
         "partition_by": None,
         "default_enabled": True,
+        "param_name": "exchange",
+        "loop_values": TUSHARE_STOCK_EXCHANGES,
     },
     "stock_st": {
         "api": "stock_st",
@@ -400,9 +602,10 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "api": "index_daily",
         "description": "指数日线行情",
         "phase": "1B",
-        "fetch_mode": "trade_day_all",
+        "fetch_mode": "index_loop_range",
         "partition_by": "date",
         "default_enabled": True,
+        "param_name": "ts_code",
     },
     "index_classify": {
         "api": "index_classify",
@@ -455,6 +658,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "default_enabled": True,
         "loop_source": "ths_index",
         "param_name": "ts_code",
+        "symbol_field_priority": ["con_code", "ts_code"],
     },
     "dc_index": {
         "api": "dc_index",
@@ -473,6 +677,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "default_enabled": True,
         "loop_source": "dc_index",
         "param_name": "ts_code",
+        "symbol_field_priority": ["con_code", "ts_code"],
     },
     # ------------------------------------------------------------------
     # 新闻 / 公告 / 语料
@@ -712,11 +917,50 @@ def get_tushare_api_access_rule(api_name: str) -> dict[str, Any]:
     )
 
 
+def get_tushare_api_doc_url(api_name: str) -> str | None:
+    """按 API 名返回官方接口文档地址。"""
+    url = TUSHARE_API_DOC_URLS.get(api_name)
+    if not url:
+        return None
+
+    legacy_prefix = "https://tushare.pro/wctapi/documents/"
+    if url.startswith(legacy_prefix) and url.endswith(".md"):
+        doc_id = url[len(legacy_prefix) : -len(".md")]
+        if doc_id.isdigit():
+            return f"https://tushare.pro/document/2?doc_id={doc_id}"
+    return url
+
+
+def get_tushare_dataset_api_name(name: str) -> str:
+    """按 dataset 名返回底层 Tushare API 名。"""
+    spec = get_tushare_dataset_spec(name)
+    return str(spec.get("api") or resolve_tushare_dataset_name(name))
+
+
+def get_tushare_dataset_api_doc_url(name: str) -> str | None:
+    """按 dataset 名返回底层 Tushare API 的官方文档地址。"""
+    return get_tushare_api_doc_url(get_tushare_dataset_api_name(name))
+
+
 def get_tushare_dataset_access_rule(name: str) -> dict[str, Any]:
     """按 dataset 名获取访问规则。"""
     spec = get_tushare_dataset_spec(name)
     api_name = str(spec.get("api") or name)
     return get_tushare_api_access_rule(api_name)
+
+
+def get_tushare_dataset_note(name: str) -> str | None:
+    """返回 dataset 的表级备注。"""
+    canonical = resolve_tushare_dataset_name(name)
+    return TUSHARE_DATASET_NOTES.get(canonical)
+
+
+def get_tushare_dataset_field_docs(name: str) -> dict[str, str]:
+    """返回 dataset 的字段说明；dataset 级说明优先，未命中时回退到通用字段说明。"""
+    canonical = resolve_tushare_dataset_name(name)
+    merged = dict(TUSHARE_COMMON_FIELD_DOCS)
+    merged.update(TUSHARE_DATASET_FIELD_DOCS.get(canonical, {}))
+    return merged
 
 
 def get_default_tushare_datasets(

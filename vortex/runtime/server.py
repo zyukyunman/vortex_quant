@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
@@ -98,6 +99,46 @@ class Server:
     # 崩溃恢复
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _task_worker_pid(task: dict) -> int | None:
+        progress_json = task.get("progress_json")
+        if not progress_json:
+            return None
+        try:
+            payload = json.loads(str(progress_json))
+        except (TypeError, ValueError):
+            return None
+        progress = TaskProgress.from_dict(payload)
+        if progress.pid is None:
+            return None
+        try:
+            return int(progress.pid)
+        except (TypeError, ValueError):
+            return None
+
+    def _mark_run_interrupted(self, task: dict, error: str) -> None:
+        from vortex.data.manifest import SyncManifest
+
+        profile = task.get("profile")
+        run_id = task.get("run_id")
+        if not profile or not run_id:
+            return
+
+        manifest_path = self.workspace.state_dir / "manifests" / str(profile) / "sync_manifest.db"
+        if not manifest_path.exists():
+            return
+
+        manifest = SyncManifest(manifest_path)
+        try:
+            run = manifest.get_run(str(run_id))
+            if run is None:
+                return
+            if run.get("status") not in {"pending", "running"}:
+                return
+            manifest.update_status(str(run_id), "failed", error_message=error)
+        finally:
+            manifest.close()
+
     def _recover_stale_tasks(self) -> int:
         """检测上次崩溃遗留的 RUNNING 任务，标记为 interrupted。
 
@@ -107,9 +148,19 @@ class Server:
         count = 0
         for task in running_tasks:
             task_id = task["task_id"]
+            worker_pid = self._task_worker_pid(task)
+            if worker_pid is not None and self._is_pid_alive(worker_pid):
+                logger.info(
+                    "崩溃恢复: 任务 %s 的 worker 仍在运行 (pid=%d)，保留 running 状态",
+                    task_id,
+                    worker_pid,
+                )
+                continue
+            error = "interrupted: server crashed"
             self.task_queue.update_status(
-                task_id, TaskStatus.FAILED, error="interrupted: server crashed"
+                task_id, TaskStatus.FAILED, error=error
             )
+            self._mark_run_interrupted(task, error)
             logger.warning("崩溃恢复: 任务 %s 已标记为 interrupted", task_id)
             count += 1
         return count
