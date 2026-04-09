@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import signal
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -56,6 +57,23 @@ class TestServerStart:
         assert "--foreground" in command
         assert calls[0]["kwargs"]["start_new_session"] is True
         assert "已在后台启动" in capsys.readouterr().out
+
+
+class TestLatestLogLinks:
+    def test_refresh_latest_log_links_updates_generic_and_prefixed_aliases(self, tmp_path):
+        logs_dir = tmp_path / "logs"
+        first = logs_dir / "data-bootstrap-20260409_100117.log"
+        second = logs_dir / "data-bootstrap-20260409_120305.log"
+
+        cli._refresh_latest_log_links(first)
+        assert (logs_dir / "latest.log").is_symlink()
+        assert (logs_dir / "latest.log").readlink() == Path(first.name)
+        assert (logs_dir / "data-bootstrap-latest.log").is_symlink()
+        assert (logs_dir / "data-bootstrap-latest.log").readlink() == Path(first.name)
+
+        cli._refresh_latest_log_links(second)
+        assert (logs_dir / "latest.log").readlink() == Path(second.name)
+        assert (logs_dir / "data-bootstrap-latest.log").readlink() == Path(second.name)
 
 
 class TestDataBackgroundTasks:

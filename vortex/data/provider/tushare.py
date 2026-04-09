@@ -5,6 +5,7 @@
 1. 保留已有核心专用 fetch（instruments / calendar / bars / fundamental / events）
 2. 对其余 dataset 统一走 registry 驱动的通用抓取入口 `fetch_dataset`
 3. 默认 datasets 覆盖全部可落盘、可批处理的 Tushare dataset
+4. 对少数 `symbol_range + date` 数据集，在 provider 内部自动比较“日期整批抓”和“股票历史抓”
 
 说明：
 - `bars` / `fundamental` / `events` / `valuation` 是 Vortex 内部稳定 dataset 名
@@ -515,6 +516,7 @@ class TushareProvider:
             raw = self._fetch_trade_day_all(
                 str(spec["api"]),
                 trading_days or self.fetch_calendar(market, start, end),
+                api_params=dict(spec.get("date_batch_params") or {}),
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -528,15 +530,35 @@ class TushareProvider:
                 progress_label=canonical,
             )
         elif mode == "symbol_range":
-            raw = self._fetch_symbol_range(
-                str(spec["api"]),
+            selected_mode, selected_api, selected_api_params = self._select_symbol_range_route(
+                canonical,
+                spec,
                 symbols,
                 start,
                 end,
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-                progress_label=canonical,
+                trading_days=trading_days,
+                partition_values=partition_values,
             )
+            if selected_mode == "trade_day_all":
+                raw = self._fetch_trade_day_all(
+                    selected_api,
+                    trading_days,
+                    api_params=selected_api_params,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    progress_label=canonical,
+                )
+            else:
+                raw = self._fetch_symbol_range(
+                    str(spec["api"]),
+                    symbols,
+                    start,
+                    end,
+                    partition_values=partition_values,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    progress_label=canonical,
+                )
         elif mode == "symbol_quarter_range":
             raw = self._fetch_symbol_quarter_range(
                 str(spec["api"]),
@@ -715,15 +737,21 @@ class TushareProvider:
         api_name: str,
         trading_days: list[date],
         *,
+        api_params: dict[str, Any] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
     ) -> pd.DataFrame:
         frames = []
         total_steps = len(trading_days)
+        extra_params = dict(api_params or {})
         for index, day in enumerate(trading_days, start=1):
             self._check_cancel_requested(cancel_check)
-            df = self._call_dataset_api(api_name, trade_date=_to_yyyymmdd(day))
+            df = self._call_dataset_api(
+                api_name,
+                trade_date=_to_yyyymmdd(day),
+                **extra_params,
+            )
             if df is not None and not df.empty:
                 frames.append(df)
             self._emit_loop_progress(
@@ -733,6 +761,61 @@ class TushareProvider:
                 f"{progress_label or api_name} trade_date={_to_yyyymmdd(day)}",
             )
         return _concat_frames(frames)
+
+    def _select_symbol_range_route(
+        self,
+        dataset: str,
+        spec: dict[str, Any],
+        symbols: list[str],
+        start: date,
+        end: date,
+        *,
+        trading_days: list[date],
+        partition_values: list[str] | None = None,
+    ) -> tuple[str, str, dict[str, Any]]:
+        """为 symbol_range + date 数据集选择最省请求数的安全抓法。"""
+        api_name = str(spec["api"])
+        date_batch_api = str(spec.get("date_batch_api") or api_name)
+        date_batch_params = dict(spec.get("date_batch_params") or {})
+
+        if (
+            str(spec.get("partition_by") or "").strip() != "date"
+            or not spec.get("date_batch_supported")
+            or not symbols
+            or not trading_days
+        ):
+            return "symbol_range", date_batch_api, date_batch_params
+
+        row_limit = spec.get("date_batch_row_limit")
+        if isinstance(row_limit, int) and row_limit > 0 and len(symbols) > row_limit:
+            logger.info(
+                "dataset=%s 路径选择: 日期整批抓不可用，single_request_limit=%d < symbol_count=%d，回退股票历史抓取",
+                dataset,
+                row_limit,
+                len(symbols),
+            )
+            return "symbol_range", date_batch_api, date_batch_params
+
+        date_batch_requests = len(trading_days)
+        symbol_windows = self._resolve_symbol_range_windows(
+            start,
+            end,
+            partition_values=partition_values,
+        )
+        symbol_range_requests = len(symbols) * len(symbol_windows)
+        selected_mode = (
+            "trade_day_all"
+            if date_batch_requests <= symbol_range_requests
+            else "symbol_range"
+        )
+        logger.info(
+            "dataset=%s 路径选择: date_batch_requests=%d, symbol_range_requests=%d, selected=%s",
+            dataset,
+            date_batch_requests,
+            symbol_range_requests,
+            selected_mode,
+        )
+        return selected_mode, date_batch_api, date_batch_params
 
     def _fetch_symbol_once(
         self,
@@ -767,6 +850,7 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
@@ -774,7 +858,11 @@ class TushareProvider:
         if not symbols:
             return pd.DataFrame()
         frames = []
-        year_ranges = self._split_by_year(start, end)
+        year_ranges = self._resolve_symbol_range_windows(
+            start,
+            end,
+            partition_values=partition_values,
+        )
         total_steps = len(year_ranges) * len(symbols)
         current_step = 0
         for year_start, year_end in year_ranges:
@@ -1386,6 +1474,27 @@ class TushareProvider:
                 year_end = end
             ranges.append((current, year_end))
             current = date(current.year + 1, 1, 1)
+        return ranges
+
+    @staticmethod
+    def _resolve_symbol_range_windows(
+        start: date,
+        end: date,
+        *,
+        partition_values: list[str] | None = None,
+    ) -> list[tuple[date, date]]:
+        if not partition_values:
+            return TushareProvider._split_by_year(start, end)
+
+        buckets: dict[int, list[date]] = {}
+        for value in partition_values:
+            parsed = _parse_yyyymmdd(value)
+            buckets.setdefault(parsed.year, []).append(parsed)
+
+        ranges: list[tuple[date, date]] = []
+        for year in sorted(buckets):
+            dates = sorted(buckets[year])
+            ranges.append((dates[0], dates[-1]))
         return ranges
 
     @staticmethod

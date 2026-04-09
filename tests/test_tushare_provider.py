@@ -215,6 +215,221 @@ class TestTushareTradeDayResume:
         }
         assert result["report_date"].tolist() == ["20260331"]
 
+    def test_fetch_dataset_passes_partition_values_to_symbol_range(self, monkeypatch):
+        provider = object.__new__(tushare_provider.TushareProvider)
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda api_name, symbols, start, end, **kwargs: (
+                captured.update(
+                    {
+                        "api_name": api_name,
+                        "symbols": list(symbols),
+                        "start": start,
+                        "end": end,
+                        "partition_values": list(kwargs.get("partition_values") or []),
+                    }
+                )
+                or pd.DataFrame(
+                    {
+                        "symbol": ["000001.SZ"],
+                        "date": ["20260409"],
+                        "adj_factor": [1.0],
+                    }
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_normalize_dataset_frame",
+            lambda _dataset, df, **_kwargs: df,
+        )
+
+        result = provider.fetch_dataset(
+            "adj_factor",
+            "cn_stock",
+            date(2005, 1, 1),
+            date(2026, 4, 9),
+            symbols=["000001.SZ"],
+            partition_values=["20050104", "20051230", "20260409"],
+        )
+
+        assert captured == {
+            "api_name": "adj_factor",
+            "symbols": ["000001.SZ"],
+            "start": date(2005, 1, 1),
+            "end": date(2026, 4, 9),
+            "partition_values": ["20050104", "20051230", "20260409"],
+        }
+        assert result["date"].tolist() == ["20260409"]
+
+    def test_fetch_symbol_range_uses_partition_values_to_shrink_year_windows(self, monkeypatch):
+        provider = object.__new__(tushare_provider.TushareProvider)
+        requested_ranges: list[tuple[str, str]] = []
+
+        monkeypatch.setattr(provider, "_check_cancel_requested", lambda _cancel_check: None)
+        monkeypatch.setattr(
+            provider,
+            "_call_dataset_api",
+            lambda _api_name, **kwargs: (
+                requested_ranges.append((kwargs["start_date"], kwargs["end_date"]))
+                or pd.DataFrame(
+                    {
+                        "ts_code": [kwargs["ts_code"]],
+                        "trade_date": [kwargs["end_date"]],
+                        "adj_factor": [1.0],
+                    }
+                )
+            ),
+        )
+
+        provider._fetch_symbol_range(
+            "adj_factor",
+            ["000001.SZ"],
+            date(2005, 1, 1),
+            date(2026, 4, 9),
+            partition_values=["20050104", "20051230", "20260409"],
+            progress_label="adj_factor",
+        )
+
+        assert requested_ranges == [
+            ("20050104", "20051230"),
+            ("20260409", "20260409"),
+        ]
+
+    def test_fetch_dataset_prefers_date_batch_for_adj_factor(self, monkeypatch):
+        provider = object.__new__(tushare_provider.TushareProvider)
+        calls: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_trade_day_all",
+            lambda api_name, trading_days, **_kwargs: (
+                calls.append((api_name, [day.strftime("%Y%m%d") for day in trading_days]))
+                or pd.DataFrame(
+                    {
+                        "symbol": ["000001.SZ"],
+                        "date": ["20260409"],
+                        "adj_factor": [1.0],
+                    }
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda *_args, **_kwargs: pytest.fail("adj_factor 应优先走日期整批抓"),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_normalize_dataset_frame",
+            lambda _dataset, df, **_kwargs: df,
+        )
+
+        result = provider.fetch_dataset(
+            "adj_factor",
+            "cn_stock",
+            date(2005, 1, 1),
+            date(2026, 4, 9),
+            symbols=["000001.SZ", "600000.SH"],
+            trading_days=[date(2026, 4, 9)],
+            partition_values=["20260409"],
+        )
+
+        assert calls == [("adj_factor", ["20260409"])]
+        assert result["date"].tolist() == ["20260409"]
+
+    def test_fetch_dataset_prefers_date_batch_for_weekly_when_row_limit_allows(self, monkeypatch):
+        provider = object.__new__(tushare_provider.TushareProvider)
+        calls: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_trade_day_all",
+            lambda api_name, trading_days, **_kwargs: (
+                calls.append((api_name, [day.strftime("%Y%m%d") for day in trading_days]))
+                or pd.DataFrame(
+                    {
+                        "symbol": ["000001.SZ"],
+                        "date": ["20260411"],
+                        "close": [10.0],
+                    }
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda *_args, **_kwargs: pytest.fail("weekly 在行数上限允许时应优先走日期整批抓"),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_normalize_dataset_frame",
+            lambda _dataset, df, **_kwargs: df,
+        )
+
+        result = provider.fetch_dataset(
+            "weekly",
+            "cn_stock",
+            date(2026, 4, 1),
+            date(2026, 4, 11),
+            symbols=["000001.SZ", "600000.SH", "300750.SZ"],
+            trading_days=[date(2026, 4, 11)],
+            partition_values=["20260411"],
+        )
+
+        assert calls == [("weekly", ["20260411"])]
+        assert result["date"].tolist() == ["20260411"]
+
+    def test_fetch_dataset_falls_back_to_symbol_range_when_date_batch_row_limit_too_small(self, monkeypatch):
+        provider = object.__new__(tushare_provider.TushareProvider)
+        calls: list[tuple[str, list[str]]] = []
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_trade_day_all",
+            lambda *_args, **_kwargs: pytest.fail("monthly 当前不应在超出单次上限时走日期整批抓"),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda api_name, symbols, _start, _end, **_kwargs: (
+                calls.append((api_name, list(symbols)))
+                or pd.DataFrame(
+                    {
+                        "symbol": [symbols[0]],
+                        "date": ["20260430"],
+                        "close": [10.0],
+                    }
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_normalize_dataset_frame",
+            lambda _dataset, df, **_kwargs: df,
+        )
+
+        symbols = [f"{idx:06d}.SZ" for idx in range(4501)]
+        result = provider.fetch_dataset(
+            "monthly",
+            "cn_stock",
+            date(2026, 4, 1),
+            date(2026, 4, 30),
+            symbols=symbols,
+            trading_days=[date(2026, 4, 30)],
+            partition_values=["20260430"],
+        )
+
+        assert calls == [("monthly", symbols)]
+        assert result["date"].tolist() == ["20260430"]
+
 
 class TestTushareQuarterVipFetch:
     def _build_provider(self, *, points: int) -> tushare_provider.TushareProvider:

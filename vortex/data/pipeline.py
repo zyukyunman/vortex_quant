@@ -1208,6 +1208,38 @@ class DataPipeline:
                 missing_partitions=len(missing_days),
             )
 
+        if fetch_mode == "symbol_range" and partition_by == "date" and trading_days:
+            expected_dates = self._expected_date_partition_values(meta, trading_days)
+            if expected_dates:
+                existing_dates = self._existing_partition_values(dataset, "date")
+                existing_target_dates = [
+                    value for value in expected_dates if value in existing_dates
+                ]
+                missing_dates = [
+                    value for value in expected_dates if value not in existing_dates
+                ]
+                if not missing_dates:
+                    return DatasetFetchPlan(
+                        start=start,
+                        end=end,
+                        trading_days=[],
+                        skip_reason="目标日期分区已全部存在",
+                        partition_key="date",
+                        target_partitions=len(expected_dates),
+                        existing_partitions=len(existing_target_dates),
+                        missing_partitions=0,
+                    )
+                return DatasetFetchPlan(
+                    start=self._parse_date(missing_dates[0]),
+                    end=self._parse_date(missing_dates[-1]),
+                    trading_days=[self._parse_date(value) for value in missing_dates],
+                    partition_key="date",
+                    target_partitions=len(expected_dates),
+                    existing_partitions=len(existing_target_dates),
+                    missing_partitions=len(missing_dates),
+                    missing_partition_values=tuple(missing_dates),
+                )
+
         if fetch_mode == "symbol_quarter_range" and partition_by == "report_date":
             partition_key = "end_date" if dataset == "fundamental" else "report_date"
             expected_quarters = self._expected_quarter_partition_values(start, end)
@@ -1345,6 +1377,38 @@ class DataPipeline:
                 values.append(quarter_end.strftime("%Y%m%d"))
             current = quarter_end + timedelta(days=1)
         return values
+
+    @staticmethod
+    def _expected_date_partition_values(
+        meta: dict[str, object],
+        trading_days: list[date],
+    ) -> list[str]:
+        if not trading_days:
+            return []
+
+        mode = str(meta.get("date_partition_mode") or "trade_day").strip()
+        if mode == "trade_day":
+            return [day.strftime("%Y%m%d") for day in trading_days]
+
+        buckets: dict[tuple[int, int], date] = {}
+        if mode == "week_end":
+            for day in trading_days:
+                iso = day.isocalendar()
+                buckets[(iso.year, iso.week)] = day
+            return [
+                buckets[key].strftime("%Y%m%d")
+                for key in sorted(buckets)
+            ]
+
+        if mode == "month_end":
+            for day in trading_days:
+                buckets[(day.year, day.month)] = day
+            return [
+                buckets[key].strftime("%Y%m%d")
+                for key in sorted(buckets)
+            ]
+
+        return [day.strftime("%Y%m%d") for day in trading_days]
 
     def _apply_pit_alignment(
         self,

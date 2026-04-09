@@ -532,9 +532,34 @@ def _tail_text_file(path: Path, max_lines: int = 10) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _refresh_latest_log_links(log_path: Path) -> None:
+    """刷新日志目录下的 latest 软链接，便于快速定位当前最新日志。"""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    aliases = [log_path.parent / "latest.log"]
+
+    stem = log_path.stem
+    if "-" in stem:
+        prefix = stem.rsplit("-", 1)[0]
+        if prefix and prefix != "latest":
+            aliases.append(log_path.parent / f"{prefix}-latest.log")
+
+    for alias in aliases:
+        try:
+            if alias.exists() or alias.is_symlink():
+                alias.unlink()
+            alias.symlink_to(log_path.name)
+        except OSError as exc:
+            logger.warning(
+                "刷新 latest 日志软链接失败: alias=%s target=%s error=%s",
+                alias,
+                log_path,
+                exc,
+            )
+
+
 def _launch_background_process(command: list[str], log_path: Path) -> subprocess.Popen:
     """以 detached 子进程方式后台启动命令，并把 stdout/stderr 落到日志。"""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _refresh_latest_log_links(log_path)
     with open(log_path, "ab") as log_file:
         return subprocess.Popen(
             command,

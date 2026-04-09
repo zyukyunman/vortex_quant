@@ -3,7 +3,7 @@
 这层只负责回答 3 个问题：
 
 1. Vortex 把哪些 Tushare 接口视为可落盘 dataset
-2. 每个 dataset 应如何抓取（fetch_mode）和如何分区（partition_by）
+2. 每个 dataset 应如何抓取（fetch_mode）、如何分区（partition_by），以及是否存在更高效的候选抓法
 3. 哪些名字是历史兼容别名，哪些 dataset 默认进入“全量拉取”
 
 注意：
@@ -380,6 +380,8 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "1B",
         "fetch_mode": "symbol_range",
         "partition_by": "date",
+        "date_partition_mode": "trade_day",
+        "date_batch_supported": True,
         "default_enabled": True,
     },
     "namechange": {
@@ -422,6 +424,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "2",
         "fetch_mode": "symbol_range",
         "partition_by": "date",
+        "date_partition_mode": "week_end",
+        "date_batch_supported": True,
+        "date_batch_row_limit": 6000,
         "default_enabled": True,
     },
     "monthly": {
@@ -430,6 +435,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "2",
         "fetch_mode": "symbol_range",
         "partition_by": "date",
+        "date_partition_mode": "month_end",
+        "date_batch_supported": True,
+        "date_batch_row_limit": 4500,
         "default_enabled": True,
     },
     "balancesheet": {
