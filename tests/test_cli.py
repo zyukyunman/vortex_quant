@@ -13,6 +13,7 @@ import pytest
 
 import vortex.cli as cli
 from vortex.config.profile.models import DataProfile
+from vortex.data.provider.tushare_registry import get_default_tushare_datasets
 from vortex.data.manifest import SyncManifest
 from vortex.data.pipeline import RunReport
 from vortex.data.storage.parquet_duckdb import ParquetDuckDBBackend
@@ -173,6 +174,49 @@ class TestDataBackgroundTasks:
             profile_name="default",
             action="bootstrap",
             fmt="json",
+        )
+
+        assert first["task_id"] == second["task_id"]
+        assert second["status"] == "deduplicated"
+        assert len(calls) == 1
+
+    def test_submit_data_background_task_collapses_full_dataset_scope_for_dedup(
+        self, monkeypatch, tmp_path
+    ):
+        calls = []
+
+        class _Proc:
+            pid = 24681
+
+        def _fake_launch(command, log_path):
+            calls.append((command, log_path))
+            return _Proc()
+
+        monkeypatch.setattr(cli, "_launch_background_process", _fake_launch)
+
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+        (root / "profiles" / "default.yaml").write_text(
+            "name: default\n"
+            "type: data\n"
+            "provider: tushare\n"
+            "history_start: '20170101'\n",
+            encoding="utf-8",
+        )
+
+        full_scope = get_default_tushare_datasets()
+        first = _submit_data_background_task(
+            root=root,
+            profile_name="default",
+            action="bootstrap",
+            fmt="json",
+        )
+        second = _submit_data_background_task(
+            root=root,
+            profile_name="default",
+            action="bootstrap",
+            fmt="json",
+            datasets=full_scope,
         )
 
         assert first["task_id"] == second["task_id"]

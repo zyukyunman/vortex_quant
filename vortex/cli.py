@@ -616,6 +616,43 @@ def _parse_dataset_override(raw: str | None) -> list[str]:
     return [token for token in tokens if token]
 
 
+def _normalize_full_dataset_scope(
+    root: Path,
+    profile_name: str,
+    datasets: list[str] | None,
+) -> list[str]:
+    """把“显式全量 dataset 列表”折叠回默认全量语义。
+
+    典型场景是 init 里的“首次数据更新”：
+    用户在交互界面里勾选了全部 dataset，本意仍然是“跑一次完整 bootstrap”。
+    如果控制面继续把它记成 `bootstrap;datasets=...`，就会和普通 `bootstrap`
+    变成两个 resource_key，导致同一份全量任务无法去重。
+    """
+    normalized = sorted({item.strip() for item in (datasets or []) if item.strip()})
+    if not normalized:
+        return []
+
+    try:
+        from vortex.config.profile.resolver import ProfileResolver
+        from vortex.config.profile.store import ProfileStore
+        from vortex.runtime.workspace import Workspace
+        from vortex.shared.errors import ConfigError
+
+        ws = Workspace(root)
+        store = ProfileStore(ws.profiles_dir)
+        resolver = ProfileResolver(store)
+        profile, _ = resolver.resolve(profile_name, "data")
+    except (ConfigError, FileNotFoundError):
+        return normalized
+
+    effective = sorted(
+        {item.strip() for item in profile.effective_datasets if item.strip()}
+    )
+    if normalized == effective:
+        return []
+    return normalized
+
+
 def _parse_update_frequency_override(raw: str | None) -> list[str]:
     """解析逗号分隔的更新频率过滤条件。"""
     if raw is None:
@@ -1153,6 +1190,7 @@ def _submit_data_background_task(
 
     ws = Workspace(root)
     ws.ensure_initialized()
+    datasets = _normalize_full_dataset_scope(root, profile_name, datasets)
 
     db = Database(ws.db_path)
     db.initialize_tables()
