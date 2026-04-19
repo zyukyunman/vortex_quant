@@ -26,6 +26,8 @@ logger = get_logger(__name__)
 
 DEFAULT_WORKSPACE = "~/Documents/vortex_workspace"
 DEFAULT_DATA_PROFILE_NAME = "default"
+DEFAULT_WORKDAY_UPDATE_FREQUENCIES = ["daily", "intraday"]
+DEFAULT_WEEKEND_UPDATE_FREQUENCIES = ["weekly", "monthly", "quarterly", "other"]
 
 
 class InitCancelled(Exception):
@@ -458,10 +460,27 @@ def _print_cron_help() -> None:
     """打印 Cron 表达式的最小必要说明。"""
     print("  Cron 是 5 段格式：分 时 日 月 周")
     print("  例如：")
-    print("    - 0 18 * * 1-5 = 每个交易日 18:00")
-    print("    - 0 21 * * 1-5 = 每个交易日 21:00")
+    print("    - 0 18 * * *   = 每天 18:00")
+    print("    - 0 21 * * *   = 每天 21:00")
     print("    - 0 6 * * *    = 每天 06:00")
     print("  记忆方式：* 表示“每”，1-5 表示周一到周五")
+
+
+def _resolve_init_schedule_choice(choice: str) -> str | None:
+    """把 init 向导中的快捷选项映射为真正写入 profile 的 cron。
+
+    这里故意把默认选项都映射成“每天触发”：
+    - 工作日会由 `data update` 默认只跑 daily/intraday
+    - 周末会由 `data update` 默认只跑 weekly/monthly/quarterly/other
+
+    如果这里仍写成 `1-5`，周末桶就永远不会被自动调度到。
+    """
+    schedule_map = {
+        "1": "0 18 * * *",
+        "2": "0 21 * * *",
+        "3": "0 6 * * *",
+    }
+    return schedule_map.get(choice)
 
 
 def _build_default_data_config(
@@ -595,6 +614,47 @@ def _parse_dataset_override(raw: str | None) -> list[str]:
         return []
     tokens = [token.strip() for token in raw.split(",")]
     return [token for token in tokens if token]
+
+
+def _parse_update_frequency_override(raw: str | None) -> list[str]:
+    """解析逗号分隔的更新频率过滤条件。"""
+    if raw is None:
+        return []
+
+    from vortex.data.provider.tushare_registry import normalize_tushare_update_frequencies
+
+    tokens = [token.strip() for token in raw.split(",")]
+    return normalize_tushare_update_frequencies([token for token in tokens if token])
+
+
+def _resolve_update_frequency_scope(
+    action: str,
+    datasets: list[str] | None,
+    update_frequencies: list[str] | None,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """解析本次 data 命令真正要跑的频率子集。
+
+    规则：
+    1. 显式 `--frequencies` 优先
+    2. 显式 `--datasets` 时，不再自动追加频率过滤
+    3. `data update` 默认按自然日分桶：
+       - 工作日：daily + intraday
+       - 周末：weekly + monthly + quarterly + other
+    4. 其余动作（bootstrap / backfill / repair / publish）默认不加频率过滤
+    """
+    if update_frequencies:
+        return list(update_frequencies)
+    if datasets:
+        return []
+    if action != "update":
+        return []
+
+    current = now or datetime.now()
+    if current.weekday() < 5:
+        return list(DEFAULT_WORKDAY_UPDATE_FREQUENCIES)
+    return list(DEFAULT_WEEKEND_UPDATE_FREQUENCIES)
 
 
 def _parse_data_filters(raw_filters: list[str] | None) -> dict[str, object]:
@@ -996,16 +1056,31 @@ def _format_progress_bar(current: int, total: int, width: int = 18) -> str:
 def _build_data_task_action(
     action: str,
     *,
+    datasets: list[str] | None = None,
+    update_frequencies: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     as_of: str | None = None,
 ) -> str:
     """构造 task_queue 的 action/resource_key，区分不同范围任务。"""
+    scope_parts: list[str] = []
+    if datasets:
+        dataset_scope = sorted({item.strip() for item in datasets if item.strip()})
+        if dataset_scope:
+            scope_parts.append(f"datasets={','.join(dataset_scope)}")
+    if update_frequencies:
+        scope_parts.append(f"frequencies={','.join(update_frequencies)}")
+
     if action in {"backfill", "repair"} and start and end:
-        return f"{action}:{start}-{end}"
-    if action == "publish" and as_of:
-        return f"publish:{as_of}"
-    return action
+        action_key = f"{action}:{start}-{end}"
+    elif action == "publish" and as_of:
+        action_key = f"publish:{as_of}"
+    else:
+        action_key = action
+
+    if scope_parts:
+        return f"{action_key};{';'.join(scope_parts)}"
+    return action_key
 
 
 def _build_data_background_command(
@@ -1016,6 +1091,7 @@ def _build_data_background_command(
     task_id: str,
     run_id: str,
     datasets: list[str] | None = None,
+    update_frequencies: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     as_of: str | None = None,
@@ -1044,6 +1120,8 @@ def _build_data_background_command(
         command.append("--verbose")
     if datasets:
         command.extend(["--datasets", ",".join(datasets)])
+    if update_frequencies:
+        command.extend(["--frequencies", ",".join(update_frequencies)])
     if start:
         command.extend(["--start", start])
     if end:
@@ -1059,7 +1137,9 @@ def _submit_data_background_task(
     profile_name: str,
     action: str,
     fmt: str,
+    emit_output: bool = True,
     datasets: list[str] | None = None,
+    update_frequencies: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     as_of: str | None = None,
@@ -1080,6 +1160,8 @@ def _submit_data_background_task(
 
     action_key = _build_data_task_action(
         action,
+        datasets=datasets,
+        update_frequencies=update_frequencies,
         start=start,
         end=end,
         as_of=as_of,
@@ -1104,8 +1186,9 @@ def _submit_data_background_task(
                 "pid": getattr(progress, "pid", None),
             }
             if fmt == "json":
-                _print_result(payload, fmt)
-            else:
+                if emit_output:
+                    _print_result(payload, fmt)
+            elif emit_output:
                 print("ℹ️  已存在同类运行中的任务，复用现有任务")
                 print(f"   task_id: {payload['task_id']}")
                 print(f"   run_id: {payload['run_id']}")
@@ -1127,6 +1210,7 @@ def _submit_data_background_task(
             task_id=task_id,
             run_id=run_id,
             datasets=datasets,
+            update_frequencies=update_frequencies,
             start=start,
             end=end,
             as_of=as_of,
@@ -1156,8 +1240,9 @@ def _submit_data_background_task(
             "log_path": str(log_path),
         }
         if fmt == "json":
-            _print_result(payload, fmt)
-        else:
+            if emit_output:
+                _print_result(payload, fmt)
+        elif emit_output:
             print("🚀 已提交后台任务")
             print(f"   task_id: {task_id}")
             print(f"   run_id: {run_id}")
@@ -1469,23 +1554,19 @@ def cmd_init(args: argparse.Namespace) -> None:
             enable_schedule = _prompt_yes_no("是否启用每日自动更新？", default=False)
             if enable_schedule:
                 print("  选择更新时间:")
-                print("  1. 每个交易日 18:00（推荐，收盘后）")
-                print("  2. 每个交易日 21:00")
+                print("  1. 每天 18:00（推荐；工作日跑日频，周末跑低频）")
+                print("  2. 每天 21:00")
                 print("  3. 每天 06:00（含非交易日）")
                 print("  4. 自定义 Cron 表达式")
                 _print_cron_help()
                 choice = _prompt("请选择", "1")
-                schedule_map = {
-                    "1": "0 18 * * 1-5",
-                    "2": "0 21 * * 1-5",
-                    "3": "0 6 * * *",
-                }
-                if choice in schedule_map:
-                    config["schedule"] = schedule_map[choice]
+                schedule = _resolve_init_schedule_choice(choice)
+                if schedule:
+                    config["schedule"] = schedule
                 else:
                     print("  请输入自定义 Cron。")
                     _print_cron_help()
-                    cron = _prompt("Cron 表达式（例如 0 18 * * 1-5）", "0 18 * * 1-5")
+                    cron = _prompt("Cron 表达式（例如 0 18 * * *）", "0 18 * * *")
                     config["schedule"] = cron
             print()
 
@@ -1627,18 +1708,46 @@ def _run_initial_bootstrap(root: Path, profile_name: str, datasets: list[str]) -
     print(f"   数据集: {_format_selection_summary(datasets)}")
 
 
-def _apply_dataset_override(profile, datasets: list[str]):
-    """用 CLI 传入的数据集列表覆盖 profile。"""
+def _apply_dataset_override(
+    profile,
+    datasets: list[str],
+    update_frequencies: list[str] | None = None,
+    *,
+    frequency_resolver=None,
+):
+    """用 CLI 传入的数据集 / 更新频率覆盖 profile。"""
     import dataclasses
 
-    if not datasets:
+    update_frequencies = list(update_frequencies or [])
+    if not datasets and not update_frequencies:
         return profile
+
+    selected_datasets = list(datasets) if datasets else list(profile.effective_datasets)
+    if update_frequencies:
+        if frequency_resolver is None:
+            raise ValueError("缺少 frequency_resolver，无法按更新频率筛选数据集")
+        allowed = set(update_frequencies)
+        selected_datasets = [
+            dataset
+            for dataset in selected_datasets
+            if str(frequency_resolver(dataset) or "other").strip().lower() in allowed
+        ]
+
+    priority_datasets = (
+        [dataset for dataset in datasets if dataset in selected_datasets]
+        if datasets
+        else [
+            dataset
+            for dataset in profile.priority_datasets
+            if dataset in selected_datasets
+        ]
+    )
 
     return dataclasses.replace(
         profile,
-        datasets=list(datasets),
+        datasets=selected_datasets,
         exclude_datasets=[],
-        priority_datasets=list(datasets),
+        priority_datasets=priority_datasets,
     )
 
 
@@ -2108,6 +2217,18 @@ def cmd_data(args: argparse.Namespace) -> None:
     profile_name = _resolve_data_profile_name(getattr(args, "profile", None))
     dry_run = getattr(args, "dry_run", False)
     datasets_override = _parse_dataset_override(getattr(args, "datasets", None))
+    try:
+        update_frequencies = _parse_update_frequency_override(
+            getattr(args, "frequencies", None)
+        )
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    effective_update_frequencies = _resolve_update_frequency_scope(
+        args.data_action,
+        datasets_override,
+        update_frequencies,
+    )
 
     if args.data_action == "status":
         if getattr(args, "watch", False):
@@ -2188,6 +2309,7 @@ def cmd_data(args: argparse.Namespace) -> None:
             action=args.data_action,
             fmt=fmt,
             datasets=datasets_override,
+            update_frequencies=effective_update_frequencies,
             start=start_str,
             end=end_str,
             as_of=as_of_str,
@@ -2412,7 +2534,23 @@ def cmd_data(args: argparse.Namespace) -> None:
             progress_callback=_emit_task_progress,
             cancel_check=_cancel_check,
         )
-        profile = _apply_dataset_override(profile, datasets_override)
+        frequency_resolver = getattr(
+            pipeline,
+            "_dataset_update_frequency",
+            lambda _dataset: "other",
+        )
+        profile = _apply_dataset_override(
+            profile,
+            datasets_override,
+            effective_update_frequencies,
+            frequency_resolver=frequency_resolver,
+        )
+        if (
+            args.data_action in {"bootstrap", "update", "backfill", "repair"}
+            and not profile.effective_datasets
+        ):
+            print("❌ 当前数据集筛选条件没有匹配到任何 dataset", file=sys.stderr)
+            sys.exit(1)
 
         result = None
         match args.data_action:
@@ -2634,6 +2772,13 @@ def main() -> None:
         sub.add_argument("--datasets", help=argparse.SUPPRESS)
         if action != "status":
             sub.add_argument(
+                "--frequencies",
+                help=(
+                    "仅运行指定更新频率的数据集，逗号分隔："
+                    "daily,weekly,monthly,quarterly,other,intraday"
+                ),
+            )
+            sub.add_argument(
                 "--foreground",
                 action="store_true",
                 help="前台执行（默认提交后台任务）",
@@ -2652,6 +2797,13 @@ def main() -> None:
         sub = data_sub.add_parser(action, parents=[root_parser])
         sub.add_argument("--profile", help=argparse.SUPPRESS)
         sub.add_argument("--datasets", help=argparse.SUPPRESS)
+        sub.add_argument(
+            "--frequencies",
+            help=(
+                "仅运行指定更新频率的数据集，逗号分隔："
+                "daily,weekly,monthly,quarterly,other,intraday"
+            ),
+        )
         sub.add_argument(
             "--foreground",
             action="store_true",

@@ -9,7 +9,12 @@ import pandas as pd
 import pytest
 
 import vortex.data.provider.tushare as tushare_provider
-from vortex.data.provider.tushare_registry import get_default_tushare_datasets
+from vortex.data.provider.tushare_registry import (
+    filter_tushare_datasets_by_update_frequency,
+    get_default_tushare_datasets,
+    get_tushare_dataset_update_frequency,
+    normalize_tushare_update_frequencies,
+)
 from vortex.shared.errors import DataError
 
 
@@ -112,6 +117,28 @@ class TestTushareTradeDayResume:
 
         assert requested_days == ["20260402", "20260408"]
         assert result["date"].tolist() == ["20260402", "20260408"]
+
+    def test_normalize_update_frequencies_accepts_intraday_alias(self):
+        assert normalize_tushare_update_frequencies(["hourly"]) == ["intraday"]
+
+    def test_get_dataset_update_frequency_returns_registry_value(self):
+        assert get_tushare_dataset_update_frequency("index_weight") == "weekly"
+        assert get_tushare_dataset_update_frequency("bars") == "daily"
+
+    def test_filter_default_datasets_by_update_frequency_preserves_order(self):
+        daily_datasets = get_default_tushare_datasets(
+            points=5000,
+            permission_keys=set(),
+            update_frequencies=["daily"],
+        )
+
+        assert "bars" in daily_datasets
+        assert "weekly" not in daily_datasets
+        assert "fundamental" not in daily_datasets
+        assert daily_datasets == filter_tushare_datasets_by_update_frequency(
+            get_default_tushare_datasets(points=5000, permission_keys=set()),
+            ["daily"],
+        )
 
     def test_trade_day_all_fallback_uses_current_market(self, monkeypatch):
         provider = object.__new__(tushare_provider.TushareProvider)
@@ -514,6 +541,38 @@ class TestTushareQuarterVipFetch:
         assert calls[0][1]["start_date"] == "20240101"
         assert calls[0][1]["end_date"] == "20240331"
 
+
+class TestTushareApiAccessRules:
+    def _build_provider(self, *, points: int) -> tushare_provider.TushareProvider:
+        provider = object.__new__(tushare_provider.TushareProvider)
+        provider._account_points = points
+        provider._extra_permissions = set()
+        provider._account_rpm = 500 if points >= 5000 else 200
+        provider._global_effective_rpm = 400 if points >= 5000 else 160
+        return provider
+
+    @pytest.mark.parametrize("api_name", ["limit_list_d", "sw_daily"])
+    def test_2000_point_apis_with_documented_200rpm_cap_use_explicit_limit(
+        self,
+        api_name: str,
+    ):
+        provider = self._build_provider(points=5000)
+
+        access = provider._describe_api_access(api_name)
+
+        assert access["allowed"] is True
+        assert access["max_rpm"] == 200
+        assert access["effective_rpm"] == 160
+
+    def test_other_2000_point_api_still_uses_account_tier_rpm(self):
+        provider = self._build_provider(points=5000)
+
+        access = provider._describe_api_access("daily_basic")
+
+        assert access["allowed"] is True
+        assert access["max_rpm"] == 500
+        assert access["effective_rpm"] == 400
+
     def test_quarter_statement_uses_partition_values_as_exact_quarter_gaps(self, monkeypatch):
         provider = self._build_provider(points=2000)
         calls: list[tuple[str, dict[str, object]]] = []
@@ -741,6 +800,49 @@ class TestTushareDatasetContracts:
             "param_name": "ts_code",
         }
         assert result["ts_code"].tolist() == ["000001.SH"]
+
+    def test_fetch_index_daily_forwards_partition_values_to_index_loop_range(self, monkeypatch):
+        provider = self._build_provider()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_index_loop_range",
+            lambda api_name, start, end, param_name, **kwargs: (
+                captured.update(
+                    {
+                        "api_name": api_name,
+                        "start": start,
+                        "end": end,
+                        "param_name": param_name,
+                        "partition_values": list(kwargs.get("partition_values") or []),
+                    }
+                )
+                or pd.DataFrame({"ts_code": ["000001.SH"], "trade_date": ["20260410"]})
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_normalize_dataset_frame",
+            lambda _dataset, raw, **_kwargs: raw,
+        )
+
+        provider.fetch_dataset(
+            "index_daily",
+            "cn_stock",
+            date(2026, 4, 1),
+            date(2026, 4, 30),
+            partition_values=["20260410"],
+        )
+
+        assert captured == {
+            "api_name": "index_daily",
+            "start": date(2026, 4, 1),
+            "end": date(2026, 4, 30),
+            "param_name": "ts_code",
+            "partition_values": ["20260410"],
+        }
 
     def test_fetch_stock_company_uses_exchange_reference_contract(self, monkeypatch):
         provider = self._build_provider()

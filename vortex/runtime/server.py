@@ -10,11 +10,13 @@ import os
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from vortex.runtime.database import Database
 from vortex.runtime.task_queue import TaskProgress, TaskQueue, TaskStatus
 from vortex.runtime.workspace import Workspace
+from vortex.shared.errors import ConfigError, RuntimeError_
 from vortex.shared.events import get_event_bus
 from vortex.shared.logging import get_logger
 from vortex.shared.types import Domain
@@ -23,6 +25,110 @@ logger = get_logger(__name__)
 
 # 优雅退出等待时长（秒）
 _DRAIN_TIMEOUT = 60
+
+
+def _expand_cron_token(
+    token: str,
+    *,
+    minimum: int,
+    maximum: int,
+    sunday_alias: bool = False,
+) -> set[int]:
+    """展开单个 cron token 为整数集合。
+
+    当前实现支持：
+    - `*`
+    - `*/15`
+    - `1,2,3`
+    - `1-5`
+    - `1-10/2`
+
+    这已经覆盖 init 默认生成的 cron，以及大多数手写日常表达式。
+    """
+
+    def _parse_number(raw: str) -> int:
+        value = int(raw)
+        if sunday_alias and value == 7:
+            return 0
+        if value < minimum or value > maximum:
+            raise ValueError(f"cron 数值越界: {raw}")
+        return value
+
+    base = token.strip()
+    step = 1
+    if "/" in base:
+        base, step_raw = base.split("/", 1)
+        step = int(step_raw)
+        if step <= 0:
+            raise ValueError(f"cron step 必须大于 0: {token}")
+
+    if base == "*":
+        values = list(range(minimum, maximum + 1))
+    elif "-" in base:
+        start_raw, end_raw = base.split("-", 1)
+        start = _parse_number(start_raw)
+        end_value = int(end_raw)
+        if sunday_alias and end_value == 7:
+            values = list(range(start, maximum + 1))
+            if 0 not in values:
+                values.append(0)
+        else:
+            end = _parse_number(end_raw)
+            if end < start:
+                raise ValueError(f"cron range 非法: {token}")
+            values = list(range(start, end + 1))
+    else:
+        values = [_parse_number(base)]
+
+    if step > 1:
+        values = [value for index, value in enumerate(values) if index % step == 0]
+    return set(values)
+
+
+def _cron_field_matches(
+    raw: str,
+    value: int,
+    *,
+    minimum: int,
+    maximum: int,
+    sunday_alias: bool = False,
+) -> bool:
+    """判断单个 cron 字段是否命中当前值。"""
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("cron 字段不能为空")
+    return any(
+        value in _expand_cron_token(
+            token,
+            minimum=minimum,
+            maximum=maximum,
+            sunday_alias=sunday_alias,
+        )
+        for token in tokens
+    )
+
+
+def schedule_matches_datetime(schedule: str, now: datetime) -> bool:
+    """判断某条 5 段 cron 是否命中当前分钟。"""
+    parts = schedule.split()
+    if len(parts) != 5:
+        raise ValueError(f"仅支持 5 段 cron 表达式: {schedule}")
+
+    minute, hour, day, month, weekday = parts
+    cron_weekday = (now.weekday() + 1) % 7
+    return (
+        _cron_field_matches(minute, now.minute, minimum=0, maximum=59)
+        and _cron_field_matches(hour, now.hour, minimum=0, maximum=23)
+        and _cron_field_matches(day, now.day, minimum=1, maximum=31)
+        and _cron_field_matches(month, now.month, minimum=1, maximum=12)
+        and _cron_field_matches(
+            weekday,
+            cron_weekday,
+            minimum=0,
+            maximum=6,
+            sunday_alias=True,
+        )
+    )
 
 
 class Server:
@@ -42,6 +148,7 @@ class Server:
         self.event_bus = get_event_bus()
         self._draining = False
         self._running = False
+        self._last_scheduler_minute: str | None = None
 
     # ------------------------------------------------------------------
     # PID 文件管理
@@ -166,6 +273,95 @@ class Server:
         return count
 
     # ------------------------------------------------------------------
+    # 自动调度
+    # ------------------------------------------------------------------
+
+    def _load_scheduled_data_profiles(self) -> list[dict[str, str]]:
+        """读取启用了 schedule 的 Data Profile 摘要。
+
+        当前仓库里 `schedule` 语义只属于 DataProfile，因此 server 只会对
+        解析后带有 schedule 的 data profile 自动提交 `data update`。
+        """
+        from vortex.config.profile.resolver import ProfileResolver
+        from vortex.config.profile.store import ProfileStore
+
+        store = ProfileStore(self.workspace.profiles_dir)
+        resolver = ProfileResolver(store)
+        scheduled_profiles: list[dict[str, str]] = []
+        for profile_name in store.list_profiles():
+            try:
+                profile, _ = resolver.resolve(profile_name, "data")
+            except ConfigError as exc:
+                logger.warning(
+                    "跳过自动调度 profile=%s：解析失败: %s",
+                    profile_name,
+                    exc,
+                )
+                continue
+            if profile.schedule:
+                scheduled_profiles.append(
+                    {"name": profile.name, "schedule": str(profile.schedule)}
+                )
+        return scheduled_profiles
+
+    def _submit_scheduled_update(self, profile_name: str) -> dict[str, object]:
+        """提交一次由 server 调度的 `data update`。"""
+        from vortex.cli import _submit_data_background_task
+
+        return _submit_data_background_task(
+            root=self.workspace.root,
+            profile_name=profile_name,
+            action="update",
+            fmt="json",
+            emit_output=False,
+        )
+
+    def _run_scheduler_tick(self, now: datetime | None = None) -> int:
+        """按分钟扫描 schedule，并触发到期的 data update。"""
+        current = now or datetime.now()
+        minute_key = current.strftime("%Y%m%d%H%M")
+        if minute_key == self._last_scheduler_minute:
+            return 0
+        self._last_scheduler_minute = minute_key
+
+        submitted = 0
+        for item in self._load_scheduled_data_profiles():
+            profile_name = item["name"]
+            schedule = item["schedule"]
+            try:
+                due = schedule_matches_datetime(schedule, current)
+            except ValueError as exc:
+                logger.warning(
+                    "跳过自动调度 profile=%s：cron 非法 (%s)",
+                    profile_name,
+                    exc,
+                )
+                continue
+            if not due:
+                continue
+            try:
+                payload = self._submit_scheduled_update(profile_name)
+            except (OSError, RuntimeError_) as exc:
+                logger.exception(
+                    "自动调度提交失败: profile=%s schedule=%s error=%s",
+                    profile_name,
+                    schedule,
+                    exc,
+                )
+                continue
+
+            submitted += 1
+            logger.info(
+                "自动调度已触发: profile=%s schedule=%s status=%s task_id=%s run_id=%s",
+                profile_name,
+                schedule,
+                payload.get("status"),
+                payload.get("task_id"),
+                payload.get("run_id"),
+            )
+        return submitted
+
+    # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
 
@@ -197,12 +393,15 @@ class Server:
         """阻塞式主循环。SIGINT/SIGTERM 触发退出。
 
         此方法在 `vortex server start` 时调用。
-        循环体当前只做心跳检测；实际任务调度由 submit_task 触发。
+        当前 server 同时承担两类职责：
+        1. 常驻控制面：持有 workspace / task_queue / 事件总线
+        2. 自动调度器：按 profile.schedule 定时提交 `data update`
         """
         self._running = True
         logger.info("进入主循环，按 Ctrl+C 退出…")
         try:
             while self._running:
+                self._run_scheduler_tick()
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
@@ -248,6 +447,7 @@ class Server:
         running = self.task_queue.running_count
         pending_rows = self.task_queue.list_tasks(status=TaskStatus.PENDING)
         existing_pid = self._read_pid()
+        scheduled_profiles = self._load_scheduled_data_profiles()
         return {
             "workspace": str(self.workspace.root),
             "db_exists": self.workspace.db_path.exists(),
@@ -257,6 +457,7 @@ class Server:
             "running_tasks": running,
             "pending_tasks": len(pending_rows),
             "can_accept_task": self.task_queue.can_run() and not self._draining,
+            "scheduled_profiles": scheduled_profiles,
         }
 
     def submit_task(

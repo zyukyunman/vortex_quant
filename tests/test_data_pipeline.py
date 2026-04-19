@@ -47,3 +47,29 @@ class TestOrderedDatasets:
             "instruments",
             "calendar",
         ]
+
+    def test_remaining_datasets_are_grouped_by_update_frequency(self):
+        profile = DataProfile(
+            name="default",
+            datasets=["fundamental", "bars", "monthly", "index_weight", "events"],
+            priority_datasets=["events"],
+        )
+        frequency_map = {
+            "fundamental": "quarterly",
+            "bars": "daily",
+            "monthly": "monthly",
+            "index_weight": "weekly",
+            "events": "other",
+        }
+
+        assert _ordered_datasets(
+            profile,
+            frequency_resolver=lambda dataset: frequency_map[dataset],
+            frequency_priority=("daily", "weekly", "monthly", "quarterly", "other"),
+        ) == [
+            "events",
+            "bars",
+            "index_weight",
+            "monthly",
+            "fundamental",
+        ]

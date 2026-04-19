@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import signal
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -57,6 +58,42 @@ class TestServerStart:
         assert "--foreground" in command
         assert calls[0]["kwargs"]["start_new_session"] is True
         assert "已在后台启动" in capsys.readouterr().out
+
+
+class TestUpdateFrequencyScope:
+    def test_update_uses_workday_defaults_when_user_did_not_override(self):
+        resolved = cli._resolve_update_frequency_scope(
+            "update",
+            datasets=None,
+            update_frequencies=[],
+            now=datetime(2026, 4, 17, 9, 30),
+        )
+
+        assert resolved == ["daily", "intraday"]
+
+    def test_update_uses_weekend_defaults_when_user_did_not_override(self):
+        resolved = cli._resolve_update_frequency_scope(
+            "update",
+            datasets=None,
+            update_frequencies=[],
+            now=datetime(2026, 4, 18, 9, 30),
+        )
+
+        assert resolved == ["weekly", "monthly", "quarterly", "other"]
+
+    def test_explicit_dataset_or_frequency_override_disables_default_bucket(self):
+        assert cli._resolve_update_frequency_scope(
+            "update",
+            datasets=["events"],
+            update_frequencies=[],
+            now=datetime(2026, 4, 18, 9, 30),
+        ) == []
+        assert cli._resolve_update_frequency_scope(
+            "update",
+            datasets=None,
+            update_frequencies=["daily"],
+            now=datetime(2026, 4, 18, 9, 30),
+        ) == ["daily"]
 
 
 class TestLatestLogLinks:
@@ -474,6 +511,40 @@ class TestDataBackgroundTasks:
         )
 
         assert captured["action"] == "bootstrap"
+        assert captured["update_frequencies"] == []
+
+    def test_cmd_data_update_defaults_to_workday_frequency_bucket(
+        self, monkeypatch, tmp_path
+    ):
+        captured: dict[str, object] = {}
+
+        def _fake_submit(**kwargs):
+            captured.update(kwargs)
+            return {"status": "submitted"}
+
+        monkeypatch.setattr(cli, "_submit_data_background_task", _fake_submit)
+        monkeypatch.setattr(
+            cli,
+            "_resolve_update_frequency_scope",
+            lambda action, datasets, update_frequencies, now=None: ["daily", "intraday"],
+        )
+
+        cli.cmd_data(
+            argparse.Namespace(
+                data_action="update",
+                root=str(tmp_path / "workspace"),
+                profile=None,
+                datasets=None,
+                frequencies=None,
+                verbose=False,
+                dry_run=False,
+                format="text",
+                foreground=False,
+            )
+        )
+
+        assert captured["action"] == "update"
+        assert captured["update_frequencies"] == ["daily", "intraday"]
 
     def test_cmd_data_foreground_worker_accepts_keyword_progress_callback(
         self, monkeypatch, tmp_path

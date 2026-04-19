@@ -576,6 +576,7 @@ class TushareProvider:
                 start,
                 end,
                 str(spec.get("param_name", "index_code")),
+                partition_values=partition_values,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -1007,13 +1008,18 @@ class TushareProvider:
         end: date,
         param_name: str,
         *,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
     ) -> pd.DataFrame:
         codes = self._load_index_codes()
         frames = []
-        year_ranges = self._split_by_year(start, end)
+        year_ranges = self._resolve_symbol_range_windows(
+            start,
+            end,
+            partition_values=partition_values,
+        )
         total_steps = len(year_ranges) * len(codes)
         current_step = 0
         for year_start, year_end in year_ranges:

@@ -72,7 +72,9 @@ TUSHARE_API_ACCESS_RULES: dict[str, dict[str, Any]] = {
     "hsgt_top10": {"access": "points", "min_points": 2000},
     "moneyflow_ind_dc": {"access": "points", "min_points": 2000},
     "moneyflow_mkt_dc": {"access": "points", "min_points": 2000},
-    "limit_list_d": {"access": "points", "min_points": 2000},
+    # 这两个接口虽然积分门槛是 2000，但实际频控上限长期表现为 200 次/分钟；
+    # 不能直接沿用账户档位（例如 5000 积分账户的 500 rpm），否则会持续触发限频。
+    "limit_list_d": {"access": "points", "min_points": 2000, "rpm": 200},
     "limit_step": {"access": "points", "min_points": 8000},
     "kpl_list": {"access": "points", "min_points": 2000},
     "dc_hot": {"access": "points", "min_points": 2000},
@@ -82,7 +84,7 @@ TUSHARE_API_ACCESS_RULES: dict[str, dict[str, Any]] = {
     "stock_company": {"access": "points", "min_points": 120},
     "stock_st": {"access": "points", "min_points": 2000},
     "st": {"access": "points", "min_points": 6000},
-    "sw_daily": {"access": "points", "min_points": 2000},
+    "sw_daily": {"access": "points", "min_points": 2000, "rpm": 200},
     "ths_index": {"access": "points", "min_points": 2000},
     "ths_member": {"access": "points", "min_points": 2000},
     "dc_index": {"access": "points", "min_points": 2000},
@@ -315,6 +317,89 @@ DEFAULT_TUSHARE_PRIORITY_DATASETS = [
     "valuation",
     "fundamental",
 ]
+
+# 运行频率口径：决定默认调度顺序，也用于按频率裁剪 dataset 子集。
+# 这里说的“频率”是产品层的建议更新节奏，不等于底层 API 的技术 fetch_mode。
+TUSHARE_UPDATE_FREQUENCY_ORDER: tuple[str, ...] = (
+    "daily",
+    "weekly",
+    "monthly",
+    "quarterly",
+    "other",
+    "intraday",
+)
+
+TUSHARE_UPDATE_FREQUENCY_ALIASES: dict[str, str] = {
+    "hourly": "intraday",
+    "realtime": "intraday",
+}
+
+TUSHARE_DATASET_UPDATE_FREQUENCIES: dict[str, str] = {
+    "instruments": "other",
+    "calendar": "daily",
+    "bars": "daily",
+    "fundamental": "quarterly",
+    "events": "other",
+    "valuation": "daily",
+    "adj_factor": "daily",
+    "namechange": "other",
+    "stock_company": "other",
+    "stock_st": "daily",
+    "st": "other",
+    "weekly": "weekly",
+    "monthly": "monthly",
+    "balancesheet": "quarterly",
+    "cashflow": "quarterly",
+    "fina_indicator": "quarterly",
+    "forecast": "quarterly",
+    "express": "quarterly",
+    "disclosure_date": "quarterly",
+    "moneyflow": "daily",
+    "moneyflow_hsgt": "daily",
+    "hsgt_top10": "daily",
+    "top_list": "daily",
+    "top_inst": "daily",
+    "moneyflow_ind_dc": "daily",
+    "moneyflow_mkt_dc": "daily",
+    "limit_list_d": "daily",
+    "limit_step": "daily",
+    "kpl_list": "daily",
+    "dc_hot": "daily",
+    "ths_hot": "daily",
+    "fund_basic": "other",
+    "index_basic": "other",
+    "index_daily": "daily",
+    "index_classify": "other",
+    "index_member_all": "other",
+    "index_weight": "weekly",
+    "sw_daily": "daily",
+    "ths_index": "other",
+    "ths_member": "other",
+    "dc_index": "other",
+    "dc_member": "other",
+    "anns_d": "daily",
+    "news": "daily",
+    "major_news": "daily",
+    "research_report": "daily",
+    "npr": "daily",
+    "irm_qa_sh": "daily",
+    "irm_qa_sz": "daily",
+    "cn_cpi": "monthly",
+    "cn_ppi": "monthly",
+    "cn_pmi": "monthly",
+    "cn_gdp": "quarterly",
+    "cn_m": "monthly",
+    "sf_month": "monthly",
+    "shibor": "daily",
+    "shibor_lpr": "monthly",
+    "us_tycr": "daily",
+    "us_daily": "daily",
+    "hk_daily": "daily",
+    "index_global": "daily",
+    "pro_bar": "daily",
+    "stk_mins": "intraday",
+    "rt_k": "intraday",
+}
 
 TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
     # ------------------------------------------------------------------
@@ -637,6 +722,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "1B",
         "fetch_mode": "index_loop_range",
         "partition_by": "date",
+        # 指数权重本质上是“按调仓日期生效”的低频数据，
+        # 用周末分区可以避免在日更里反复把整周都当作新分区重扫。
+        "date_partition_mode": "week_end",
         "default_enabled": True,
         "loop_source": "index_basic",
         "param_name": "index_code",
@@ -874,6 +962,13 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
     },
 }
 
+for _dataset_name, _frequency in TUSHARE_DATASET_UPDATE_FREQUENCIES.items():
+    if _dataset_name in TUSHARE_DATASET_REGISTRY:
+        TUSHARE_DATASET_REGISTRY[_dataset_name].setdefault(
+            "update_frequency",
+            _frequency,
+        )
+
 
 def resolve_tushare_dataset_name(name: str) -> str:
     """把历史别名解析为当前 canonical dataset 名。"""
@@ -957,6 +1052,56 @@ def get_tushare_dataset_access_rule(name: str) -> dict[str, Any]:
     return get_tushare_api_access_rule(api_name)
 
 
+def normalize_tushare_update_frequencies(
+    update_frequencies: list[str] | tuple[str, ...] | set[str] | None,
+) -> list[str]:
+    """规范化更新频率列表，并按统一优先级排序。"""
+    if not update_frequencies:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in update_frequencies:
+        token = str(raw).strip().lower()
+        if not token:
+            continue
+        canonical = TUSHARE_UPDATE_FREQUENCY_ALIASES.get(token, token)
+        if canonical not in TUSHARE_UPDATE_FREQUENCY_ORDER:
+            allowed = ", ".join(TUSHARE_UPDATE_FREQUENCY_ORDER)
+            raise ValueError(
+                f"未知更新频率: {raw}；可选值: {allowed}"
+            )
+        if canonical not in seen:
+            normalized.append(canonical)
+            seen.add(canonical)
+
+    normalized.sort(key=TUSHARE_UPDATE_FREQUENCY_ORDER.index)
+    return normalized
+
+
+def get_tushare_dataset_update_frequency(name: str) -> str:
+    """按 dataset 名返回建议更新频率。"""
+    canonical = resolve_tushare_dataset_name(name)
+    return TUSHARE_DATASET_UPDATE_FREQUENCIES.get(canonical, "other")
+
+
+def filter_tushare_datasets_by_update_frequency(
+    datasets: list[str],
+    update_frequencies: list[str] | tuple[str, ...] | set[str] | None,
+) -> list[str]:
+    """按更新频率过滤 dataset，保留输入顺序。"""
+    normalized = normalize_tushare_update_frequencies(update_frequencies)
+    if not normalized:
+        return list(datasets)
+
+    allowed = set(normalized)
+    return [
+        dataset
+        for dataset in datasets
+        if get_tushare_dataset_update_frequency(dataset) in allowed
+    ]
+
+
 def get_tushare_dataset_note(name: str) -> str | None:
     """返回 dataset 的表级备注。"""
     canonical = resolve_tushare_dataset_name(name)
@@ -974,6 +1119,7 @@ def get_tushare_dataset_field_docs(name: str) -> dict[str, str]:
 def get_default_tushare_datasets(
     points: int | None = None,
     permission_keys: set[str] | None = None,
+    update_frequencies: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> list[str]:
     """返回默认进入“全量拉取”的 canonical dataset 列表。
 
@@ -987,7 +1133,7 @@ def get_default_tushare_datasets(
         os.environ.get("TUSHARE_EXTRA_PERMISSIONS")
     ) if permission_keys is None else permission_keys
 
-    return [
+    datasets = [
         name
         for name, meta in TUSHARE_DATASET_REGISTRY.items()
         if bool(meta.get("default_enabled", True))
@@ -1006,3 +1152,7 @@ def get_default_tushare_datasets(
             )
         )
     ]
+    return filter_tushare_datasets_by_update_frequency(
+        datasets,
+        update_frequencies,
+    )

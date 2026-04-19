@@ -267,6 +267,40 @@ class SyncManifest:
         )
         return {str(row["partition_value"]) for row in cursor.fetchall()}
 
+    def list_historical_partition_coverages(
+        self,
+        *,
+        dataset: str,
+        partition_key: str,
+        as_of_end: str,
+        statuses: tuple[str, ...],
+        require_as_of_after_partition: bool = False,
+    ) -> set[str]:
+        """返回在给定 as_of_end 及之前已登记覆盖的分区值集合。
+
+        这个查询主要用于复用“历史空分区”一类覆盖记录：
+        - `as_of_end <= 当前 run`：只看过去已经观测过的覆盖
+        - `require_as_of_after_partition=True`：只复用那些“在分区日期之后又被观察过仍为空”的记录，
+          避免把“当天尚未出数”误当成永久空分区。
+        """
+        if not statuses:
+            return set()
+        placeholders = ", ".join("?" for _ in statuses)
+        extra_clause = ""
+        if require_as_of_after_partition:
+            extra_clause = " AND REPLACE(as_of_end, '-', '') > partition_value"
+        cursor = self.conn.execute(
+            f"""SELECT partition_value
+                FROM dataset_partition_coverage
+                WHERE dataset = ?
+                  AND partition_key = ?
+                  AND as_of_end <= ?
+                  AND status IN ({placeholders})
+                  {extra_clause}""",
+            (dataset, partition_key, as_of_end, *statuses),
+        )
+        return {str(row["partition_value"]) for row in cursor.fetchall()}
+
     # ------------------------------------------------------------------
     # snapshot_descriptors
     # ------------------------------------------------------------------

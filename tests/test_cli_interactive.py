@@ -18,9 +18,11 @@ from vortex.cli import (
     _format_selection_summary,
     _multi_select_window,
     _parse_dataset_override,
+    _parse_update_frequency_override,
     _prompt,
     _redraw_multi_select,
     _resolve_data_profile_name,
+    _resolve_init_schedule_choice,
     _run_initial_bootstrap,
     _truncate_terminal_line,
 )
@@ -209,6 +211,12 @@ class TestDataCliHelpers:
         assert "publish_pack" not in config
         assert "storage_pack" not in config
 
+    def test_resolve_init_schedule_choice_uses_daily_triggers(self):
+        assert _resolve_init_schedule_choice("1") == "0 18 * * *"
+        assert _resolve_init_schedule_choice("2") == "0 21 * * *"
+        assert _resolve_init_schedule_choice("3") == "0 6 * * *"
+        assert _resolve_init_schedule_choice("4") is None
+
     def test_resolve_data_profile_name_defaults_to_default(self):
         assert _resolve_data_profile_name(None) == "default"
         assert _resolve_data_profile_name("") == "default"
@@ -228,12 +236,41 @@ class TestDataCliHelpers:
             "calendar",
         ]
 
+    def test_parse_update_frequency_override(self):
+        assert _parse_update_frequency_override("daily, hourly ,weekly") == [
+            "daily",
+            "weekly",
+            "intraday",
+        ]
+
     def test_apply_dataset_override(self):
         profile = DataProfile(name="default")
         updated = _apply_dataset_override(profile, ["bars", "valuation"])
         assert updated.datasets == ["bars", "valuation"]
         assert updated.exclude_datasets == []
         assert updated.priority_datasets == ["bars", "valuation"]
+
+    def test_apply_dataset_override_filters_by_frequency(self):
+        profile = DataProfile(
+            name="default",
+            datasets=["bars", "weekly", "fundamental", "events"],
+            priority_datasets=["fundamental"],
+        )
+        updated = _apply_dataset_override(
+            profile,
+            [],
+            ["daily", "weekly"],
+            frequency_resolver=lambda dataset: {
+                "bars": "daily",
+                "weekly": "weekly",
+                "fundamental": "quarterly",
+                "events": "other",
+            }[dataset],
+        )
+
+        assert updated.datasets == ["bars", "weekly"]
+        assert updated.exclude_datasets == []
+        assert updated.priority_datasets == []
 
     def test_multi_select_window_pages_around_cursor(self):
         start, end = _multi_select_window(total_options=61, cursor=30, visible_count=10)
@@ -267,6 +304,13 @@ class TestDataCliHelpers:
             end="20250131",
         ) == "backfill:20250101-20250131"
         assert _build_data_task_action("publish", as_of="20250407") == "publish:20250407"
+
+    def test_build_data_task_action_includes_dataset_scope(self):
+        assert _build_data_task_action(
+            "update",
+            datasets=["valuation", "bars", "bars"],
+            update_frequencies=["daily"],
+        ) == "update;datasets=bars,valuation;frequencies=daily"
 
 
 class TestInitCancellation:
