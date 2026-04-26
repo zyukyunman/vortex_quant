@@ -3,6 +3,11 @@ name: feishu
 description: 用户明确要求发飞书时，直接发送文本消息到默认接收人；失败后再说明原因。支持发送、配置校验和故障排查。
 author: vortex
 version: 2.0.0
+tags: [vortex, vortex/skill]
+obsidian_links:
+  - "[[用户手册]]"
+  - "[[AI-Agent可行性分析]]"
+  - "[[产品功能冻结文档]]"
 ---
 
 # feishu — 飞书直发技能

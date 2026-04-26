@@ -1,6 +1,15 @@
+---
+tags: [vortex, vortex/architecture, vortex/data-domain]
+aliases: [Tushare 接口参考, Tushare全量数据接口参考表, Tushare API Reference]
+created: 2025-06-01
+updated: 2026-04-26
+---
+
 # Tushare 全量数据接口参考表
 
 > 目标：Vortex 数据域的长期目标是抓取 Tushare 全量数据。本文档列出 Tushare 全部公开接口，按业务分类组织，供数据域开发与数据治理参考。
+>
+> 关联文档：[[数据域设计说明书]]、[[用户手册]] §5.7、[[tushare skill]]
 >
 > 来源：tushare.pro 官方接口文档（截至 2025 年）。
 

@@ -1,9 +1,17 @@
+---
+tags: [vortex, vortex/architecture]
+aliases: [AI Agent 可行性分析, AI-Agent可行性分析, AI Agent Feasibility]
+created: 2026-04-04
+updated: 2026-04-26
+---
+
 # 主动调用 AI Agent 的可行性与需求分析
 
 > 文档编号：10  
 > 版本：v0.1（草案）  
 > 归属：架构设计  
-> 状态：需求分析阶段
+> 状态：需求分析阶段  
+> 关联 Skill：[[feishu skill]]、[[context7-mcp skill]]
 
 ---
 

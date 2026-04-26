@@ -2,6 +2,8 @@
 description: "Use when answering questions, writing docs, annotating code, or recording analysis and implementation notes in this Vortex repo. Prefer Chinese responses and records, and explain the why, assumptions, and business context."
 name: "Vortex 中文说明与注释规范"
 applyTo: "**/*.md, **/*.py"
+tags: [vortex]
+aliases: [Vortex 编码规范, Vortex Coding Conventions]
 ---
 
 # Vortex 中文说明与注释规范
