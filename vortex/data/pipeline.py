@@ -1210,7 +1210,12 @@ class DataPipeline:
 
         if fetch_mode == "trade_day_all" and partition_by == "date" and trading_days:
             existing_dates = self._existing_partition_values(dataset, "date")
-            covered_dates = self._covered_partition_values(dataset, "date", end)
+            expected_dates = [day.strftime("%Y%m%d") for day in trading_days]
+            covered_dates = self._trim_recent_covered_partitions(
+                meta,
+                expected_dates,
+                self._covered_partition_values(dataset, "date", end),
+            )
             existing_target_days = [
                 day for day in trading_days
                 if day.strftime("%Y%m%d") in existing_dates
@@ -1260,7 +1265,11 @@ class DataPipeline:
             expected_dates = self._expected_date_partition_values(meta, trading_days)
             if expected_dates:
                 existing_dates = self._existing_partition_values(dataset, "date")
-                covered_dates = self._covered_partition_values(dataset, "date", end)
+                covered_dates = self._trim_recent_covered_partitions(
+                    meta,
+                    expected_dates,
+                    self._covered_partition_values(dataset, "date", end),
+                )
                 existing_target_dates = [
                     value for value in expected_dates if value in existing_dates
                 ]
@@ -1306,7 +1315,11 @@ class DataPipeline:
             expected_dates = self._expected_date_partition_values(meta, trading_days)
             if expected_dates:
                 existing_dates = self._existing_partition_values(dataset, "date")
-                covered_dates = self._covered_partition_values(dataset, "date", end)
+                covered_dates = self._trim_recent_covered_partitions(
+                    meta,
+                    expected_dates,
+                    self._covered_partition_values(dataset, "date", end),
+                )
                 existing_target_dates = [
                     value for value in expected_dates if value in existing_dates
                 ]
@@ -1526,6 +1539,20 @@ class DataPipeline:
             ]
 
         return [day.strftime("%Y%m%d") for day in trading_days]
+
+    @staticmethod
+    def _trim_recent_covered_partitions(
+        meta: dict[str, object],
+        expected_values: list[str],
+        covered_values: set[str],
+    ) -> set[str]:
+        retry_recent = int(meta.get("source_empty_retry_recent_days") or 0)
+        if retry_recent <= 0 or not expected_values or not covered_values:
+            return covered_values
+        retry_values = set(expected_values[-retry_recent:])
+        if not retry_values:
+            return covered_values
+        return {value for value in covered_values if value not in retry_values}
 
     def _apply_pit_alignment(
         self,

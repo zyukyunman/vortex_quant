@@ -479,6 +479,73 @@ class TestGenericDatasetPipeline:
         assert "dataset=valuation 去重覆盖: partition_key=date, covered_partitions=2" in caplog.text
         assert "dataset=valuation 去重决策: 目标日期分区已全部存在或已登记覆盖" in caplog.text
 
+    def test_bootstrap_retries_recent_source_empty_for_index_loop_range(self, tmp_path, caplog):
+        class RetryRecentIndexProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.calls = 0
+                self.requested_partition_values: list[list[str]] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "index_daily": {
+                        "api": "index_daily",
+                        "description": "指数日线",
+                        "phase": "1B",
+                        "fetch_mode": "index_loop_range",
+                        "partition_by": "date",
+                        "source_empty_retry_recent_days": 1,
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "index_daily"
+                self.calls += 1
+                self.requested_partition_values.append(list(partition_values or []))
+                return pd.DataFrame(columns=["symbol", "date", "close"])
+
+        provider = RetryRecentIndexProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["index_daily"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        first = pipeline.bootstrap(profile)
+        second = pipeline.bootstrap(profile)
+
+        assert first.status == "success"
+        assert second.status == "success"
+        assert provider.calls == 2
+        assert provider.requested_partition_values == [
+            ["20260401", "20260402"],
+            ["20260402"],
+        ]
+        assert "dataset=index_daily 去重覆盖: partition_key=date, covered_partitions=1" in caplog.text
+
     def test_bootstrap_skips_existing_symbol_range_daily_partitions(self, tmp_path, caplog):
         class SymbolRangeResumeProvider(GenericDatasetProvider):
             def __init__(self) -> None:
