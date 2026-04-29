@@ -28,8 +28,10 @@ import pandas as pd
 from vortex.data.provider.tushare_registry import (
     DEFAULT_TUSHARE_PRIORITY_DATASETS,
     DEFAULT_TUSHARE_POINTS,
+    DEFAULT_TUSHARE_INDEX_DAILY_CODES,
     TUSHARE_DATASET_REGISTRY,
     TUSHARE_FUND_MARKETS,
+    TUSHARE_INDEX_DAILY_MARKETS,
     TUSHARE_INDEX_MARKETS,
     TUSHARE_STOCK_EXCHANGES,
     get_default_tushare_datasets,
@@ -632,7 +634,14 @@ class TushareProvider:
             )
 
         result = self._normalize_dataset_frame(canonical, raw, start=start, end=end)
-        if symbols and "symbol" in result.columns:
+        if symbols and "symbol" in result.columns and mode in {
+            "trade_day_all",
+            "symbol_once",
+            "symbol_range",
+            "symbol_quarter_range",
+            "pro_bar",
+            "minute_range",
+        }:
             result = result[result["symbol"].isin(symbols)]
         return result
 
@@ -1196,12 +1205,21 @@ class TushareProvider:
     # ------------------------------------------------------------------
 
     def _load_index_codes(self) -> list[str]:
+        if not (
+            len(DEFAULT_TUSHARE_INDEX_DAILY_CODES) == 1
+            and DEFAULT_TUSHARE_INDEX_DAILY_CODES[0].lower() == "all"
+        ):
+            return list(DEFAULT_TUSHARE_INDEX_DAILY_CODES)
+
         if "index_basic" not in self._frame_cache:
             self._frame_cache["index_basic"] = self._fetch_index_reference("index_basic")
         df = self._frame_cache["index_basic"]
         if df.empty or "ts_code" not in df.columns:
             return []
-        return sorted(df["ts_code"].dropna().astype(str).unique().tolist())
+        if "market" in df.columns:
+            df = df.loc[df["market"].astype(str).isin(TUSHARE_INDEX_DAILY_MARKETS)]
+        codes = sorted(df["ts_code"].dropna().astype(str).unique().tolist())
+        return codes
 
     def _load_member_parent_codes(self, loop_source: str) -> list[str]:
         if loop_source not in self._frame_cache:

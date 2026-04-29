@@ -12,6 +12,9 @@ import vortex.data.provider.tushare as tushare_provider
 from vortex.data.provider.tushare_registry import (
     filter_tushare_datasets_by_update_frequency,
     get_default_tushare_datasets,
+    get_tushare_dataset_access_rule,
+    get_tushare_dataset_api_doc_url,
+    get_tushare_dataset_spec,
     get_tushare_dataset_update_frequency,
     normalize_tushare_update_frequencies,
 )
@@ -573,6 +576,16 @@ class TestTushareApiAccessRules:
         assert access["max_rpm"] == 500
         assert access["effective_rpm"] == 400
 
+    @pytest.mark.parametrize("dataset", ["stk_limit", "suspend_d"])
+    def test_tradability_datasets_are_registered_as_daily_trade_day_all(self, dataset: str):
+        spec = get_tushare_dataset_spec(dataset)
+
+        assert spec["fetch_mode"] == "trade_day_all"
+        assert spec["partition_by"] == "date"
+        assert get_tushare_dataset_update_frequency(dataset) == "daily"
+        assert get_tushare_dataset_access_rule(dataset)["min_points"] == 2000
+        assert get_tushare_dataset_api_doc_url(dataset)
+
     def test_quarter_statement_uses_partition_values_as_exact_quarter_gaps(self, monkeypatch):
         provider = self._build_provider(points=2000)
         calls: list[tuple[str, dict[str, object]]] = []
@@ -843,6 +856,48 @@ class TestTushareDatasetContracts:
             "param_name": "ts_code",
             "partition_values": ["20260410"],
         }
+
+    def test_index_daily_code_loader_uses_research_default_benchmark_pool(self):
+        provider = self._build_provider()
+        provider._fetch_index_reference = lambda _api_name: (_ for _ in ()).throw(AssertionError("should not load catalog"))
+
+        assert provider._load_index_codes() == [
+            "000001.SH",
+            "000016.SH",
+            "399001.SZ",
+            "399006.SZ",
+            "000300.SH",
+            "000905.SH",
+            "000852.SH",
+            "000906.SH",
+            "000985.CSI",
+        ]
+
+    def test_fetch_index_daily_ignores_stock_symbol_filter(self, monkeypatch):
+        provider = self._build_provider()
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_index_loop_range",
+            lambda *_args, **_kwargs: pd.DataFrame(
+                {
+                    "ts_code": ["000300.SH"],
+                    "trade_date": ["20240102"],
+                    "close": [3386.3522],
+                }
+            ),
+        )
+
+        result = provider.fetch_dataset(
+            "index_daily",
+            "cn_stock",
+            date(2024, 1, 2),
+            date(2024, 1, 5),
+            symbols=["000001.SZ"],
+        )
+
+        assert result["symbol"].tolist() == ["000300.SH"]
 
     def test_fetch_stock_company_uses_exchange_reference_contract(self, monkeypatch):
         provider = self._build_provider()

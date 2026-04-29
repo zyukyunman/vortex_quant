@@ -1214,7 +1214,7 @@ class DataPipeline:
             covered_dates = self._trim_recent_covered_partitions(
                 meta,
                 expected_dates,
-                self._covered_partition_values(dataset, "date", end),
+                self._covered_partition_values(dataset, "date", end, meta),
             )
             existing_target_days = [
                 day for day in trading_days
@@ -1268,7 +1268,7 @@ class DataPipeline:
                 covered_dates = self._trim_recent_covered_partitions(
                     meta,
                     expected_dates,
-                    self._covered_partition_values(dataset, "date", end),
+                    self._covered_partition_values(dataset, "date", end, meta),
                 )
                 existing_target_dates = [
                     value for value in expected_dates if value in existing_dates
@@ -1318,7 +1318,7 @@ class DataPipeline:
                 covered_dates = self._trim_recent_covered_partitions(
                     meta,
                     expected_dates,
-                    self._covered_partition_values(dataset, "date", end),
+                    self._covered_partition_values(dataset, "date", end, meta),
                 )
                 existing_target_dates = [
                     value for value in expected_dates if value in existing_dates
@@ -1370,6 +1370,7 @@ class DataPipeline:
                     dataset,
                     partition_key,
                     end,
+                    meta,
                 )
                 existing_target_quarters = [
                     value for value in expected_quarters if value in existing_quarters
@@ -1457,21 +1458,26 @@ class DataPipeline:
         dataset: str,
         partition_key: str,
         as_of_end: date,
+        meta: dict[str, object],
     ) -> set[str]:
         current_as_of = as_of_end.isoformat()
+        reuse_source_empty = bool(meta.get("reuse_source_empty_coverage", True))
+        same_asof_statuses = ("pit_blocked", "source_empty") if reuse_source_empty else ("pit_blocked",)
         same_asof_coverages = self._manifest.list_partition_coverages(
             dataset=dataset,
             partition_key=partition_key,
             as_of_end=current_as_of,
-            statuses=("pit_blocked", "source_empty"),
+            statuses=same_asof_statuses,
         )
-        historical_empty_coverages = self._manifest.list_historical_partition_coverages(
-            dataset=dataset,
-            partition_key=partition_key,
-            as_of_end=current_as_of,
-            statuses=("source_empty",),
-            require_as_of_after_partition=True,
-        )
+        historical_empty_coverages: set[str] = set()
+        if reuse_source_empty:
+            historical_empty_coverages = self._manifest.list_historical_partition_coverages(
+                dataset=dataset,
+                partition_key=partition_key,
+                as_of_end=current_as_of,
+                statuses=("source_empty",),
+                require_as_of_after_partition=True,
+            )
         return same_asof_coverages | historical_empty_coverages
 
     def _has_exact_range_coverage(

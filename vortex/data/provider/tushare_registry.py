@@ -17,6 +17,15 @@ import os
 from typing import Any
 
 TUSHARE_INDEX_MARKETS = ["MS", "SSE", "SZSE", "CSI", "CICC", "SW", "OTH"]
+TUSHARE_INDEX_DAILY_MARKETS = ["SSE", "SZSE", "CSI"]
+DEFAULT_TUSHARE_INDEX_DAILY_CODES = tuple(
+    item.strip()
+    for item in os.getenv(
+        "VORTEX_TUSHARE_INDEX_DAILY_CODES",
+        "000001.SH,000016.SH,399001.SZ,399006.SZ,000300.SH,000905.SH,000852.SH,000906.SH,000985.CSI",
+    ).split(",")
+    if item.strip()
+)
 TUSHARE_FUND_MARKETS = ["E", "O"]
 TUSHARE_STOCK_EXCHANGES = ["SSE", "SZSE", "BSE"]
 
@@ -72,9 +81,11 @@ TUSHARE_API_ACCESS_RULES: dict[str, dict[str, Any]] = {
     "hsgt_top10": {"access": "points", "min_points": 2000},
     "moneyflow_ind_dc": {"access": "points", "min_points": 2000},
     "moneyflow_mkt_dc": {"access": "points", "min_points": 2000},
-    # 这两个接口虽然积分门槛是 2000，但实际频控上限长期表现为 200 次/分钟；
+    # limit_list_d 和 sw_daily 虽然积分门槛是 2000，但实际频控上限长期表现为 200 次/分钟；
     # 不能直接沿用账户档位（例如 5000 积分账户的 500 rpm），否则会持续触发限频。
     "limit_list_d": {"access": "points", "min_points": 2000, "rpm": 200},
+    "stk_limit": {"access": "points", "min_points": 2000},
+    "suspend_d": {"access": "points", "min_points": 2000},
     "limit_step": {"access": "points", "min_points": 8000},
     "kpl_list": {"access": "points", "min_points": 2000},
     "dc_hot": {"access": "points", "min_points": 2000},
@@ -163,6 +174,8 @@ TUSHARE_API_DOC_URLS: dict[str, str] = {
     "ths_index": "https://tushare.pro/wctapi/documents/259.md",
     "ths_member": "https://tushare.pro/wctapi/documents/261.md",
     "limit_list_d": "https://tushare.pro/wctapi/documents/298.md",
+    "stk_limit": "https://tushare.pro/wctapi/documents/183.md",
+    "suspend_d": "https://tushare.pro/wctapi/documents/214.md",
     "sf_month": "https://tushare.pro/wctapi/documents/310.md",
     "ths_hot": "https://tushare.pro/wctapi/documents/320.md",
     "dc_hot": "https://tushare.pro/wctapi/documents/321.md",
@@ -362,6 +375,8 @@ TUSHARE_DATASET_UPDATE_FREQUENCIES: dict[str, str] = {
     "moneyflow_ind_dc": "daily",
     "moneyflow_mkt_dc": "daily",
     "limit_list_d": "daily",
+    "stk_limit": "daily",
+    "suspend_d": "daily",
     "limit_step": "daily",
     "kpl_list": "daily",
     "dc_hot": "daily",
@@ -640,6 +655,22 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "partition_by": "date",
         "default_enabled": True,
     },
+    "stk_limit": {
+        "api": "stk_limit",
+        "description": "每日涨跌停价格",
+        "phase": "2",
+        "fetch_mode": "trade_day_all",
+        "partition_by": "date",
+        "default_enabled": True,
+    },
+    "suspend_d": {
+        "api": "suspend_d",
+        "description": "每日停复牌信息",
+        "phase": "2",
+        "fetch_mode": "trade_day_all",
+        "partition_by": "date",
+        "default_enabled": True,
+    },
     "limit_step": {
         "api": "limit_step",
         "description": "涨停连板梯队",
@@ -700,6 +731,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         # 该接口在实时更新窗口内可能存在发布延迟，最近几个交易日即便曾记录 source_empty
         # 也应继续重试，避免把“迟到数据”永久误判为历史空分区。
         "source_empty_retry_recent_days": 5,
+        "reuse_source_empty_coverage": False,
         "default_enabled": True,
         "param_name": "ts_code",
     },
