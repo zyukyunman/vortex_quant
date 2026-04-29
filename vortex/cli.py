@@ -2742,6 +2742,85 @@ def _print_result(result: dict, fmt: str) -> None:
                 print(f"  {key}: {value}")
 
 
+def cmd_strategy(args: argparse.Namespace) -> None:
+    """策略研究与候选策略复核入口。"""
+
+    if args.strategy_action != "earnings-forecast":
+        raise SystemExit(f"未知 strategy 子命令: {args.strategy_action}")
+    if args.earnings_action not in {"precise-review", "shadow-plan"}:
+        raise SystemExit(f"未知 earnings-forecast 子命令: {args.earnings_action}")
+
+    from vortex.strategy.earnings_forecast_runner import (
+        DEFAULT_REVIEW_LABEL,
+        DEFAULT_SHADOW_LABEL,
+        run_earnings_forecast_shadow_plan,
+        run_precise_earnings_forecast_review,
+    )
+
+    if args.earnings_action == "shadow-plan":
+        artifacts = run_earnings_forecast_shadow_plan(
+            Path(args.root).expanduser(),
+            start=args.start,
+            as_of=args.as_of,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_SHADOW_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告影子跟踪计划已生成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  HTML: {artifacts.html_path}")
+        print(f"  目标持仓: {artifacts.target_path}")
+        print(
+            "  摘要: "
+            f"目标仓位 {float(artifacts.summary['exposure']) * 100:.2f}%, "
+            f"持仓 {artifacts.summary['holding_count']} 只, "
+            f"调仓 {artifacts.summary['trade_count']} 只"
+        )
+        return
+
+    costs = _parse_float_csv(args.costs) if getattr(args, "costs", None) else None
+    artifacts = run_precise_earnings_forecast_review(
+        Path(args.root).expanduser(),
+        start=args.start,
+        end=args.end,
+        output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+        artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+        label=args.label or DEFAULT_REVIEW_LABEL,
+        cost_grid=costs if costs is not None else (0.0, 10.0, 20.0, 30.0, 50.0, 80.0, 100.0),
+        portfolio_notional=float(args.portfolio_notional),
+        require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+    )
+    if args.format == "json":
+        print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2))
+        return
+    print("业绩预告精确可交易复核完成")
+    print(f"  JSON: {artifacts.json_path}")
+    print(f"  HTML: {artifacts.html_path}")
+    print(f"  持仓: {artifacts.holdings_path}")
+    metrics = artifacts.summary["metrics"]
+    if isinstance(metrics, dict):
+        print(
+            "  指标: "
+            f"年化 {float(metrics['annual_return']) * 100:.2f}%, "
+            f"最大回撤 {float(metrics['max_drawdown']) * 100:.2f}%"
+        )
+
+
+def _parse_float_csv(raw: str) -> tuple[float, ...]:
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    if not values:
+        raise ValueError("浮点列表不能为空")
+    return tuple(values)
+
+
 # ------------------------------------------------------------------
 # 主入口
 # ------------------------------------------------------------------
@@ -2901,6 +2980,55 @@ def main() -> None:
     inspect_sub.add_argument("--limit", type=int, default=10, help="样例行数（默认 10，0 表示只看元信息）")
     inspect_sub.add_argument("--format", choices=["text", "json"], default="text")
 
+    # --- vortex strategy earnings-forecast precise-review ---
+    strategy_parser = subparsers.add_parser("strategy", help="策略研究与复核")
+    strategy_sub = strategy_parser.add_subparsers(dest="strategy_action")
+    earnings_parser = strategy_sub.add_parser("earnings-forecast", help="业绩预告漂移策略")
+    earnings_sub = earnings_parser.add_subparsers(dest="earnings_action")
+    precise_sub = earnings_sub.add_parser(
+        "precise-review",
+        parents=[root_parser],
+        help="运行业绩预告 v3 精确可交易复核",
+    )
+    precise_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    precise_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    precise_sub.add_argument("--output-dir", help="JSON/HTML 报告输出目录；默认 workspace/strategy")
+    precise_sub.add_argument("--artifact-dir", help="持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
+    precise_sub.add_argument("--label", help="输出文件名前缀")
+    precise_sub.add_argument(
+        "--costs",
+        help="成本压力网格，bps 逗号分隔；默认 0,10,20,30,50,80,100",
+    )
+    precise_sub.add_argument(
+        "--portfolio-notional",
+        type=float,
+        default=100_000_000,
+        help="容量测算本金，默认 1 亿元",
+    )
+    precise_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    precise_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    shadow_sub = earnings_sub.add_parser(
+        "shadow-plan",
+        parents=[root_parser],
+        help="生成某日影子跟踪目标持仓",
+    )
+    shadow_sub.add_argument("--start", required=True, help="影子跟踪回看起始日期 YYYYMMDD")
+    shadow_sub.add_argument("--as-of", required=True, help="目标持仓日期 YYYYMMDD")
+    shadow_sub.add_argument("--output-dir", help="JSON/HTML 报告输出目录；默认 workspace/strategy")
+    shadow_sub.add_argument("--artifact-dir", help="目标持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
+    shadow_sub.add_argument("--label", help="输出文件名前缀")
+    shadow_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    shadow_sub.add_argument("--format", choices=["text", "json"], default="text")
+
     args = parser.parse_args()
 
     # 日志
@@ -2916,5 +3044,7 @@ def main() -> None:
             cmd_profile(args)
         case "data":
             cmd_data(args)
+        case "strategy":
+            cmd_strategy(args)
         case _:
             parser.print_help()
