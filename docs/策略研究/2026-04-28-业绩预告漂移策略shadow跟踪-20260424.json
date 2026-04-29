@@ -1,0 +1,28 @@
+{
+  "label": "2026-04-28-业绩预告漂移策略shadow跟踪",
+  "as_of": "20260424",
+  "requested_as_of": "20260424",
+  "json_path": "docs/策略研究/2026-04-28-业绩预告漂移策略shadow跟踪-20260424.json",
+  "html_path": "docs/策略研究/2026-04-28-业绩预告漂移策略shadow跟踪-20260424.html",
+  "target_path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略shadow跟踪-20260424目标持仓.csv",
+  "holding_count": 44,
+  "trade_count": 45,
+  "exposure": 1.0,
+  "turnover": 0.04444444444444444,
+  "metrics_to_date": {
+    "annual_return": 0.6763079364752156,
+    "max_drawdown": -0.10693110548220142,
+    "sharpe": 3.694897773847783,
+    "calmar": 6.324707234863353,
+    "turnover": 0.2710962448581646,
+    "total_return": 101.39559690954131
+  },
+  "candidate_review": {
+    "grade": "S",
+    "worth_owning": true,
+    "failures": [],
+    "next_actions": [
+      "归档为值得拥有的 alpha 候选，继续做 walk-forward、容量和成本压力测试。"
+    ]
+  }
+}
