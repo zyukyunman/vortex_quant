@@ -126,6 +126,26 @@ def test_event_signal_backtest_blocked_sell_keeps_position_without_excess_exposu
     assert result.weights.loc["20240104"].sum() == pytest.approx(1.0)
 
 
+def test_event_signal_backtest_reapplies_trade_blocks_after_rescaling():
+    dates = pd.Index(["20240102", "20240103", "20240104"])
+    symbols = pd.Index(["A", "B", "C"])
+    signal = pd.DataFrame(index=dates, columns=symbols, dtype=float)
+    signal.loc["20240103", ["A", "B"]] = [1.0, 0.9]
+    signal.loc["20240104", ["B", "C"]] = [1.0, 0.9]
+    returns = pd.DataFrame(0.0, index=dates, columns=symbols)
+    blocked_sell = pd.DataFrame(False, index=dates, columns=symbols)
+    blocked_sell.loc["20240104", "A"] = True
+
+    result = run_event_signal_backtest(
+        signal,
+        returns,
+        EventBacktestConfig(top_n=2, max_weight=0.5, target_exposure=1.0, transaction_cost_bps=0),
+        blocked_sell_mask=blocked_sell,
+    )
+
+    assert result.weights.loc["20240104", "A"] == pytest.approx(result.weights.loc["20240103", "A"])
+
+
 def test_event_signal_backtest_cost_reduces_return():
     signal, returns = _event_signal_and_returns()
 

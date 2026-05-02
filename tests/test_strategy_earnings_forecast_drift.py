@@ -8,8 +8,10 @@ from vortex.research.market_state import MarketStateConfig
 from vortex.strategy.earnings_forecast_drift import (
     EarningsForecastDriftConfig,
     SegmentSpec,
+    build_financial_st_risk_events,
     build_limit_event_masks,
     build_open_limit_price_masks,
+    build_persistent_st_risk_mask,
     build_stock_st_mask,
     build_suspend_trade_mask,
     capacity_report,
@@ -127,6 +129,103 @@ def test_earnings_forecast_drift_supports_capped_cash_position_mode():
 
     assert float(result.weights.sum(axis=1).max()) <= 0.6 + 1e-12
     assert float(result.weights.max(axis=1).max()) <= 0.3 + 1e-12
+
+
+def test_earnings_forecast_drift_removes_st_during_forward_filled_holding():
+    forecast, open_prices, close_prices, amount, index_close = _fixture_data(days=30)
+    forecast = forecast.loc[forecast["symbol"] == "A"].copy()
+    st_date = open_prices.index[4]
+    stock_st = pd.DataFrame({"date": [st_date], "symbol": ["A"], "type": ["ST"], "type_name": ["风险警示"]})
+
+    result = run_earnings_forecast_drift(
+        forecast,
+        open_prices,
+        close_prices,
+        amount,
+        index_close,
+        EarningsForecastDriftConfig(
+            hold_days=20,
+            top_n=1,
+            liquidity_window=1,
+            transaction_cost_bps=0,
+            market_state=MarketStateConfig(momentum_window=1, support_window=1),
+        ),
+        quality=_quality(),
+        segments=(),
+        stock_st=stock_st,
+    )
+
+    assert result.weights.loc[open_prices.index[2], "A"] > 0
+    assert result.weights.loc[st_date, "A"] == pytest.approx(0.0)
+
+
+def test_earnings_forecast_drift_supports_financial_st_risk_events():
+    forecast, open_prices, close_prices, amount, index_close = _fixture_data(days=30)
+    forecast = forecast.loc[forecast["symbol"] == "A"].copy()
+    risk_date = open_prices.index[3]
+    st_risk_events = pd.DataFrame({"date": [risk_date], "symbol": ["A"], "risk_reason": ["negative_equity"]})
+
+    result = run_earnings_forecast_drift(
+        forecast,
+        open_prices,
+        close_prices,
+        amount,
+        index_close,
+        EarningsForecastDriftConfig(
+            hold_days=20,
+            top_n=1,
+            liquidity_window=1,
+            transaction_cost_bps=0,
+            market_state=MarketStateConfig(momentum_window=1, support_window=1),
+        ),
+        quality=_quality(),
+        segments=(),
+        st_risk_events=st_risk_events,
+    )
+
+    assert result.weights.loc[open_prices.index[2], "A"] > 0
+    assert result.weights.loc[risk_date, "A"] == pytest.approx(0.0)
+
+
+def test_build_financial_st_risk_events_uses_pit_effective_date():
+    dates = pd.Index(["20240102", "20240103", "20240104"])
+    fina = pd.DataFrame(
+        {
+            "symbol": ["A", "B"],
+            "effective_from": ["2024-01-03T09:30:00+08:00", "2024-01-03T09:30:00+08:00"],
+            "bps": [-0.1, 2.0],
+            "roe": [1.0, 2.0],
+            "debt_to_assets": [20.0, 30.0],
+            "netprofit_yoy": [5.0, 5.0],
+        }
+    )
+    balance = pd.DataFrame(
+        {
+            "symbol": ["C"],
+            "ann_date": ["20240101"],
+            "total_hldr_eqy_inc_min_int": [-1.0],
+            "total_hldr_eqy_exc_min_int": [10.0],
+        }
+    )
+
+    events = build_financial_st_risk_events(fina_indicator=fina, balancesheet=balance, target_index=dates)
+
+    assert set(events["symbol"]) == {"A", "C"}
+    assert events.loc[events["symbol"] == "A", "date"].iloc[0] == "20240103"
+    assert events.loc[events["symbol"] == "C", "date"].iloc[0] == "20240102"
+
+
+def test_persistent_st_risk_mask_stays_active_after_event_date():
+    dates = pd.Index(["20240102", "20240103", "20240104"])
+    symbols = pd.Index(["A", "B"])
+    events = pd.DataFrame({"date": ["20240103"], "symbol": ["A"], "risk_reason": ["negative_equity"]})
+
+    mask = build_persistent_st_risk_mask(events, dates, symbols)
+
+    assert not mask.loc["20240102", "A"]
+    assert mask.loc["20240103", "A"]
+    assert mask.loc["20240104", "A"]
+    assert not mask.loc["20240104", "B"]
 
 
 def test_earnings_forecast_grid_reports_cost_pressure_rows():

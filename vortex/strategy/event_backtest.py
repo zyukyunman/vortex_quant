@@ -188,6 +188,12 @@ def _apply_trade_blocks(
         variable_total = float(adjusted.loc[variable].sum())
         if variable_total > 0:
             adjusted.loc[variable] = adjusted.loc[variable] * min(1.0, budget / variable_total)
+    if blocked_sell is not None:
+        sell_blocked = blocked_sell.reindex(target.index).fillna(False).astype(bool)
+        adjusted.loc[sell_blocked & (adjusted < current - eps)] = current.loc[sell_blocked & (adjusted < current - eps)]
+    if blocked_buy is not None:
+        buy_blocked = blocked_buy.reindex(target.index).fillna(False).astype(bool)
+        adjusted.loc[buy_blocked & (adjusted > current + eps)] = current.loc[buy_blocked & (adjusted > current + eps)]
     return adjusted
 
 

@@ -41,6 +41,7 @@ class EarningsForecastDriftConfig:
     liquidity_window: int = 20
     min_avg_amount: float = 30000.0
     exclude_st: bool = True
+    exclude_st_risk: bool = True
     block_limit_up_buys: bool = True
     block_limit_down_sells: bool = True
     block_suspended_trades: bool = True
@@ -134,6 +135,7 @@ def run_earnings_forecast_drift(
     limit_open_prices: pd.DataFrame | None = None,
     suspend_events: pd.DataFrame | None = None,
     stock_st: pd.DataFrame | None = None,
+    st_risk_events: pd.DataFrame | None = None,
 ) -> EarningsForecastDriftResult:
     """运行业绩预告漂移策略并生成候选评级。"""
 
@@ -150,8 +152,14 @@ def run_earnings_forecast_drift(
         window=config.liquidity_window,
         min_avg_amount=config.min_avg_amount,
     )
+    st_mask: pd.DataFrame | None = None
     if config.exclude_st and stock_st is not None:
-        liquidity = liquidity & ~build_stock_st_mask(stock_st, open_prices.index, open_prices.columns)
+        st_mask = build_stock_st_mask(stock_st, open_prices.index, open_prices.columns)
+        liquidity = liquidity & ~st_mask
+    if config.exclude_st_risk and st_risk_events is not None:
+        risk_mask = build_persistent_st_risk_mask(st_risk_events, open_prices.index, open_prices.columns)
+        st_mask = _combine_masks(st_mask, risk_mask)
+        liquidity = liquidity & ~risk_mask
     limit_up_mask: pd.DataFrame | None = None
     limit_down_mask: pd.DataFrame | None = None
     if limit_events is not None and (config.block_limit_up_buys or config.block_limit_down_sells):
@@ -181,6 +189,8 @@ def run_earnings_forecast_drift(
         delay_days=config.delay_days,
         hold_days=config.hold_days,
     )
+    if st_mask is not None:
+        signal = signal.where(~st_mask.reindex_like(signal).fillna(False))
     returns = open_to_close_returns(open_prices, close_prices)
     market_gate = market_gate_from_state(build_market_state(index_close, config.market_state))
     event_config = EventBacktestConfig(
@@ -257,6 +267,7 @@ def run_earnings_forecast_grid(
                         liquidity_window=base.liquidity_window,
                         min_avg_amount=base.min_avg_amount,
                         exclude_st=base.exclude_st,
+                        exclude_st_risk=base.exclude_st_risk,
                         block_limit_up_buys=base.block_limit_up_buys,
                         block_limit_down_sells=base.block_limit_down_sells,
                         block_suspended_trades=base.block_suspended_trades,
@@ -705,6 +716,71 @@ def build_stock_st_mask(
     return _event_mask(stock_st, target_index, target_columns)
 
 
+def build_persistent_st_risk_mask(
+    st_risk_events: pd.DataFrame,
+    target_index: pd.Index,
+    target_columns: pd.Index,
+) -> pd.DataFrame:
+    """从风险事件日起持续剔除标的，适用于财务 ST 预警类过滤。"""
+
+    required = {"date", "symbol"}
+    missing = required - set(st_risk_events.columns)
+    if missing:
+        raise ValueError(f"st_risk_events 缺少字段: {sorted(missing)}")
+    mask = _event_mask(st_risk_events, target_index, target_columns)
+    return mask.where(mask).ffill().fillna(False).astype(bool)
+
+
+def build_financial_st_risk_events(
+    *,
+    fina_indicator: pd.DataFrame | None = None,
+    balancesheet: pd.DataFrame | None = None,
+    cashflow: pd.DataFrame | None = None,
+    target_index: pd.Index | None = None,
+) -> pd.DataFrame:
+    """把财务退市/ST 风险转成可用于策略过滤的日频事件。
+
+    第一版采用保守、可解释的风险规则：净资产或每股净资产为负、资产负债率
+    极高且盈利恶化、ROE 极低、净利润与经营现金流同时为负。事件日期优先使用
+    PIT 可见时间 `effective_from`，否则使用公告日 `ann_date`。
+    """
+
+    frames = []
+    if fina_indicator is not None and not fina_indicator.empty:
+        frame = fina_indicator.copy()
+        symbol = frame.get("symbol", pd.Series(index=frame.index, dtype=object)).astype(str)
+        bps = pd.to_numeric(frame.get("bps", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        roe = pd.to_numeric(frame.get("roe", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        debt_to_assets = pd.to_numeric(frame.get("debt_to_assets", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        netprofit_yoy = pd.to_numeric(frame.get("netprofit_yoy", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        risk = (
+            bps.le(0)
+            | roe.le(-50)
+            | (debt_to_assets.ge(95) & netprofit_yoy.le(-50))
+        ).fillna(False)
+        frames.append(_financial_risk_rows(frame.loc[risk], symbol.loc[risk], "fina_indicator_st_risk", target_index))
+    if balancesheet is not None and not balancesheet.empty:
+        frame = balancesheet.copy()
+        symbol = frame.get("symbol", pd.Series(index=frame.index, dtype=object)).astype(str)
+        equity_inc = pd.to_numeric(frame.get("total_hldr_eqy_inc_min_int", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        equity_exc = pd.to_numeric(frame.get("total_hldr_eqy_exc_min_int", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        risk = (equity_inc.le(0) | equity_exc.le(0)).fillna(False)
+        frames.append(_financial_risk_rows(frame.loc[risk], symbol.loc[risk], "negative_equity_st_risk", target_index))
+    if cashflow is not None and not cashflow.empty:
+        frame = cashflow.copy()
+        symbol = frame.get("symbol", pd.Series(index=frame.index, dtype=object)).astype(str)
+        net_profit = pd.to_numeric(frame.get("net_profit", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        operating_cashflow = pd.to_numeric(frame.get("n_cashflow_act", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        free_cashflow = pd.to_numeric(frame.get("free_cashflow", pd.Series(pd.NA, index=frame.index)), errors="coerce")
+        risk = (net_profit.lt(0) & operating_cashflow.lt(0) & free_cashflow.lt(0)).fillna(False)
+        frames.append(_financial_risk_rows(frame.loc[risk], symbol.loc[risk], "profit_cashflow_st_risk", target_index))
+    non_empty = [frame for frame in frames if frame is not None and not frame.empty]
+    if not non_empty:
+        return pd.DataFrame(columns=["date", "symbol", "risk_reason"])
+    result = pd.concat(non_empty, ignore_index=True)
+    return result.drop_duplicates(["date", "symbol", "risk_reason"]).sort_values(["date", "symbol"]).reset_index(drop=True)
+
+
 def _combine_masks(left: pd.DataFrame | None, right: pd.DataFrame | None) -> pd.DataFrame | None:
     if left is None:
         return right
@@ -712,6 +788,51 @@ def _combine_masks(left: pd.DataFrame | None, right: pd.DataFrame | None) -> pd.
         return left
     right = right.reindex(index=left.index, columns=left.columns).fillna(False).astype(bool)
     return left.fillna(False).astype(bool) | right
+
+
+def _financial_risk_rows(
+    frame: pd.DataFrame,
+    symbol: pd.Series,
+    reason: str,
+    target_index: pd.Index | None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["date", "symbol", "risk_reason"])
+    dates = _financial_effective_dates(frame)
+    if target_index is not None:
+        dates = _align_risk_dates_to_trading_index(dates, target_index)
+    rows = pd.DataFrame({"date": dates, "symbol": symbol.astype(str).to_numpy(), "risk_reason": reason})
+    return rows.dropna(subset=["date", "symbol"])
+
+
+def _financial_effective_dates(frame: pd.DataFrame) -> pd.Series:
+    raw = frame.get("effective_from")
+    if raw is not None:
+        extracted = _extract_yyyymmdd(raw)
+    else:
+        extracted = pd.Series(pd.NA, index=frame.index, dtype=object)
+    fallback = _extract_yyyymmdd(frame.get("ann_date", pd.Series(pd.NA, index=frame.index, dtype=object)))
+    dates = extracted.fillna(fallback)
+    return dates.where(dates.str.len() == 8)
+
+
+def _extract_yyyymmdd(values: pd.Series) -> pd.Series:
+    digits = values.astype(str).str.replace(r"\D", "", regex=True)
+    return digits.str.slice(0, 8).where(digits.str.len() >= 8)
+
+
+def _align_risk_dates_to_trading_index(dates: pd.Series, target_index: pd.Index) -> pd.Series:
+    trading = pd.Series(target_index.astype(str), index=target_index.astype(str))
+    trading_int = pd.to_numeric(trading, errors="coerce").dropna().astype(int).to_numpy()
+    raw = pd.to_numeric(dates, errors="coerce")
+    aligned: list[str | None] = []
+    for value in raw:
+        if pd.isna(value):
+            aligned.append(None)
+            continue
+        pos = int(pd.Index(trading_int).searchsorted(int(value), side="left"))
+        aligned.append(str(trading_int[pos]) if pos < len(trading_int) else None)
+    return pd.Series(aligned, index=dates.index, dtype=object)
 
 
 def open_to_close_returns(open_prices: pd.DataFrame, close_prices: pd.DataFrame) -> pd.DataFrame:
@@ -847,6 +968,7 @@ def _config_to_dict(config: EarningsForecastDriftConfig) -> dict[str, object]:
         "liquidity_window": config.liquidity_window,
         "min_avg_amount": config.min_avg_amount,
         "exclude_st": config.exclude_st,
+        "exclude_st_risk": config.exclude_st_risk,
         "block_limit_up_buys": config.block_limit_up_buys,
         "block_limit_down_sells": config.block_limit_down_sells,
         "block_suspended_trades": config.block_suspended_trades,
