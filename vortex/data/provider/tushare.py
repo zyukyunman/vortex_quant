@@ -5,6 +5,7 @@
 1. 保留已有核心专用 fetch（instruments / calendar / bars / fundamental / events）
 2. 对其余 dataset 统一走 registry 驱动的通用抓取入口 `fetch_dataset`
 3. 默认 datasets 覆盖全部可落盘、可批处理的 Tushare dataset
+4. 对少数 `symbol_range + date` 数据集，在 provider 内部自动比较“日期整批抓”和“股票历史抓”
 
 说明：
 - `bars` / `fundamental` / `events` / `valuation` 是 Vortex 内部稳定 dataset 名
@@ -27,8 +28,10 @@ import pandas as pd
 from vortex.data.provider.tushare_registry import (
     DEFAULT_TUSHARE_PRIORITY_DATASETS,
     DEFAULT_TUSHARE_POINTS,
+    DEFAULT_TUSHARE_INDEX_DAILY_CODES,
     TUSHARE_DATASET_REGISTRY,
     TUSHARE_FUND_MARKETS,
+    TUSHARE_INDEX_DAILY_MARKETS,
     TUSHARE_INDEX_MARKETS,
     TUSHARE_STOCK_EXCHANGES,
     get_default_tushare_datasets,
@@ -100,6 +103,42 @@ def _normalize_date_key(value: object) -> str | None:
     if len(digits) == 4:
         return digits + "0101"
     return None
+
+
+def _normalize_minute_freq(value: str) -> str:
+    """校验并规范 Tushare stk_mins 的 freq 参数。"""
+
+    normalized = value.strip().lower()
+    allowed = {"1min", "5min", "15min", "30min", "60min"}
+    if normalized not in allowed:
+        raise DataError(
+            code="DATA_PROVIDER_INVALID_MINUTE_FREQ",
+            message=f"不支持的 stk_mins freq: {value}",
+            detail={"freq": value, "allowed": sorted(allowed)},
+        )
+    return normalized
+
+
+def _resolve_minute_windows(start: date, end: date, freq: str) -> list[tuple[date, date]]:
+    """按官方单次 8000 行上限，把 stk_mins 请求切成安全时间块。"""
+
+    if start > end:
+        return []
+    chunk_days_by_freq = {
+        "1min": 30,
+        "5min": 120,
+        "15min": 365,
+        "30min": 730,
+        "60min": 730,
+    }
+    chunk_days = chunk_days_by_freq[_normalize_minute_freq(freq)]
+    windows: list[tuple[date, date]] = []
+    cursor = start
+    while cursor <= end:
+        window_end = min(end, cursor + timedelta(days=chunk_days - 1))
+        windows.append((cursor, window_end))
+        cursor = window_end + timedelta(days=1)
+    return windows
 
 
 def _concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -515,6 +554,7 @@ class TushareProvider:
             raw = self._fetch_trade_day_all(
                 str(spec["api"]),
                 trading_days or self.fetch_calendar(market, start, end),
+                api_params=dict(spec.get("date_batch_params") or {}),
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -528,15 +568,36 @@ class TushareProvider:
                 progress_label=canonical,
             )
         elif mode == "symbol_range":
-            raw = self._fetch_symbol_range(
-                str(spec["api"]),
+            selected_mode, selected_api, selected_api_params = self._select_symbol_range_route(
+                canonical,
+                spec,
                 symbols,
                 start,
                 end,
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-                progress_label=canonical,
+                trading_days=trading_days,
+                partition_values=partition_values,
             )
+            if selected_mode == "trade_day_all":
+                raw = self._fetch_trade_day_all(
+                    selected_api,
+                    trading_days,
+                    api_params=selected_api_params,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    progress_label=canonical,
+                )
+            else:
+                raw = self._fetch_symbol_range(
+                    str(spec["api"]),
+                    symbols,
+                    start,
+                    end,
+                    partition_values=partition_values,
+                    api_params=dict(spec.get("symbol_range_params") or {}),
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    progress_label=canonical,
+                )
         elif mode == "symbol_quarter_range":
             raw = self._fetch_symbol_quarter_range(
                 str(spec["api"]),
@@ -554,6 +615,7 @@ class TushareProvider:
                 start,
                 end,
                 str(spec.get("param_name", "index_code")),
+                partition_values=partition_values,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -590,6 +652,7 @@ class TushareProvider:
                 symbols,
                 start,
                 end,
+                freq=str(spec.get("freq") or os.getenv("VORTEX_TUSHARE_STK_MINS_FREQ", "1min")),
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -597,6 +660,14 @@ class TushareProvider:
         elif mode == "realtime_snapshot":
             raw = self._fetch_realtime_snapshot(
                 str(spec["api"]),
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+                progress_label=canonical,
+            )
+        elif mode == "realtime_quote_snapshot":
+            raw = self._fetch_realtime_quote_snapshot(
+                symbols,
+                market=market,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -609,7 +680,14 @@ class TushareProvider:
             )
 
         result = self._normalize_dataset_frame(canonical, raw, start=start, end=end)
-        if symbols and "symbol" in result.columns:
+        if symbols and "symbol" in result.columns and mode in {
+            "trade_day_all",
+            "symbol_once",
+            "symbol_range",
+            "symbol_quarter_range",
+            "pro_bar",
+            "minute_range",
+        }:
             result = result[result["symbol"].isin(symbols)]
         return result
 
@@ -715,15 +793,21 @@ class TushareProvider:
         api_name: str,
         trading_days: list[date],
         *,
+        api_params: dict[str, Any] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
     ) -> pd.DataFrame:
         frames = []
         total_steps = len(trading_days)
+        extra_params = dict(api_params or {})
         for index, day in enumerate(trading_days, start=1):
             self._check_cancel_requested(cancel_check)
-            df = self._call_dataset_api(api_name, trade_date=_to_yyyymmdd(day))
+            df = self._call_dataset_api(
+                api_name,
+                trade_date=_to_yyyymmdd(day),
+                **extra_params,
+            )
             if df is not None and not df.empty:
                 frames.append(df)
             self._emit_loop_progress(
@@ -733,6 +817,67 @@ class TushareProvider:
                 f"{progress_label or api_name} trade_date={_to_yyyymmdd(day)}",
             )
         return _concat_frames(frames)
+
+    def _select_symbol_range_route(
+        self,
+        dataset: str,
+        spec: dict[str, Any],
+        symbols: list[str],
+        start: date,
+        end: date,
+        *,
+        trading_days: list[date],
+        partition_values: list[str] | None = None,
+    ) -> tuple[str, str, dict[str, Any]]:
+        """为 symbol_range + date 数据集选择最省请求数的安全抓法。"""
+        api_name = str(spec["api"])
+        date_batch_api = str(spec.get("date_batch_api") or api_name)
+        date_batch_params = dict(spec.get("date_batch_params") or {})
+
+        if (
+            str(spec.get("partition_by") or "").strip() != "date"
+            or not spec.get("date_batch_supported")
+            or not trading_days
+        ):
+            return "symbol_range", date_batch_api, date_batch_params
+
+        if not symbols:
+            logger.info(
+                "dataset=%s 路径选择: 未提供 symbols，直接走日期整批抓取",
+                dataset,
+            )
+            return "trade_day_all", date_batch_api, date_batch_params
+
+        row_limit = spec.get("date_batch_row_limit")
+        if isinstance(row_limit, int) and row_limit > 0 and len(symbols) > row_limit:
+            logger.info(
+                "dataset=%s 路径选择: 日期整批抓不可用，single_request_limit=%d < symbol_count=%d，回退股票历史抓取",
+                dataset,
+                row_limit,
+                len(symbols),
+            )
+            return "symbol_range", date_batch_api, date_batch_params
+
+        date_batch_requests = len(trading_days)
+        symbol_windows = self._resolve_symbol_range_windows(
+            start,
+            end,
+            partition_values=partition_values,
+        )
+        symbol_range_requests = len(symbols) * len(symbol_windows)
+        selected_mode = (
+            "trade_day_all"
+            if date_batch_requests <= symbol_range_requests
+            else "symbol_range"
+        )
+        logger.info(
+            "dataset=%s 路径选择: date_batch_requests=%d, symbol_range_requests=%d, selected=%s",
+            dataset,
+            date_batch_requests,
+            symbol_range_requests,
+            selected_mode,
+        )
+        return selected_mode, date_batch_api, date_batch_params
 
     def _fetch_symbol_once(
         self,
@@ -767,6 +912,8 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        partition_values: list[str] | None = None,
+        api_params: dict[str, Any] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
@@ -774,7 +921,12 @@ class TushareProvider:
         if not symbols:
             return pd.DataFrame()
         frames = []
-        year_ranges = self._split_by_year(start, end)
+        year_ranges = self._resolve_symbol_range_windows(
+            start,
+            end,
+            partition_values=partition_values,
+        )
+        extra_params = dict(api_params or {})
         total_steps = len(year_ranges) * len(symbols)
         current_step = 0
         for year_start, year_end in year_ranges:
@@ -785,6 +937,7 @@ class TushareProvider:
                     ts_code=symbol,
                     start_date=_to_yyyymmdd(year_start),
                     end_date=_to_yyyymmdd(year_end),
+                    **extra_params,
                 )
                 if df is not None and not df.empty:
                     frames.append(df)
@@ -919,13 +1072,18 @@ class TushareProvider:
         end: date,
         param_name: str,
         *,
+        partition_values: list[str] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
     ) -> pd.DataFrame:
         codes = self._load_index_codes()
         frames = []
-        year_ranges = self._split_by_year(start, end)
+        year_ranges = self._resolve_symbol_range_windows(
+            start,
+            end,
+            partition_values=partition_values,
+        )
         total_steps = len(year_ranges) * len(codes)
         current_step = 0
         for year_start, year_end in year_ranges:
@@ -1050,32 +1208,42 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        freq: str = "1min",
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
     ) -> pd.DataFrame:
         if not symbols:
             return pd.DataFrame()
+        normalized_freq = _normalize_minute_freq(freq)
         frames = []
-        start_text = f"{_to_yyyymmdd(start)} 09:30:00"
-        end_text = f"{_to_yyyymmdd(end)} 15:00:00"
-        total_steps = len(symbols)
-        for index, symbol in enumerate(symbols, start=1):
-            self._check_cancel_requested(cancel_check)
-            df = self._call_dataset_api(
-                "stk_mins",
-                ts_code=symbol,
-                start_date=start_text,
-                end_date=end_text,
-            )
-            if df is not None and not df.empty:
-                frames.append(df)
-            self._emit_loop_progress(
-                progress_callback,
-                index,
-                total_steps,
-                f"{progress_label or 'minute'} {symbol}",
-            )
+        windows = _resolve_minute_windows(start, end, normalized_freq)
+        total_steps = len(symbols) * len(windows)
+        current_step = 0
+        for symbol in symbols:
+            for window_start, window_end in windows:
+                self._check_cancel_requested(cancel_check)
+                df = self._call_dataset_api(
+                    "stk_mins",
+                    ts_code=symbol,
+                    freq=normalized_freq,
+                    start_date=f"{_to_yyyymmdd(window_start)} 09:30:00",
+                    end_date=f"{_to_yyyymmdd(window_end)} 15:00:00",
+                )
+                if df is not None and not df.empty:
+                    frame = df.copy()
+                    frame["freq"] = normalized_freq
+                    frames.append(frame)
+                current_step += 1
+                self._emit_loop_progress(
+                    progress_callback,
+                    current_step,
+                    total_steps,
+                    (
+                        f"{progress_label or 'minute'} {symbol} {normalized_freq} "
+                        f"{window_start:%Y%m%d}-{window_end:%Y%m%d}"
+                    ),
+                )
         return _concat_frames(frames)
 
     def _fetch_realtime_snapshot(
@@ -1097,17 +1265,58 @@ class TushareProvider:
         self._emit_loop_progress(progress_callback, 1, 1, progress_label or api_name)
         return df
 
+    def _fetch_realtime_quote_snapshot(
+        self,
+        symbols: list[str],
+        *,
+        market: str,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        progress_label: str | None = None,
+        batch_size: int = 30,
+    ) -> pd.DataFrame:
+        """Fetch realtime orderbook snapshots in batched symbol lists."""
+
+        if not symbols:
+            symbols = self.fetch_instruments(market)["symbol"].dropna().astype(str).tolist()
+        if not symbols:
+            return pd.DataFrame()
+        frames = []
+        batches = [symbols[idx : idx + batch_size] for idx in range(0, len(symbols), batch_size)]
+        total_steps = len(batches)
+        for index, batch in enumerate(batches, start=1):
+            self._check_cancel_requested(cancel_check)
+            df = self._call_dataset_api("realtime_quote", ts_code=",".join(batch))
+            if df is not None and not df.empty:
+                frames.append(df)
+            self._emit_loop_progress(
+                progress_callback,
+                index,
+                total_steps,
+                f"{progress_label or 'realtime_quote'} batch {index}/{total_steps}",
+            )
+        return _concat_frames(frames)
+
     # ------------------------------------------------------------------
     # 内部缓存
     # ------------------------------------------------------------------
 
     def _load_index_codes(self) -> list[str]:
+        if not (
+            len(DEFAULT_TUSHARE_INDEX_DAILY_CODES) == 1
+            and DEFAULT_TUSHARE_INDEX_DAILY_CODES[0].lower() == "all"
+        ):
+            return list(DEFAULT_TUSHARE_INDEX_DAILY_CODES)
+
         if "index_basic" not in self._frame_cache:
             self._frame_cache["index_basic"] = self._fetch_index_reference("index_basic")
         df = self._frame_cache["index_basic"]
         if df.empty or "ts_code" not in df.columns:
             return []
-        return sorted(df["ts_code"].dropna().astype(str).unique().tolist())
+        if "market" in df.columns:
+            df = df.loc[df["market"].astype(str).isin(TUSHARE_INDEX_DAILY_MARKETS)]
+        codes = sorted(df["ts_code"].dropna().astype(str).unique().tolist())
+        return codes
 
     def _load_member_parent_codes(self, loop_source: str) -> list[str]:
         if loop_source not in self._frame_cache:
@@ -1163,6 +1372,7 @@ class TushareProvider:
         rename_map = {
             "vol": "volume",
         }
+        rename_map.update(dict(spec.get("rename_map") or {}))
         if "symbol" not in result.columns:
             for source in symbol_candidates:
                 if source in result.columns:
@@ -1180,6 +1390,10 @@ class TushareProvider:
                     break
 
         result = result.rename(columns=rename_map)
+        if canonical == "realtime_quote" and "date" in result.columns and "time" in result.columns:
+            result["trade_time"] = result["date"].astype(str) + " " + result["time"].astype(str)
+        if canonical == "stk_mins" and "trade_time" in result.columns:
+            result = self._normalize_minute_time_columns(result)
         if spec.get("partition_by") == "date":
             result = self._coalesce_date_column(
                 result,
@@ -1209,6 +1423,8 @@ class TushareProvider:
 
         if "symbol" in result.columns:
             sort_cols.append("symbol")
+        if "trade_time" in result.columns:
+            sort_cols.append("trade_time")
 
         if sort_cols:
             result = result.sort_values(sort_cols).reset_index(drop=True)
@@ -1255,6 +1471,23 @@ class TushareProvider:
 
         result = df.copy()
         result[target_column] = values
+        return result
+
+    @staticmethod
+    def _normalize_minute_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """从 stk_mins.trade_time 派生标准 date/minute，供 date partition 和日内聚合使用。"""
+
+        result = df.copy()
+        parsed = pd.to_datetime(result["trade_time"], errors="coerce")
+        fallback_dates = result["trade_time"].map(_normalize_date_key)
+        result["date"] = [
+            value.strftime("%Y%m%d") if pd.notna(value) else fallback
+            for value, fallback in zip(parsed, fallback_dates)
+        ]
+        result["minute"] = [
+            value.strftime("%H:%M:%S") if pd.notna(value) else str(raw)[-8:]
+            for value, raw in zip(parsed, result["trade_time"])
+        ]
         return result
 
     # ------------------------------------------------------------------
@@ -1355,6 +1588,13 @@ class TushareProvider:
                     message="当前 tushare 版本不支持 pro_bar",
                 )
             return self._call_with_retry(api_name, self._ts.pro_bar, **kwargs)
+        if api_name == "realtime_quote":
+            if not hasattr(self._ts, "realtime_quote"):
+                raise DataError(
+                    code="DATA_PROVIDER_API_NOT_FOUND",
+                    message="当前 tushare 版本不支持 realtime_quote",
+                )
+            return self._call_with_retry(api_name, self._ts.realtime_quote, **kwargs)
 
         func = getattr(self._api, api_name, None)
         if callable(func):
@@ -1386,6 +1626,27 @@ class TushareProvider:
                 year_end = end
             ranges.append((current, year_end))
             current = date(current.year + 1, 1, 1)
+        return ranges
+
+    @staticmethod
+    def _resolve_symbol_range_windows(
+        start: date,
+        end: date,
+        *,
+        partition_values: list[str] | None = None,
+    ) -> list[tuple[date, date]]:
+        if not partition_values:
+            return TushareProvider._split_by_year(start, end)
+
+        buckets: dict[int, list[date]] = {}
+        for value in partition_values:
+            parsed = _parse_yyyymmdd(value)
+            buckets.setdefault(parsed.year, []).append(parsed)
+
+        ranges: list[tuple[date, date]] = []
+        for year in sorted(buckets):
+            dates = sorted(buckets[year])
+            ranges.append((dates[0], dates[-1]))
         return ranges
 
     @staticmethod

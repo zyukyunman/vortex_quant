@@ -1,0 +1,56 @@
+{
+  "strategy": "earnings_forecast_drift",
+  "date": "2026-04-28",
+  "policy": "核心仓库保留策略卡、测试报告、代表性 HTML 和轻量 JSON；大 CSV 与截图外置到 workspace artifact。",
+  "workspace_root": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28",
+  "external_artifacts": [
+    {
+      "name": "v1_daily_holdings",
+      "type": "csv",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略可交易约束每日持仓.csv",
+      "reason": "每日持仓明细体积较大，适合保存在 workspace。"
+    },
+    {
+      "name": "v2_daily_holdings",
+      "type": "csv",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略v2可交易约束每日持仓.csv",
+      "reason": "每日持仓明细体积较大，适合保存在 workspace。"
+    },
+    {
+      "name": "v3_daily_holdings",
+      "type": "csv",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略v3可交易约束每日持仓.csv",
+      "reason": "每日持仓明细体积较大，适合保存在 workspace。"
+    },
+    {
+      "name": "v3_precise_tradability_daily_holdings",
+      "type": "csv",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略v3精确可交易复核每日持仓.csv",
+      "reason": "全历史 stk_limit/suspend_d 精确复核持仓明细体积较大，适合保存在 workspace。"
+    },
+    {
+      "name": "v3_shadow_20260424_target",
+      "type": "csv",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略shadow跟踪-20260424目标持仓.csv",
+      "reason": "影子跟踪目标持仓属于每日运行产物，适合保存在 workspace。"
+    },
+    {
+      "name": "v1_screenshot",
+      "type": "png",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略可交易约束回测报告截图.png",
+      "reason": "截图可由 HTML 报告再生成，不需要进入核心仓库。"
+    },
+    {
+      "name": "v2_screenshot",
+      "type": "png",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略v2可交易约束回测报告截图.png",
+      "reason": "截图可由 HTML 报告再生成，不需要进入核心仓库。"
+    },
+    {
+      "name": "v3_screenshot",
+      "type": "png",
+      "path": "/Users/zyukyunman/Documents/vortex_workspace/artifacts/strategy_research/earnings_forecast_drift/2026-04-28/2026-04-28-业绩预告漂移策略v3可交易约束回测报告截图.png",
+      "reason": "截图可由 HTML 报告再生成，不需要进入核心仓库。"
+    }
+  ]
+}

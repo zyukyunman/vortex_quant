@@ -1,7 +1,12 @@
 ---
 name: dividend-yield-strategy
-description: '高股息之家"股息率模式"投资策略。Use when: 实现红利/高股息策略、股息率计算、4进3出选股规则、分红可持续性筛选、红利组合构建与再平衡。适用于: dividend yield strategy, high dividend stock selection, 4-in-3-out rule, dividend sustainability screening, income portfolio construction.'
+description: '高股息之家"股息率模式"投资策略。Use when: 实现红利/高股息策略、股息率计算、4进3出选股规则、分红可持续性筛选、红利组合构建与再平衡。'
 argument-hint: '描述股息率策略相关需求，如选股规则实现、股息率计算、组合构建等'
+tags: [vortex, vortex/skill, vortex/strategy-domain]
+obsidian_links:
+  - "[[实例策略开发流程]]"
+  - "[[策略域设计说明书]]"
+  - "[[用户场景与体验增强设计]]"
 ---
 
 # 高股息之家「股息率模式」投资策略

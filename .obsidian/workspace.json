@@ -1,0 +1,228 @@
+{
+  "main": {
+    "id": "f4c54ff9582692c1",
+    "type": "split",
+    "children": [
+      {
+        "id": "e45e7a1d5029ffa7",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "76f7f89d010b1af0",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "docs/因子研究/README.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "README"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "c8ab080d1b9df930",
+    "type": "split",
+    "children": [
+      {
+        "id": "6e2fb8daea94d3b0",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "7fa566dd3df2fa59",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "8c3a01a2365111fd",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "48c8e0ce8337df50",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "137d4f878ac3f36b",
+    "type": "split",
+    "children": [
+      {
+        "id": "4b97a9d166eb01aa",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f5ac5d6ac5f18806",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "docs/策略研究/2026-04-28-业绩预告漂移策略测试报告.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "2026-04-28-业绩预告漂移策略测试报告 的反向链接列表"
+            }
+          },
+          {
+            "id": "04cd6e367d10acf7",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "docs/策略研究/2026-04-28-业绩预告漂移策略测试报告.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "2026-04-28-业绩预告漂移策略测试报告 的出链列表"
+            }
+          },
+          {
+            "id": "b81db0a47871e8b5",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "5c2572bc0c73d0c6",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          },
+          {
+            "id": "640519c524fcb90a",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "docs/策略研究/2026-04-28-业绩预告漂移策略测试报告.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "2026-04-28-业绩预告漂移策略测试报告 的大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "76f7f89d010b1af0",
+  "lastOpenFiles": [
+    "tests/__pycache__/test_research_cogalpha_fitness.cpython-311-pytest-9.0.2.pyc",
+    "tests/__pycache__/test_research_cogalpha_quality.cpython-311-pytest-9.0.2.pyc",
+    "vortex/research/cogalpha/__pycache__/reports.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/schema.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/quality.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/fitness.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/agent_catalog.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/__init__.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__",
+    "tests/__pycache__/test_research_cogalpha_schema.cpython-311-pytest-9.0.2.pyc",
+    "tests/test_research_cogalpha_fitness.py",
+    "docs/论文/CogAlpha/CogAlpha因子研究落地路线.md",
+    "docs/论文/CogAlpha/CogAlpha Quality Gate与Fitness规范.md",
+    "docs/论文/CogAlpha/CogAlpha Agent体系设计.md",
+    "docs/因子研究/外部Alpha资料线索.md",
+    "docs/因子研究/README.md",
+    "docs/因子研究/因子研究档案规范.md",
+    "docs/因子研究/因子实验总表.md",
+    "docs/论文/README.md",
+    "docs/论文/CogAlpha/README.md",
+    "docs/论文/CogAlpha/CogAlpha完整中文译文.md",
+    "docs/论文/CogAlpha/CogAlpha与Vortex落地讨论.md",
+    "docs/论文/CogAlpha/CogAlpha课堂讲义.md",
+    "docs/因子研究/CogAlpha论文中文精读.md",
+    "docs/因子研究/CogAlpha与Vortex因子研究映射.md",
+    "docs/因子研究/实验档案/九转与筹码因子.md",
+    "docs/策略研究/策略组合研究框架.md",
+    "docs/因子研究/101因子全库研究路线.md",
+    "docs/因子研究/因子方法论与多周期组合.md",
+    "docs/因子研究/实验档案/峰岭谷成交量结构因子.md",
+    "docs/因子研究/实验档案/动量与101量价因子.md",
+    "docs/因子研究/因子族/事件因子.md",
+    "docs/因子研究/实验档案/集合竞价因子.md",
+    "docs/因子研究/因子评价框架.md",
+    "docs/因子研究/因子族/资金流因子.md",
+    "docs/因子研究/实验档案/红利与自由现金流因子线索.md",
+    "docs/策略研究/2026-04-28-业绩预告漂移策略v3可交易约束回测报告截图.png",
+    "docs/策略研究/2026-04-28-业绩预告漂移策略v2可交易约束回测报告截图.png",
+    "docs/策略研究/2026-04-28-业绩预告漂移策略可交易约束回测报告截图.png"
+  ]
+}

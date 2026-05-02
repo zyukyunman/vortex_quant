@@ -26,6 +26,8 @@ logger = get_logger(__name__)
 
 DEFAULT_WORKSPACE = "~/Documents/vortex_workspace"
 DEFAULT_DATA_PROFILE_NAME = "default"
+DEFAULT_WORKDAY_UPDATE_FREQUENCIES = ["daily", "intraday"]
+DEFAULT_WEEKEND_UPDATE_FREQUENCIES = ["weekly", "monthly", "quarterly", "other"]
 
 
 class InitCancelled(Exception):
@@ -458,10 +460,27 @@ def _print_cron_help() -> None:
     """打印 Cron 表达式的最小必要说明。"""
     print("  Cron 是 5 段格式：分 时 日 月 周")
     print("  例如：")
-    print("    - 0 18 * * 1-5 = 每个交易日 18:00")
-    print("    - 0 21 * * 1-5 = 每个交易日 21:00")
+    print("    - 0 18 * * *   = 每天 18:00")
+    print("    - 0 21 * * *   = 每天 21:00")
     print("    - 0 6 * * *    = 每天 06:00")
     print("  记忆方式：* 表示“每”，1-5 表示周一到周五")
+
+
+def _resolve_init_schedule_choice(choice: str) -> str | None:
+    """把 init 向导中的快捷选项映射为真正写入 profile 的 cron。
+
+    这里故意把默认选项都映射成“每天触发”：
+    - 工作日会由 `data update` 默认只跑 daily/intraday
+    - 周末会由 `data update` 默认只跑 weekly/monthly/quarterly/other
+
+    如果这里仍写成 `1-5`，周末桶就永远不会被自动调度到。
+    """
+    schedule_map = {
+        "1": "0 18 * * *",
+        "2": "0 21 * * *",
+        "3": "0 6 * * *",
+    }
+    return schedule_map.get(choice)
 
 
 def _build_default_data_config(
@@ -532,9 +551,34 @@ def _tail_text_file(path: Path, max_lines: int = 10) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def _refresh_latest_log_links(log_path: Path) -> None:
+    """刷新日志目录下的 latest 软链接，便于快速定位当前最新日志。"""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    aliases = [log_path.parent / "latest.log"]
+
+    stem = log_path.stem
+    if "-" in stem:
+        prefix = stem.rsplit("-", 1)[0]
+        if prefix and prefix != "latest":
+            aliases.append(log_path.parent / f"{prefix}-latest.log")
+
+    for alias in aliases:
+        try:
+            if alias.exists() or alias.is_symlink():
+                alias.unlink()
+            alias.symlink_to(log_path.name)
+        except OSError as exc:
+            logger.warning(
+                "刷新 latest 日志软链接失败: alias=%s target=%s error=%s",
+                alias,
+                log_path,
+                exc,
+            )
+
+
 def _launch_background_process(command: list[str], log_path: Path) -> subprocess.Popen:
     """以 detached 子进程方式后台启动命令，并把 stdout/stderr 落到日志。"""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _refresh_latest_log_links(log_path)
     with open(log_path, "ab") as log_file:
         return subprocess.Popen(
             command,
@@ -570,6 +614,84 @@ def _parse_dataset_override(raw: str | None) -> list[str]:
         return []
     tokens = [token.strip() for token in raw.split(",")]
     return [token for token in tokens if token]
+
+
+def _normalize_full_dataset_scope(
+    root: Path,
+    profile_name: str,
+    datasets: list[str] | None,
+) -> list[str]:
+    """把“显式全量 dataset 列表”折叠回默认全量语义。
+
+    典型场景是 init 里的“首次数据更新”：
+    用户在交互界面里勾选了全部 dataset，本意仍然是“跑一次完整 bootstrap”。
+    如果控制面继续把它记成 `bootstrap;datasets=...`，就会和普通 `bootstrap`
+    变成两个 resource_key，导致同一份全量任务无法去重。
+    """
+    normalized = sorted({item.strip() for item in (datasets or []) if item.strip()})
+    if not normalized:
+        return []
+
+    try:
+        from vortex.config.profile.resolver import ProfileResolver
+        from vortex.config.profile.store import ProfileStore
+        from vortex.runtime.workspace import Workspace
+        from vortex.shared.errors import ConfigError
+
+        ws = Workspace(root)
+        store = ProfileStore(ws.profiles_dir)
+        resolver = ProfileResolver(store)
+        profile, _ = resolver.resolve(profile_name, "data")
+    except (ConfigError, FileNotFoundError):
+        return normalized
+
+    effective = sorted(
+        {item.strip() for item in profile.effective_datasets if item.strip()}
+    )
+    if normalized == effective:
+        return []
+    return normalized
+
+
+def _parse_update_frequency_override(raw: str | None) -> list[str]:
+    """解析逗号分隔的更新频率过滤条件。"""
+    if raw is None:
+        return []
+
+    from vortex.data.provider.tushare_registry import normalize_tushare_update_frequencies
+
+    tokens = [token.strip() for token in raw.split(",")]
+    return normalize_tushare_update_frequencies([token for token in tokens if token])
+
+
+def _resolve_update_frequency_scope(
+    action: str,
+    datasets: list[str] | None,
+    update_frequencies: list[str] | None,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """解析本次 data 命令真正要跑的频率子集。
+
+    规则：
+    1. 显式 `--frequencies` 优先
+    2. 显式 `--datasets` 时，不再自动追加频率过滤
+    3. `data update` 默认按自然日分桶：
+       - 工作日：daily + intraday
+       - 周末：weekly + monthly + quarterly + other
+    4. 其余动作（bootstrap / backfill / repair / publish）默认不加频率过滤
+    """
+    if update_frequencies:
+        return list(update_frequencies)
+    if datasets:
+        return []
+    if action != "update":
+        return []
+
+    current = now or datetime.now()
+    if current.weekday() < 5:
+        return list(DEFAULT_WORKDAY_UPDATE_FREQUENCIES)
+    return list(DEFAULT_WEEKEND_UPDATE_FREQUENCIES)
 
 
 def _parse_data_filters(raw_filters: list[str] | None) -> dict[str, object]:
@@ -971,16 +1093,31 @@ def _format_progress_bar(current: int, total: int, width: int = 18) -> str:
 def _build_data_task_action(
     action: str,
     *,
+    datasets: list[str] | None = None,
+    update_frequencies: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     as_of: str | None = None,
 ) -> str:
     """构造 task_queue 的 action/resource_key，区分不同范围任务。"""
+    scope_parts: list[str] = []
+    if datasets:
+        dataset_scope = sorted({item.strip() for item in datasets if item.strip()})
+        if dataset_scope:
+            scope_parts.append(f"datasets={','.join(dataset_scope)}")
+    if update_frequencies:
+        scope_parts.append(f"frequencies={','.join(update_frequencies)}")
+
     if action in {"backfill", "repair"} and start and end:
-        return f"{action}:{start}-{end}"
-    if action == "publish" and as_of:
-        return f"publish:{as_of}"
-    return action
+        action_key = f"{action}:{start}-{end}"
+    elif action == "publish" and as_of:
+        action_key = f"publish:{as_of}"
+    else:
+        action_key = action
+
+    if scope_parts:
+        return f"{action_key};{';'.join(scope_parts)}"
+    return action_key
 
 
 def _build_data_background_command(
@@ -991,6 +1128,7 @@ def _build_data_background_command(
     task_id: str,
     run_id: str,
     datasets: list[str] | None = None,
+    update_frequencies: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     as_of: str | None = None,
@@ -1019,6 +1157,8 @@ def _build_data_background_command(
         command.append("--verbose")
     if datasets:
         command.extend(["--datasets", ",".join(datasets)])
+    if update_frequencies:
+        command.extend(["--frequencies", ",".join(update_frequencies)])
     if start:
         command.extend(["--start", start])
     if end:
@@ -1034,7 +1174,9 @@ def _submit_data_background_task(
     profile_name: str,
     action: str,
     fmt: str,
+    emit_output: bool = True,
     datasets: list[str] | None = None,
+    update_frequencies: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     as_of: str | None = None,
@@ -1048,6 +1190,7 @@ def _submit_data_background_task(
 
     ws = Workspace(root)
     ws.ensure_initialized()
+    datasets = _normalize_full_dataset_scope(root, profile_name, datasets)
 
     db = Database(ws.db_path)
     db.initialize_tables()
@@ -1055,6 +1198,8 @@ def _submit_data_background_task(
 
     action_key = _build_data_task_action(
         action,
+        datasets=datasets,
+        update_frequencies=update_frequencies,
         start=start,
         end=end,
         as_of=as_of,
@@ -1079,8 +1224,9 @@ def _submit_data_background_task(
                 "pid": getattr(progress, "pid", None),
             }
             if fmt == "json":
-                _print_result(payload, fmt)
-            else:
+                if emit_output:
+                    _print_result(payload, fmt)
+            elif emit_output:
                 print("ℹ️  已存在同类运行中的任务，复用现有任务")
                 print(f"   task_id: {payload['task_id']}")
                 print(f"   run_id: {payload['run_id']}")
@@ -1102,6 +1248,7 @@ def _submit_data_background_task(
             task_id=task_id,
             run_id=run_id,
             datasets=datasets,
+            update_frequencies=update_frequencies,
             start=start,
             end=end,
             as_of=as_of,
@@ -1131,8 +1278,9 @@ def _submit_data_background_task(
             "log_path": str(log_path),
         }
         if fmt == "json":
-            _print_result(payload, fmt)
-        else:
+            if emit_output:
+                _print_result(payload, fmt)
+        elif emit_output:
             print("🚀 已提交后台任务")
             print(f"   task_id: {task_id}")
             print(f"   run_id: {run_id}")
@@ -1444,23 +1592,19 @@ def cmd_init(args: argparse.Namespace) -> None:
             enable_schedule = _prompt_yes_no("是否启用每日自动更新？", default=False)
             if enable_schedule:
                 print("  选择更新时间:")
-                print("  1. 每个交易日 18:00（推荐，收盘后）")
-                print("  2. 每个交易日 21:00")
+                print("  1. 每天 18:00（推荐；工作日跑日频，周末跑低频）")
+                print("  2. 每天 21:00")
                 print("  3. 每天 06:00（含非交易日）")
                 print("  4. 自定义 Cron 表达式")
                 _print_cron_help()
                 choice = _prompt("请选择", "1")
-                schedule_map = {
-                    "1": "0 18 * * 1-5",
-                    "2": "0 21 * * 1-5",
-                    "3": "0 6 * * *",
-                }
-                if choice in schedule_map:
-                    config["schedule"] = schedule_map[choice]
+                schedule = _resolve_init_schedule_choice(choice)
+                if schedule:
+                    config["schedule"] = schedule
                 else:
                     print("  请输入自定义 Cron。")
                     _print_cron_help()
-                    cron = _prompt("Cron 表达式（例如 0 18 * * 1-5）", "0 18 * * 1-5")
+                    cron = _prompt("Cron 表达式（例如 0 18 * * *）", "0 18 * * *")
                     config["schedule"] = cron
             print()
 
@@ -1602,18 +1746,46 @@ def _run_initial_bootstrap(root: Path, profile_name: str, datasets: list[str]) -
     print(f"   数据集: {_format_selection_summary(datasets)}")
 
 
-def _apply_dataset_override(profile, datasets: list[str]):
-    """用 CLI 传入的数据集列表覆盖 profile。"""
+def _apply_dataset_override(
+    profile,
+    datasets: list[str],
+    update_frequencies: list[str] | None = None,
+    *,
+    frequency_resolver=None,
+):
+    """用 CLI 传入的数据集 / 更新频率覆盖 profile。"""
     import dataclasses
 
-    if not datasets:
+    update_frequencies = list(update_frequencies or [])
+    if not datasets and not update_frequencies:
         return profile
+
+    selected_datasets = list(datasets) if datasets else list(profile.effective_datasets)
+    if update_frequencies:
+        if frequency_resolver is None:
+            raise ValueError("缺少 frequency_resolver，无法按更新频率筛选数据集")
+        allowed = set(update_frequencies)
+        selected_datasets = [
+            dataset
+            for dataset in selected_datasets
+            if str(frequency_resolver(dataset) or "other").strip().lower() in allowed
+        ]
+
+    priority_datasets = (
+        [dataset for dataset in datasets if dataset in selected_datasets]
+        if datasets
+        else [
+            dataset
+            for dataset in profile.priority_datasets
+            if dataset in selected_datasets
+        ]
+    )
 
     return dataclasses.replace(
         profile,
-        datasets=list(datasets),
+        datasets=selected_datasets,
         exclude_datasets=[],
-        priority_datasets=list(datasets),
+        priority_datasets=priority_datasets,
     )
 
 
@@ -2083,6 +2255,18 @@ def cmd_data(args: argparse.Namespace) -> None:
     profile_name = _resolve_data_profile_name(getattr(args, "profile", None))
     dry_run = getattr(args, "dry_run", False)
     datasets_override = _parse_dataset_override(getattr(args, "datasets", None))
+    try:
+        update_frequencies = _parse_update_frequency_override(
+            getattr(args, "frequencies", None)
+        )
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    effective_update_frequencies = _resolve_update_frequency_scope(
+        args.data_action,
+        datasets_override,
+        update_frequencies,
+    )
 
     if args.data_action == "status":
         if getattr(args, "watch", False):
@@ -2163,6 +2347,7 @@ def cmd_data(args: argparse.Namespace) -> None:
             action=args.data_action,
             fmt=fmt,
             datasets=datasets_override,
+            update_frequencies=effective_update_frequencies,
             start=start_str,
             end=end_str,
             as_of=as_of_str,
@@ -2387,7 +2572,23 @@ def cmd_data(args: argparse.Namespace) -> None:
             progress_callback=_emit_task_progress,
             cancel_check=_cancel_check,
         )
-        profile = _apply_dataset_override(profile, datasets_override)
+        frequency_resolver = getattr(
+            pipeline,
+            "_dataset_update_frequency",
+            lambda _dataset: "other",
+        )
+        profile = _apply_dataset_override(
+            profile,
+            datasets_override,
+            effective_update_frequencies,
+            frequency_resolver=frequency_resolver,
+        )
+        if (
+            args.data_action in {"bootstrap", "update", "backfill", "repair"}
+            and not profile.effective_datasets
+        ):
+            print("❌ 当前数据集筛选条件没有匹配到任何 dataset", file=sys.stderr)
+            sys.exit(1)
 
         result = None
         match args.data_action:
@@ -2541,6 +2742,558 @@ def _print_result(result: dict, fmt: str) -> None:
                 print(f"  {key}: {value}")
 
 
+def cmd_strategy(args: argparse.Namespace) -> None:
+    """策略研究与候选策略复核入口。"""
+
+    if args.strategy_action != "earnings-forecast":
+        raise SystemExit(f"未知 strategy 子命令: {args.strategy_action}")
+    if args.earnings_action not in {
+        "precise-review",
+        "shadow-plan",
+        "live-handoff",
+        "opening-liquidity-review",
+        "auction-execution-review",
+    }:
+        raise SystemExit(f"未知 earnings-forecast 子命令: {args.earnings_action}")
+
+    from vortex.strategy.earnings_forecast_runner import (
+        DEFAULT_AUCTION_EXECUTION_LABEL,
+        DEFAULT_LIVE_HANDOFF_LABEL,
+        DEFAULT_OPENING_LIQUIDITY_LABEL,
+        DEFAULT_REVIEW_LABEL,
+        DEFAULT_SHADOW_LABEL,
+        run_opening_auction_execution_review,
+        run_opening_liquidity_review,
+        run_earnings_forecast_live_handoff,
+        run_earnings_forecast_shadow_plan,
+        run_precise_earnings_forecast_review,
+    )
+
+    if args.earnings_action == "opening-liquidity-review":
+        artifacts = run_opening_liquidity_review(
+            Path(args.root).expanduser(),
+            opening_snapshot_path=Path(args.opening_snapshots).expanduser(),
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            label=args.label or DEFAULT_OPENING_LIQUIDITY_LABEL,
+            top_n_values=_parse_int_csv(args.top_n_values),
+            position_modes=_parse_str_csv(args.position_modes),
+            portfolio_notional=float(args.portfolio_notional),
+            capped_max_weight=float(args.capped_max_weight),
+            volume_unit=args.volume_unit,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告开盘卖一容量复核完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  CSV: {artifacts.csv_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        best_variant = artifacts.summary.get("best_variant") or {}
+        if isinstance(best_variant, dict) and best_variant:
+            print(
+                "  最优变体: "
+                f"{best_variant.get('variant')}，"
+                f"一手可成交率 {float(best_variant.get('one_lot_feasible_rate', 0.0)) * 100:.2f}%，"
+                f"目标覆盖率 {float(best_variant.get('covered_shares_ratio', 0.0)) * 100:.2f}%"
+            )
+        return
+
+    if args.earnings_action == "shadow-plan":
+        artifacts = run_earnings_forecast_shadow_plan(
+            Path(args.root).expanduser(),
+            start=args.start,
+            as_of=args.as_of,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_SHADOW_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告影子跟踪计划已生成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  HTML: {artifacts.html_path}")
+        print(f"  目标持仓: {artifacts.target_path}")
+        print(
+            "  摘要: "
+            f"目标仓位 {float(artifacts.summary['exposure']) * 100:.2f}%, "
+            f"持仓 {artifacts.summary['holding_count']} 只, "
+            f"调仓 {artifacts.summary['trade_count']} 只"
+        )
+        return
+
+    if args.earnings_action == "live-handoff":
+        artifacts = run_earnings_forecast_live_handoff(
+            Path(args.root).expanduser(),
+            start=args.start,
+            as_of=args.as_of,
+            qmt_bridge_url=args.qmt_bridge_url,
+            qmt_bridge_token=args.qmt_bridge_token,
+            qmt_account_id=args.qmt_account_id,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_LIVE_HANDOFF_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告实盘交接包已生成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  HTML: {artifacts.html_path}")
+        print(f"  目标持仓: {artifacts.target_path}")
+        print(f"  QMT 就绪: {'yes' if bool(artifacts.summary['qmt_ready']) else 'no'}")
+        if artifacts.summary.get("blocking_reasons"):
+            print("  阻断:")
+            for item in artifacts.summary["blocking_reasons"]:
+                print(f"    - {item}")
+        return
+
+    if args.earnings_action == "auction-execution-review":
+        artifacts = run_opening_auction_execution_review(
+            Path(args.root).expanduser(),
+            opening_snapshot_path=Path(args.opening_snapshots).expanduser(),
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_AUCTION_EXECUTION_LABEL,
+            top_n=int(args.top_n),
+            position_mode=args.position_mode,
+            portfolio_notional=float(args.portfolio_notional),
+            capped_max_weight=float(args.capped_max_weight),
+            volume_unit=args.volume_unit,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告开盘竞价可靠性回测完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  HTML: {artifacts.html_path}")
+        print(f"  持仓: {artifacts.holdings_path}")
+        print(f"  交易: {artifacts.trades_path}")
+        print(f"  买单意图: {artifacts.order_intents_path}")
+        execution_summary = artifacts.summary.get("auction_execution_summary") or {}
+        if isinstance(execution_summary, dict) and execution_summary:
+            print(
+                "  摘要: "
+                f"买单完全成交率 {float(execution_summary.get('filled_order_rate', 0.0)) * 100:.2f}%, "
+                f"股数执行率 {float(execution_summary.get('executed_shares_ratio', 0.0)) * 100:.2f}%"
+            )
+        return
+
+    costs = _parse_float_csv(args.costs) if getattr(args, "costs", None) else None
+    artifacts = run_precise_earnings_forecast_review(
+        Path(args.root).expanduser(),
+        start=args.start,
+        end=args.end,
+        output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+        artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+        label=args.label or DEFAULT_REVIEW_LABEL,
+        cost_grid=costs if costs is not None else (0.0, 10.0, 20.0, 30.0, 50.0, 80.0, 100.0),
+        portfolio_notional=float(args.portfolio_notional),
+        require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+    )
+    if args.format == "json":
+        print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2))
+        return
+    print("业绩预告精确可交易复核完成")
+    print(f"  JSON: {artifacts.json_path}")
+    print(f"  HTML: {artifacts.html_path}")
+    print(f"  持仓: {artifacts.holdings_path}")
+    metrics = artifacts.summary["metrics"]
+    if isinstance(metrics, dict):
+        print(
+            "  指标: "
+            f"年化 {float(metrics['annual_return']) * 100:.2f}%, "
+            f"最大回撤 {float(metrics['max_drawdown']) * 100:.2f}%"
+        )
+
+
+def _trade_status_summary(
+    root: Path,
+    *,
+    bridge_url: str | None = None,
+    bridge_token: str | None = None,
+    bridge_account_id: str | None = None,
+) -> dict[str, object]:
+    """Return a read-only summary of local Trade artifacts."""
+
+    trade_root = root.expanduser() / "trade"
+    executions_root = trade_root / "executions"
+    execution_dirs = sorted([path for path in executions_root.glob("*") if path.is_dir()]) if executions_root.exists() else []
+    latest = execution_dirs[-1].name if execution_dirs else None
+    payload: dict[str, object] = {
+        "workspace": str(root.expanduser()),
+        "trade_root": str(trade_root),
+        "execution_count": len(execution_dirs),
+        "latest_exec_id": latest,
+        "paper_ready": True,
+        "qmt_ready": False,
+        "qmt_blocking_reason": "Windows VM / QMT / bridge POC not connected",
+    }
+    if not bridge_url:
+        return payload
+    payload.update(
+        {
+            "qmt_bridge_url": bridge_url,
+            "qmt_account_id": bridge_account_id or "",
+        }
+    )
+    from vortex.trade import QmtBridgeAdapter, QmtBridgeConfig, is_known_connection_status_bug
+
+    adapter = QmtBridgeAdapter(
+        QmtBridgeConfig(
+            base_url=bridge_url,
+            token=bridge_token,
+            account_id=bridge_account_id or None,
+            allow_trading=False,
+        )
+    )
+    health = adapter.health()
+    payload["qmt_health"] = {"ok": health.ok, "message": health.message}
+    if not health.ok:
+        payload["qmt_blocking_reason"] = f"bridge health failed: {health.message}"
+        return payload
+    try:
+        connection = adapter.connection_status()
+        cash = adapter.get_cash()
+        positions = adapter.get_positions()
+        orders = adapter.get_orders()
+        fills = adapter.get_fills()
+    except Exception as exc:  # noqa: BLE001 - status command should surface failure in payload.
+        payload["qmt_blocking_reason"] = f"bridge read failed: {exc}"
+        return payload
+    payload.update(
+        {
+            "qmt_connection_status": connection,
+            "qmt_cash": cash.available_cash,
+            "qmt_market_value": cash.market_value,
+            "qmt_position_count": len(positions),
+            "qmt_order_count": len(orders),
+            "qmt_fill_count": len(fills),
+            "qmt_ready": True,
+            "qmt_blocking_reason": "-",
+        }
+    )
+    if isinstance(connection, dict) and connection.get("connected") is False:
+        if is_known_connection_status_bug(connection):
+            payload["qmt_connection_status_warning"] = (
+                "bridge connection_status endpoint uses incompatible xtdata API; "
+                "treated as non-blocking because cash/positions/orders/fills are readable"
+            )
+        else:
+            payload["qmt_ready"] = False
+            payload["qmt_blocking_reason"] = f"bridge connected=false: {connection}"
+    return payload
+
+
+def _trade_quote_summary(
+    root: Path,
+    *,
+    symbols: tuple[str, ...],
+    bridge_url: str | None = None,
+    bridge_token: str | None = None,
+    bridge_account_id: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "root": str(root.expanduser()),
+        "symbols": list(symbols),
+        "qmt_ready": False,
+        "qmt_blocking_reason": "-",
+        "qmt_health": {"ok": False, "message": "未探测"},
+        "quotes": {},
+    }
+    if not symbols:
+        raise ValueError("symbols 不能为空")
+    if not bridge_url:
+        payload["qmt_blocking_reason"] = "缺少 --qmt-bridge-url"
+        return payload
+
+    from vortex.trade import QmtBridgeAdapter, QmtBridgeConfig
+
+    adapter = QmtBridgeAdapter(
+        QmtBridgeConfig(
+            base_url=bridge_url,
+            token=bridge_token,
+            account_id=bridge_account_id or None,
+            allow_trading=False,
+        )
+    )
+    health = adapter.health()
+    payload["qmt_health"] = {"ok": health.ok, "message": health.message}
+    if not health.ok:
+        payload["qmt_blocking_reason"] = f"bridge health failed: {health.message}"
+        return payload
+    try:
+        quotes = adapter.get_quotes(list(symbols))
+    except Exception as exc:  # noqa: BLE001 - quote command should surface failure in payload.
+        payload["qmt_blocking_reason"] = f"bridge quote failed: {exc}"
+        return payload
+    payload["quotes"] = {
+        symbol: {
+            "open_price": quote.open_price,
+            "last_price": quote.last_price,
+            "volume": quote.volume,
+            "amount": quote.amount,
+            "is_suspended": quote.is_suspended,
+            "is_limit_up": quote.is_limit_up,
+            "is_limit_down": quote.is_limit_down,
+        }
+        for symbol, quote in quotes.items()
+    }
+    payload["qmt_ready"] = True
+    return payload
+
+
+def _trade_execution_report_path(root: Path, exec_id: str | None) -> Path:
+    root = root.expanduser()
+    if exec_id:
+        return root / "trade" / "executions" / exec_id / "execution_report.json"
+    latest = _trade_status_summary(root)["latest_exec_id"]
+    if not latest:
+        raise FileNotFoundError("没有可 inspect/reconcile 的 trade execution")
+    return root / "trade" / "executions" / str(latest) / "execution_report.json"
+
+
+def _read_trade_quotes(path: Path):
+    from vortex.trade import Quote
+    from vortex.trade.serialization import read_json
+
+    raw = read_json(path.expanduser())
+    rows = raw.get("quotes", raw) if isinstance(raw, dict) else raw
+    if not isinstance(rows, list):
+        raise ValueError("quotes JSON 必须是列表，或包含 quotes 列表字段")
+    quotes = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("quotes JSON 每一项必须是对象")
+        quotes.append(
+            Quote(
+                symbol=str(row["symbol"]),
+                open_price=float(row["open_price"]),
+                last_price=float(row["last_price"]) if row.get("last_price") is not None else None,
+                volume=int(row["volume"]) if row.get("volume") is not None else None,
+                amount=float(row["amount"]) if row.get("amount") is not None else None,
+                is_suspended=bool(row.get("is_suspended", False)),
+                is_limit_up=bool(row.get("is_limit_up", False)),
+                is_limit_down=bool(row.get("is_limit_down", False)),
+            )
+        )
+    return quotes
+
+
+def _read_trade_st_flags(path: Path | None) -> dict[str, bool] | None:
+    if path is None:
+        return None
+    from vortex.trade.serialization import read_json
+
+    raw = read_json(path.expanduser())
+    if isinstance(raw, dict) and "st_flags" in raw:
+        raw = raw["st_flags"]
+    if isinstance(raw, dict):
+        return {str(symbol): bool(flag) for symbol, flag in raw.items()}
+    if isinstance(raw, list):
+        flags: dict[str, bool] = {}
+        for row in raw:
+            if not isinstance(row, dict):
+                raise ValueError("st_flags JSON 列表每一项必须是对象")
+            flags[str(row["symbol"])] = bool(row.get("is_st", row.get("st", False)))
+        return flags
+    raise ValueError("st_flags JSON 必须是 symbol->bool 对象、列表，或包含 st_flags 字段")
+
+
+def _run_trade_paper_rebalance(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade import PaperBrokerAdapter, PaperBrokerConfig
+    from vortex.trade.execution import run_paper_rebalance
+    from vortex.trade.order_plan import OrderPlanConfig
+    from vortex.trade.risk import PreTradeRiskConfig
+    from vortex.trade.serialization import read_json, target_portfolio_from_dict
+
+    portfolio = target_portfolio_from_dict(read_json(Path(args.target_portfolio).expanduser()))
+    quotes = _read_trade_quotes(Path(args.quotes))
+    st_flags = _read_trade_st_flags(Path(args.st_flags).expanduser() if args.st_flags else None)
+    broker = PaperBrokerAdapter(
+        PaperBrokerConfig(
+            initial_cash=float(args.initial_cash),
+            commission_bps=float(args.commission_bps),
+            min_commission=float(args.min_commission),
+            stamp_duty_sell_bps=float(args.stamp_duty_sell_bps),
+            max_participation_rate=float(args.max_participation_rate),
+            allow_trading=not bool(args.disable_trading),
+        )
+    )
+    artifacts = run_paper_rebalance(
+        portfolio,
+        broker=broker,
+        quotes=quotes,
+        output_root=Path(args.root).expanduser(),
+        st_flags=st_flags,
+        order_config=OrderPlanConfig(
+            buy_limit_bps=float(args.buy_limit_bps),
+            sell_limit_bps=float(args.sell_limit_bps),
+            min_order_value=float(args.min_order_value),
+        ),
+        risk_config=PreTradeRiskConfig(
+            mode="paper",
+            require_st_data=not bool(args.allow_missing_st_data),
+            max_order_count=int(args.max_order_count),
+            max_single_order_value=float(args.max_single_order_value),
+            max_daily_order_value=float(args.max_daily_order_value),
+        ),
+    )
+    report = artifacts.report
+    return {
+        "exec_id": artifacts.exec_id,
+        "risk_passed": report.risk_result.passed,
+        "blocking_reasons": report.risk_result.blocking_reasons,
+        "order_count": len(report.orders),
+        "fill_count": len(report.fills),
+        "cash": report.cash.available_cash,
+        "market_value": report.cash.market_value,
+        "order_intent_path": str(artifacts.order_intent_path),
+        "order_plan_path": str(artifacts.order_plan_path),
+        "risk_result_path": str(artifacts.risk_result_path),
+        "execution_report_path": str(artifacts.execution_report_path),
+        "execution_report_md_path": str(artifacts.execution_report_md_path),
+    }
+
+
+def _trade_inspect_summary(root: Path, exec_id: str | None = None) -> dict[str, object]:
+    from vortex.trade.serialization import execution_report_from_dict, read_json
+
+    path = _trade_execution_report_path(root, exec_id)
+    report = execution_report_from_dict(read_json(path))
+    return {
+        "exec_id": report.exec_id,
+        "mode": report.mode,
+        "trade_date": report.trade_date,
+        "portfolio_id": report.portfolio_id,
+        "risk_passed": report.risk_result.passed,
+        "blocking_reasons": report.risk_result.blocking_reasons,
+        "warnings": report.risk_result.warnings,
+        "order_count": len(report.orders),
+        "fill_count": len(report.fills),
+        "position_count": len(report.positions),
+        "cash": report.cash.available_cash,
+        "market_value": report.cash.market_value,
+        "unfilled_summary": report.unfilled_summary,
+        "slippage_summary": report.slippage_summary,
+        "execution_report_path": str(path),
+    }
+
+
+def _run_trade_reconcile(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade.reconcile import reconcile_execution_report, write_reconcile_report
+    from vortex.trade.serialization import execution_report_from_dict, read_json
+
+    path = _trade_execution_report_path(Path(args.root), args.exec_id)
+    report = execution_report_from_dict(read_json(path))
+    reconcile = reconcile_execution_report(
+        report,
+        cash_tolerance=float(args.cash_tolerance),
+        share_tolerance=int(args.share_tolerance),
+    )
+    reconcile_path = path.parent / "reconcile_report.json"
+    write_reconcile_report(reconcile_path, reconcile)
+    return {
+        "reconcile_id": reconcile.reconcile_id,
+        "exec_id": reconcile.exec_id,
+        "abnormal": reconcile.abnormal,
+        "cash_diff": reconcile.cash_diff,
+        "position_diff_count": len(reconcile.position_diffs),
+        "order_diff_count": len(reconcile.order_diffs),
+        "fill_diff_count": len(reconcile.fill_diffs),
+        "blocking_reasons": reconcile.blocking_reasons,
+        "reconcile_report_path": str(reconcile_path),
+    }
+
+
+def _print_trade_dict(title: str, payload: dict[str, object]) -> None:
+    print(title)
+    for key, value in payload.items():
+        if isinstance(value, bool):
+            value = "yes" if value else "no"
+        elif isinstance(value, list):
+            value = ", ".join(str(item) for item in value) if value else "-"
+        elif isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False)
+        elif value is None:
+            value = "-"
+        print(f"  {key}: {value}")
+
+
+def cmd_trade(args: argparse.Namespace) -> None:
+    """交易执行入口。"""
+
+    if args.trade_action == "status":
+        payload = _trade_status_summary(
+            Path(args.root),
+            bridge_url=getattr(args, "qmt_bridge_url", None),
+            bridge_token=getattr(args, "qmt_bridge_token", None),
+            bridge_account_id=getattr(args, "qmt_account_id", None),
+        )
+        title = "Trade 状态"
+    elif args.trade_action == "quote":
+        payload = _trade_quote_summary(
+            Path(args.root),
+            symbols=_parse_str_csv(args.symbols),
+            bridge_url=getattr(args, "qmt_bridge_url", None),
+            bridge_token=getattr(args, "qmt_bridge_token", None),
+            bridge_account_id=getattr(args, "qmt_account_id", None),
+        )
+        title = "Trade 实时行情"
+    elif args.trade_action == "inspect":
+        payload = _trade_inspect_summary(Path(args.root), args.exec_id)
+        title = "Trade 执行检查"
+    elif args.trade_action == "reconcile":
+        payload = _run_trade_reconcile(args)
+        title = "Trade 对账完成"
+    elif args.trade_action == "paper" and args.trade_paper_action == "rebalance":
+        payload = _run_trade_paper_rebalance(args)
+        title = "Paper rebalance 完成"
+    else:
+        raise SystemExit(f"未知 trade 子命令: {args.trade_action}")
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    _print_trade_dict(title, payload)
+
+
+def _parse_float_csv(raw: str) -> tuple[float, ...]:
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    if not values:
+        raise ValueError("浮点列表不能为空")
+    return tuple(values)
+
+
+def _parse_int_csv(raw: str) -> tuple[int, ...]:
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(int(item))
+    if not values:
+        raise ValueError("整数列表不能为空")
+    return tuple(values)
+
+
+def _parse_str_csv(raw: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError("字符串列表不能为空")
+    return values
+
+
 # ------------------------------------------------------------------
 # 主入口
 # ------------------------------------------------------------------
@@ -2609,6 +3362,13 @@ def main() -> None:
         sub.add_argument("--datasets", help=argparse.SUPPRESS)
         if action != "status":
             sub.add_argument(
+                "--frequencies",
+                help=(
+                    "仅运行指定更新频率的数据集，逗号分隔："
+                    "daily,weekly,monthly,quarterly,other,intraday"
+                ),
+            )
+            sub.add_argument(
                 "--foreground",
                 action="store_true",
                 help="前台执行（默认提交后台任务）",
@@ -2627,6 +3387,13 @@ def main() -> None:
         sub = data_sub.add_parser(action, parents=[root_parser])
         sub.add_argument("--profile", help=argparse.SUPPRESS)
         sub.add_argument("--datasets", help=argparse.SUPPRESS)
+        sub.add_argument(
+            "--frequencies",
+            help=(
+                "仅运行指定更新频率的数据集，逗号分隔："
+                "daily,weekly,monthly,quarterly,other,intraday"
+            ),
+        )
         sub.add_argument(
             "--foreground",
             action="store_true",
@@ -2686,6 +3453,177 @@ def main() -> None:
     inspect_sub.add_argument("--limit", type=int, default=10, help="样例行数（默认 10，0 表示只看元信息）")
     inspect_sub.add_argument("--format", choices=["text", "json"], default="text")
 
+    # --- vortex strategy earnings-forecast precise-review ---
+    strategy_parser = subparsers.add_parser("strategy", help="策略研究与复核")
+    strategy_sub = strategy_parser.add_subparsers(dest="strategy_action")
+    earnings_parser = strategy_sub.add_parser("earnings-forecast", help="业绩预告漂移策略")
+    earnings_sub = earnings_parser.add_subparsers(dest="earnings_action")
+    precise_sub = earnings_sub.add_parser(
+        "precise-review",
+        parents=[root_parser],
+        help="运行业绩预告 v3 精确可交易复核",
+    )
+    precise_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    precise_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    precise_sub.add_argument("--output-dir", help="JSON/HTML 报告输出目录；默认 workspace/strategy")
+    precise_sub.add_argument("--artifact-dir", help="持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
+    precise_sub.add_argument("--label", help="输出文件名前缀")
+    precise_sub.add_argument(
+        "--costs",
+        help="成本压力网格，bps 逗号分隔；默认 0,10,20,30,50,80,100",
+    )
+    precise_sub.add_argument(
+        "--portfolio-notional",
+        type=float,
+        default=100_000_000,
+        help="容量测算本金，默认 1 亿元",
+    )
+    precise_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    precise_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    shadow_sub = earnings_sub.add_parser(
+        "shadow-plan",
+        parents=[root_parser],
+        help="生成某日影子跟踪目标持仓",
+    )
+    shadow_sub.add_argument("--start", required=True, help="影子跟踪回看起始日期 YYYYMMDD")
+    shadow_sub.add_argument("--as-of", required=True, help="目标持仓日期 YYYYMMDD")
+    shadow_sub.add_argument("--output-dir", help="JSON/HTML 报告输出目录；默认 workspace/strategy")
+    shadow_sub.add_argument("--artifact-dir", help="目标持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
+    shadow_sub.add_argument("--label", help="输出文件名前缀")
+    shadow_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    shadow_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    handoff_sub = earnings_sub.add_parser(
+        "live-handoff",
+        parents=[root_parser],
+        help="生成影子目标 + qmt-bridge 账户快照的实盘交接包",
+    )
+    handoff_sub.add_argument("--start", required=True, help="影子跟踪回看起始日期 YYYYMMDD")
+    handoff_sub.add_argument("--as-of", required=True, help="目标持仓日期 YYYYMMDD")
+    handoff_sub.add_argument("--qmt-bridge-url", required=True, help="qmt-bridge 地址，例如 http://10.0.0.2:8000")
+    handoff_sub.add_argument("--qmt-bridge-token", help="qmt-bridge API Token（只读可选，按服务端配置）")
+    handoff_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
+    handoff_sub.add_argument("--output-dir", help="交接 JSON/HTML 输出目录；默认 workspace/strategy")
+    handoff_sub.add_argument("--artifact-dir", help="目标持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
+    handoff_sub.add_argument("--label", help="输出文件名前缀")
+    handoff_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    handoff_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    opening_liquidity_sub = earnings_sub.add_parser(
+        "opening-liquidity-review",
+        parents=[root_parser],
+        help="基于外部开盘快照复核开盘卖一容量",
+    )
+    opening_liquidity_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    opening_liquidity_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    opening_liquidity_sub.add_argument("--opening-snapshots", required=True, help="开盘快照 CSV/JSON/Parquet 路径")
+    opening_liquidity_sub.add_argument("--output-dir", help="JSON/CSV/Markdown 输出目录；默认 workspace/strategy")
+    opening_liquidity_sub.add_argument("--label", help="输出文件名前缀")
+    opening_liquidity_sub.add_argument("--top-n-values", default="30,40,50", help="TopN 网格，默认 30,40,50")
+    opening_liquidity_sub.add_argument(
+        "--position-modes",
+        default="full_equal_selected,capped_with_cash",
+        help="仓位模式网格，默认 full_equal_selected,capped_with_cash",
+    )
+    opening_liquidity_sub.add_argument("--portfolio-notional", type=float, default=1_000_000.0)
+    opening_liquidity_sub.add_argument("--capped-max-weight", type=float, default=0.05)
+    opening_liquidity_sub.add_argument("--volume-unit", choices=["shares", "lots"], default="shares")
+    opening_liquidity_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    opening_liquidity_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    auction_execution_sub = earnings_sub.add_parser(
+        "auction-execution-review",
+        parents=[root_parser],
+        help="把开盘竞价成交量约束真正施加到正式回测执行里",
+    )
+    auction_execution_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    auction_execution_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    auction_execution_sub.add_argument("--opening-snapshots", required=True, help="开盘竞价快照 CSV/JSON/Parquet 或 dataset 目录")
+    auction_execution_sub.add_argument("--output-dir", help="JSON/HTML 报告输出目录；默认 workspace/strategy")
+    auction_execution_sub.add_argument("--artifact-dir", help="持仓/成交/买单意图输出目录；默认 workspace/strategy/artifacts")
+    auction_execution_sub.add_argument("--label", help="输出文件名前缀")
+    auction_execution_sub.add_argument("--top-n", type=int, default=30, help="目标持仓上限，默认 30")
+    auction_execution_sub.add_argument(
+        "--position-mode",
+        choices=["full_equal_selected", "capped_with_cash"],
+        default="capped_with_cash",
+        help="仓位模式，默认 capped_with_cash",
+    )
+    auction_execution_sub.add_argument("--portfolio-notional", type=float, default=1_000_000.0)
+    auction_execution_sub.add_argument("--capped-max-weight", type=float, default=0.05)
+    auction_execution_sub.add_argument("--volume-unit", choices=["shares", "lots"], default="shares")
+    auction_execution_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    auction_execution_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    # --- vortex trade ---
+    trade_parser = subparsers.add_parser("trade", help="交易执行")
+    trade_sub = trade_parser.add_subparsers(dest="trade_action")
+    trade_status = trade_sub.add_parser("status", parents=[root_parser], help="查看交易线状态")
+    trade_status.add_argument("--qmt-bridge-url", default=os.getenv("QMT_BRIDGE_BASE_URL"), help="qmt-bridge 地址")
+    trade_status.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    trade_status.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID（可选）")
+    trade_status.add_argument("--format", choices=["text", "json"], default="text")
+    trade_quote = trade_sub.add_parser("quote", parents=[root_parser], help="通过 qmt-bridge 拉取实时行情")
+    trade_quote.add_argument("--symbols", required=True, help="股票列表，逗号分隔，例如 000001.SZ,600000.SH")
+    trade_quote.add_argument("--qmt-bridge-url", default=os.getenv("QMT_BRIDGE_BASE_URL"), help="qmt-bridge 地址")
+    trade_quote.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    trade_quote.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID（可选）")
+    trade_quote.add_argument("--format", choices=["text", "json"], default="text")
+    trade_inspect = trade_sub.add_parser("inspect", parents=[root_parser], help="查看某次执行报告摘要")
+    trade_inspect.add_argument("--exec-id", help="执行 ID；默认取最近一次")
+    trade_inspect.add_argument("--format", choices=["text", "json"], default="text")
+    trade_reconcile = trade_sub.add_parser("reconcile", parents=[root_parser], help="对账某次执行报告")
+    trade_reconcile.add_argument("--exec-id", help="执行 ID；默认取最近一次")
+    trade_reconcile.add_argument("--cash-tolerance", type=float, default=1.0, help="现金差异容忍度")
+    trade_reconcile.add_argument("--share-tolerance", type=int, default=0, help="持仓股数差异容忍度")
+    trade_reconcile.add_argument("--format", choices=["text", "json"], default="text")
+
+    trade_paper = trade_sub.add_parser("paper", help="本地 paper broker")
+    trade_paper_sub = trade_paper.add_subparsers(dest="trade_paper_action")
+    paper_rebalance = trade_paper_sub.add_parser(
+        "rebalance",
+        parents=[root_parser],
+        help="使用 target_portfolio 与 quotes JSON 运行本地 paper rebalance",
+    )
+    paper_rebalance.add_argument("--target-portfolio", required=True, help="target_portfolio.json 路径")
+    paper_rebalance.add_argument("--quotes", required=True, help="quotes JSON 路径")
+    paper_rebalance.add_argument("--st-flags", help="ST 标记 JSON 路径；默认缺失会触发 fail-closed 风控")
+    paper_rebalance.add_argument("--allow-missing-st-data", action="store_true", help="允许缺少 ST 标记数据")
+    paper_rebalance.add_argument("--initial-cash", type=float, default=1_000_000.0)
+    paper_rebalance.add_argument("--max-participation-rate", type=float, default=0.05)
+    paper_rebalance.add_argument("--commission-bps", type=float, default=2.5)
+    paper_rebalance.add_argument("--min-commission", type=float, default=5.0)
+    paper_rebalance.add_argument("--stamp-duty-sell-bps", type=float, default=5.0)
+    paper_rebalance.add_argument("--buy-limit-bps", type=float, default=30.0)
+    paper_rebalance.add_argument("--sell-limit-bps", type=float, default=30.0)
+    paper_rebalance.add_argument("--min-order-value", type=float, default=3_000.0)
+    paper_rebalance.add_argument("--max-order-count", type=int, default=80)
+    paper_rebalance.add_argument("--max-single-order-value", type=float, default=100_000.0)
+    paper_rebalance.add_argument("--max-daily-order-value", type=float, default=1_000_000.0)
+    paper_rebalance.add_argument("--disable-trading", action="store_true", help="生成报告但禁用 broker 提交")
+    paper_rebalance.add_argument("--format", choices=["text", "json"], default="text")
+
     args = parser.parse_args()
 
     # 日志
@@ -2701,5 +3639,9 @@ def main() -> None:
             cmd_profile(args)
         case "data":
             cmd_data(args)
+        case "strategy":
+            cmd_strategy(args)
+        case "trade":
+            cmd_trade(args)
         case _:
             parser.print_help()

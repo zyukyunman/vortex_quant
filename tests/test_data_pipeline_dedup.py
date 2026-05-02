@@ -333,6 +333,574 @@ class TestGenericDatasetPipeline:
         assert "dataset=valuation 去重判断: partition_key=date, target_partitions=3, existing_partitions=1, missing_partitions=2" in caplog.text
         assert "dataset=valuation 去重决策: 跳过 1 个已存在分区，沿用 0 个已登记覆盖分区，仅抓取 2 个缺失分区" in caplog.text
 
+    def test_bootstrap_reuses_trade_day_source_empty_coverage(self, tmp_path, caplog):
+        class EmptyTradeDayProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.calls = 0
+                self.seen_trading_days: list[list[str]] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "valuation": {
+                        "api": "daily_basic",
+                        "description": "估值指标",
+                        "phase": "1B",
+                        "fetch_mode": "trade_day_all",
+                        "partition_by": "date",
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "valuation"
+                self.calls += 1
+                self.seen_trading_days.append(
+                    [day.strftime("%Y%m%d") for day in (trading_days or [])]
+                )
+                return pd.DataFrame(columns=["symbol", "date", "pe", "pb"])
+
+        provider = EmptyTradeDayProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["valuation"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        first = pipeline.bootstrap(profile)
+        second = pipeline.bootstrap(profile)
+        coverage = manifest.list_partition_coverages(
+            dataset="valuation",
+            partition_key="date",
+            as_of_end="2026-04-02",
+            statuses=("source_empty",),
+        )
+
+        assert first.status == "success"
+        assert second.status == "success"
+        assert provider.calls == 1
+        assert provider.seen_trading_days == [["20260401", "20260402"]]
+        assert coverage == {"20260401", "20260402"}
+        assert "dataset=valuation 去重决策: 目标日期分区已全部存在或已登记覆盖" in caplog.text
+
+    def test_repair_reuses_historical_source_empty_coverage_across_days(self, tmp_path, caplog):
+        class HistoricalEmptyTradeDayProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.calls = 0
+                self.seen_trading_days: list[list[str]] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "valuation": {
+                        "api": "daily_basic",
+                        "description": "估值指标",
+                        "phase": "1B",
+                        "fetch_mode": "trade_day_all",
+                        "partition_by": "date",
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "valuation"
+                self.calls += 1
+                self.seen_trading_days.append(
+                    [day.strftime("%Y%m%d") for day in (trading_days or [])]
+                )
+                return pd.DataFrame(columns=["symbol", "date", "pe", "pb"])
+
+        provider = HistoricalEmptyTradeDayProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["valuation"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        first = pipeline.repair(
+            profile,
+            (date(2026, 4, 1), date(2026, 4, 5)),
+            action="repair",
+        )
+        second = pipeline.repair(
+            profile,
+            (date(2026, 4, 1), date(2026, 4, 6)),
+            action="repair",
+        )
+
+        assert first.status == "success"
+        assert second.status == "success"
+        assert provider.calls == 1
+        assert provider.seen_trading_days == [["20260401", "20260402"]]
+        assert "dataset=valuation 去重覆盖: partition_key=date, covered_partitions=2" in caplog.text
+        assert "dataset=valuation 去重决策: 目标日期分区已全部存在或已登记覆盖" in caplog.text
+
+    def test_bootstrap_retries_recent_source_empty_for_index_loop_range(self, tmp_path, caplog):
+        class RetryRecentIndexProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.calls = 0
+                self.requested_partition_values: list[list[str]] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "index_daily": {
+                        "api": "index_daily",
+                        "description": "指数日线",
+                        "phase": "1B",
+                        "fetch_mode": "index_loop_range",
+                        "partition_by": "date",
+                        "source_empty_retry_recent_days": 1,
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "index_daily"
+                self.calls += 1
+                self.requested_partition_values.append(list(partition_values or []))
+                return pd.DataFrame(columns=["symbol", "date", "close"])
+
+        provider = RetryRecentIndexProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["index_daily"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        first = pipeline.bootstrap(profile)
+        second = pipeline.bootstrap(profile)
+
+        assert first.status == "success"
+        assert second.status == "success"
+        assert provider.calls == 2
+        assert provider.requested_partition_values == [
+            ["20260401", "20260402"],
+            ["20260402"],
+        ]
+        assert "dataset=index_daily 去重覆盖: partition_key=date, covered_partitions=1" in caplog.text
+
+    def test_index_loop_range_can_ignore_historical_source_empty_coverage(self, tmp_path, caplog):
+        class RetryAllIndexProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.calls = 0
+                self.requested_partition_values: list[list[str]] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "index_daily": {
+                        "api": "index_daily",
+                        "description": "指数日线",
+                        "phase": "1B",
+                        "fetch_mode": "index_loop_range",
+                        "partition_by": "date",
+                        "reuse_source_empty_coverage": False,
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                self.calls += 1
+                self.requested_partition_values.append(list(partition_values or []))
+                if self.calls == 1:
+                    return pd.DataFrame(columns=["symbol", "date", "close"])
+                return pd.DataFrame(
+                    {
+                        "symbol": ["000300.SH", "000300.SH"],
+                        "date": ["20260401", "20260402"],
+                        "close": [1.0, 1.1],
+                    }
+                )
+
+        provider = RetryAllIndexProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["index_daily"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        first = pipeline.bootstrap(profile)
+        second = pipeline.bootstrap(profile)
+
+        assert first.status == "success"
+        assert second.status == "success"
+        assert provider.calls == 2
+        assert provider.requested_partition_values == [
+            ["20260401", "20260402"],
+            ["20260401", "20260402"],
+        ]
+        assert "dataset=index_daily 已写入 2 行" in caplog.text
+
+    def test_bootstrap_skips_existing_symbol_range_daily_partitions(self, tmp_path, caplog):
+        class SymbolRangeResumeProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.requested_ranges: list[tuple[str, str]] = []
+                self.requested_partition_values: list[list[str] | None] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "adj_factor": {
+                        "api": "adj_factor",
+                        "description": "复权因子",
+                        "phase": "1B",
+                        "fetch_mode": "symbol_range",
+                        "partition_by": "date",
+                        "date_partition_mode": "trade_day",
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2), date(2026, 4, 3)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "adj_factor"
+                self.requested_ranges.append(
+                    (start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+                )
+                self.requested_partition_values.append(list(partition_values or []))
+                values = list(partition_values or [])
+                return pd.DataFrame(
+                    {
+                        "symbol": ["600519.SH"] * len(values),
+                        "date": values,
+                        "adj_factor": [1.0] * len(values),
+                    }
+                )
+
+        provider = SymbolRangeResumeProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        storage.upsert(
+            "adj_factor",
+            pd.DataFrame(
+                {
+                    "symbol": ["600519.SH"],
+                    "date": ["20260401"],
+                    "adj_factor": [0.98],
+                }
+            ),
+            {"date": "20260401"},
+        )
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+
+        profile = DataProfile(
+            name="default",
+            datasets=["adj_factor"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        report = pipeline.bootstrap(profile)
+
+        assert report.status == "success"
+        assert provider.requested_ranges == [("20260402", "20260403")]
+        assert provider.requested_partition_values == [["20260402", "20260403"]]
+        result = storage.read("adj_factor")
+        assert sorted(str(value) for value in result["date"].tolist()) == [
+            "20260401",
+            "20260402",
+            "20260403",
+        ]
+        assert "dataset=adj_factor 去重判断: partition_key=date, target_partitions=3, existing_partitions=1, missing_partitions=2" in caplog.text
+
+    def test_bootstrap_skips_existing_symbol_range_week_end_partitions(self, tmp_path, caplog):
+        class WeeklyResumeProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.requested_ranges: list[tuple[str, str]] = []
+                self.requested_partition_values: list[list[str] | None] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "weekly": {
+                        "api": "weekly",
+                        "description": "周线行情",
+                        "phase": "2",
+                        "fetch_mode": "symbol_range",
+                        "partition_by": "date",
+                        "date_partition_mode": "week_end",
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [
+                    date(2026, 4, 1),
+                    date(2026, 4, 2),
+                    date(2026, 4, 3),
+                    date(2026, 4, 8),
+                    date(2026, 4, 9),
+                    date(2026, 4, 10),
+                ]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "weekly"
+                self.requested_ranges.append(
+                    (start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+                )
+                self.requested_partition_values.append(list(partition_values or []))
+                values = list(partition_values or [])
+                return pd.DataFrame(
+                    {
+                        "symbol": ["600519.SH"] * len(values),
+                        "date": values,
+                        "close": [10.0] * len(values),
+                    }
+                )
+
+        provider = WeeklyResumeProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        storage.upsert(
+            "weekly",
+            pd.DataFrame(
+                {
+                    "symbol": ["600519.SH"],
+                    "date": ["20260403"],
+                    "close": [9.8],
+                }
+            ),
+            {"date": "20260403"},
+        )
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+
+        profile = DataProfile(
+            name="default",
+            datasets=["weekly"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        report = pipeline.bootstrap(profile)
+
+        assert report.status == "success"
+        assert provider.requested_ranges == [("20260410", "20260410")]
+        assert provider.requested_partition_values == [["20260410"]]
+        result = storage.read("weekly")
+        assert sorted(str(value) for value in result["date"].tolist()) == [
+            "20260403",
+            "20260410",
+        ]
+        assert "dataset=weekly 去重判断: partition_key=date, target_partitions=2, existing_partitions=1, missing_partitions=1" in caplog.text
+
+    def test_bootstrap_skips_existing_index_loop_week_end_partitions(self, tmp_path, caplog):
+        class IndexWeightResumeProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.requested_ranges: list[tuple[str, str]] = []
+                self.requested_partition_values: list[list[str] | None] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "index_weight": {
+                        "api": "index_weight",
+                        "description": "指数权重",
+                        "phase": "1B",
+                        "fetch_mode": "index_loop_range",
+                        "partition_by": "date",
+                        "date_partition_mode": "week_end",
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [
+                    date(2026, 4, 1),
+                    date(2026, 4, 2),
+                    date(2026, 4, 3),
+                    date(2026, 4, 8),
+                    date(2026, 4, 9),
+                    date(2026, 4, 10),
+                ]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "index_weight"
+                self.requested_ranges.append(
+                    (start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+                )
+                self.requested_partition_values.append(list(partition_values or []))
+                values = list(partition_values or [])
+                return pd.DataFrame(
+                    {
+                        "index_code": ["000300.SH"] * len(values),
+                        "con_code": ["600519.SH"] * len(values),
+                        "weight": [1.0] * len(values),
+                        "date": values,
+                    }
+                )
+
+        provider = IndexWeightResumeProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        storage.upsert(
+            "index_weight",
+            pd.DataFrame(
+                {
+                    "index_code": ["000300.SH"],
+                    "con_code": ["600519.SH"],
+                    "weight": [0.98],
+                    "date": ["20260403"],
+                }
+            ),
+            {"date": "20260403"},
+        )
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+
+        profile = DataProfile(
+            name="default",
+            datasets=["index_weight"],
+            history_start="20260401",
+        )
+
+        caplog.set_level(logging.INFO)
+        report = pipeline.bootstrap(profile)
+
+        assert report.status == "success"
+        assert provider.requested_ranges == [("20260410", "20260410")]
+        assert provider.requested_partition_values == [["20260410"]]
+        result = storage.read("index_weight")
+        assert sorted(str(value) for value in result["date"].tolist()) == [
+            "20260403",
+            "20260410",
+        ]
+        assert "dataset=index_weight 去重判断: partition_key=date, target_partitions=2, existing_partitions=1, missing_partitions=1" in caplog.text
+
     def test_bootstrap_skips_existing_quarter_partitions(self, tmp_path):
         class QuarterResumeProvider(GenericDatasetProvider):
             def __init__(self) -> None:

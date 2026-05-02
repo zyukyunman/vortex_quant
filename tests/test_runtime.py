@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -333,3 +334,63 @@ class TestServer:
         with pytest.raises(RuntimeError, match="already running"):
             server2.start()
         server1.stop()
+
+    def test_schedule_matches_datetime_supports_common_cron_patterns(self):
+        from vortex.runtime.server import schedule_matches_datetime
+
+        assert schedule_matches_datetime(
+            "0 18 * * 1-5",
+            datetime(2026, 4, 17, 18, 0),
+        )
+        assert not schedule_matches_datetime(
+            "0 18 * * 1-5",
+            datetime(2026, 4, 18, 18, 0),
+        )
+        assert schedule_matches_datetime(
+            "*/15 6 * * *",
+            datetime(2026, 4, 19, 6, 45),
+        )
+
+    def test_scheduler_tick_submits_due_profile_only_once_per_minute(
+        self, monkeypatch, tmp_path
+    ):
+        from vortex.runtime.server import Server
+
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+        (root / "profiles" / "default.yaml").write_text(
+            "provider: tushare\nhistory_start: '20170101'\nschedule: '0 18 * * 1-5'\n",
+            encoding="utf-8",
+        )
+
+        submitted: list[str] = []
+        monkeypatch.setattr(
+            Server,
+            "_submit_scheduled_update",
+            lambda self, profile_name: submitted.append(profile_name) or {"status": "submitted"},
+        )
+
+        server = Server(root)
+        server.start()
+        assert server._run_scheduler_tick(datetime(2026, 4, 17, 18, 0)) == 1
+        assert server._run_scheduler_tick(datetime(2026, 4, 17, 18, 0, 30)) == 0
+        assert submitted == ["default"]
+        server.stop()
+
+    def test_status_reports_schedule_enabled_profiles(self, tmp_path):
+        from vortex.runtime.server import Server
+
+        root = tmp_path / "ws"
+        Workspace(root).initialize()
+        (root / "profiles" / "default.yaml").write_text(
+            "provider: tushare\nhistory_start: '20170101'\nschedule: '0 21 * * 1-5'\n",
+            encoding="utf-8",
+        )
+
+        server = Server(root)
+        server.start()
+        info = server.status()
+        assert info["scheduled_profiles"] == [
+            {"name": "default", "schedule": "0 21 * * 1-5"}
+        ]
+        server.stop()

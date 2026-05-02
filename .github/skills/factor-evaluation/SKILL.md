@@ -1,7 +1,12 @@
 ---
 name: factor-evaluation
-description: '新因子多周期能力评测技能。Use when: 新增因子、评估因子预测能力、计算 IC_1d/IC_5d/IC_20d、做多空组合检验、判断因子是否值得纳入策略。适用于: factor evaluation, IC_1d, IC_5d, IC_20d, rank IC, long-short portfolio, factor admission testing.'
+description: '新因子多周期能力评测技能。Use when: 新增因子、评估因子预测能力、计算 IC_1d/IC_5d/IC_20d、做多空组合检验、判断因子是否值得纳入策略。'
 argument-hint: '描述要评测的因子、数据频率、需要的周期（如 1d/5d/20d）以及是否需要多空分组检验'
+tags: [vortex, vortex/skill, vortex/research-domain]
+obsidian_links:
+  - "[[因子研究与评测全流程说明]]"
+  - "[[研究域设计说明书]]"
+  - "[[实例策略开发流程]]"
 ---
 
 # 新因子多周期能力评测

@@ -23,6 +23,7 @@ from vortex.data.derived import DerivedMetricCalculator
 from vortex.data.manifest import SyncManifest
 from vortex.data.pit.aligner import PitAligner
 from vortex.data.pit.report import PitReport
+from vortex.data.provider.tushare_registry import TUSHARE_UPDATE_FREQUENCY_ORDER
 from vortex.data.provider.base import DataProvider
 from vortex.data.quality.engine import QualityEngine
 from vortex.data.quality.report import QualityContext, QualityReport
@@ -49,13 +50,19 @@ def _map_quality_status(report: QualityReport | None) -> str:
     return "passed"
 
 
-def _ordered_datasets(profile: ResolvedProfile) -> list[str]:
+def _ordered_datasets(
+    profile: ResolvedProfile,
+    *,
+    frequency_resolver: Callable[[str], str] | None = None,
+    frequency_priority: tuple[str, ...] | list[str] = (),
+) -> list[str]:
     """返回本次运行的数据集顺序。
 
     规则：
     1. 先应用 exclude_datasets，得到 effective_datasets
     2. priority_datasets 中存在且未被排除的数据集优先
-    3. 其余数据集按 datasets 原有顺序补齐
+    3. 若提供 frequency_resolver，则其余数据集按更新频率分桶排序
+    4. 同频率桶内保持 datasets 原有顺序
     """
     effective = profile.effective_datasets
     effective_set = set(effective)
@@ -67,10 +74,23 @@ def _ordered_datasets(profile: ResolvedProfile) -> list[str]:
             ordered.append(name)
             seen.add(name)
 
-    for name in effective:
-        if name not in seen:
-            ordered.append(name)
-            seen.add(name)
+    remaining = [name for name in effective if name not in seen]
+    if frequency_resolver is None or not frequency_priority:
+        ordered.extend(remaining)
+        return ordered
+
+    buckets: dict[str, list[str]] = {key: [] for key in frequency_priority}
+    fallback: list[str] = []
+    for name in remaining:
+        frequency = str(frequency_resolver(name) or "other").strip().lower()
+        if frequency in buckets:
+            buckets[frequency].append(name)
+        else:
+            fallback.append(name)
+
+    for key in frequency_priority:
+        ordered.extend(buckets[key])
+    ordered.extend(fallback)
 
     return ordered
 
@@ -589,7 +609,13 @@ class DataPipeline:
             )
 
         # 3. 按 dataset 拉取数据
-        datasets = self._canonicalize_datasets(_ordered_datasets(profile))
+        datasets = self._canonicalize_datasets(
+            _ordered_datasets(
+                profile,
+                frequency_resolver=self._dataset_update_frequency,
+                frequency_priority=TUSHARE_UPDATE_FREQUENCY_ORDER,
+            )
+        )
         self._emit_progress(
             current_stage="fetch",
             total_stages=5,
@@ -866,6 +892,11 @@ class DataPipeline:
                 detail={"dataset": dataset},
             )
         return meta
+
+    def _dataset_update_frequency(self, dataset: str) -> str:
+        canonical = self._provider.resolve_dataset(dataset)
+        meta = self._dataset_meta(canonical)
+        return str(meta.get("update_frequency") or "other")
 
     def _dataset_access(self, dataset: str) -> dict[str, object]:
         checker = getattr(self._provider, "describe_dataset_access", None)
@@ -1179,23 +1210,41 @@ class DataPipeline:
 
         if fetch_mode == "trade_day_all" and partition_by == "date" and trading_days:
             existing_dates = self._existing_partition_values(dataset, "date")
+            expected_dates = [day.strftime("%Y%m%d") for day in trading_days]
+            covered_dates = self._trim_recent_covered_partitions(
+                meta,
+                expected_dates,
+                self._covered_partition_values(dataset, "date", end, meta),
+            )
             existing_target_days = [
                 day for day in trading_days
                 if day.strftime("%Y%m%d") in existing_dates
             ]
+            covered_target_days = [
+                day
+                for day in trading_days
+                if day.strftime("%Y%m%d") not in existing_dates
+                and day.strftime("%Y%m%d") in covered_dates
+            ]
             missing_days = [
                 day for day in trading_days
                 if day.strftime("%Y%m%d") not in existing_dates
+                and day.strftime("%Y%m%d") not in covered_dates
             ]
             if not missing_days:
                 return DatasetFetchPlan(
                     start=start,
                     end=end,
                     trading_days=[],
-                    skip_reason="目标日期分区已全部存在",
+                    skip_reason=(
+                        "目标日期分区已全部存在"
+                        if not covered_target_days
+                        else "目标日期分区已全部存在或已登记覆盖"
+                    ),
                     partition_key="date",
                     target_partitions=len(trading_days),
                     existing_partitions=len(existing_target_days),
+                    covered_partitions=len(covered_target_days),
                     missing_partitions=0,
                 )
             return DatasetFetchPlan(
@@ -1205,8 +1254,112 @@ class DataPipeline:
                 partition_key="date",
                 target_partitions=len(trading_days),
                 existing_partitions=len(existing_target_days),
+                covered_partitions=len(covered_target_days),
                 missing_partitions=len(missing_days),
+                missing_partition_values=tuple(
+                    day.strftime("%Y%m%d") for day in missing_days
+                ),
             )
+
+        if fetch_mode == "symbol_range" and partition_by == "date" and trading_days:
+            expected_dates = self._expected_date_partition_values(meta, trading_days)
+            if expected_dates:
+                existing_dates = self._existing_partition_values(dataset, "date")
+                covered_dates = self._trim_recent_covered_partitions(
+                    meta,
+                    expected_dates,
+                    self._covered_partition_values(dataset, "date", end, meta),
+                )
+                existing_target_dates = [
+                    value for value in expected_dates if value in existing_dates
+                ]
+                covered_target_dates = [
+                    value
+                    for value in expected_dates
+                    if value not in existing_dates and value in covered_dates
+                ]
+                missing_dates = [
+                    value
+                    for value in expected_dates
+                    if value not in existing_dates and value not in covered_dates
+                ]
+                if not missing_dates:
+                    return DatasetFetchPlan(
+                        start=start,
+                        end=end,
+                        trading_days=[],
+                        skip_reason=(
+                            "目标日期分区已全部存在"
+                            if not covered_target_dates
+                            else "目标日期分区已全部存在或已登记覆盖"
+                        ),
+                        partition_key="date",
+                        target_partitions=len(expected_dates),
+                        existing_partitions=len(existing_target_dates),
+                        covered_partitions=len(covered_target_dates),
+                        missing_partitions=0,
+                    )
+                return DatasetFetchPlan(
+                    start=self._parse_date(missing_dates[0]),
+                    end=self._parse_date(missing_dates[-1]),
+                    trading_days=[self._parse_date(value) for value in missing_dates],
+                    partition_key="date",
+                    target_partitions=len(expected_dates),
+                    existing_partitions=len(existing_target_dates),
+                    covered_partitions=len(covered_target_dates),
+                    missing_partitions=len(missing_dates),
+                    missing_partition_values=tuple(missing_dates),
+                )
+
+        if fetch_mode == "index_loop_range" and partition_by == "date" and trading_days:
+            expected_dates = self._expected_date_partition_values(meta, trading_days)
+            if expected_dates:
+                existing_dates = self._existing_partition_values(dataset, "date")
+                covered_dates = self._trim_recent_covered_partitions(
+                    meta,
+                    expected_dates,
+                    self._covered_partition_values(dataset, "date", end, meta),
+                )
+                existing_target_dates = [
+                    value for value in expected_dates if value in existing_dates
+                ]
+                covered_target_dates = [
+                    value
+                    for value in expected_dates
+                    if value not in existing_dates and value in covered_dates
+                ]
+                missing_dates = [
+                    value
+                    for value in expected_dates
+                    if value not in existing_dates and value not in covered_dates
+                ]
+                if not missing_dates:
+                    return DatasetFetchPlan(
+                        start=start,
+                        end=end,
+                        trading_days=[],
+                        skip_reason=(
+                            "目标日期分区已全部存在"
+                            if not covered_target_dates
+                            else "目标日期分区已全部存在或已登记覆盖"
+                        ),
+                        partition_key="date",
+                        target_partitions=len(expected_dates),
+                        existing_partitions=len(existing_target_dates),
+                        covered_partitions=len(covered_target_dates),
+                        missing_partitions=0,
+                    )
+                return DatasetFetchPlan(
+                    start=self._parse_date(missing_dates[0]),
+                    end=self._parse_date(missing_dates[-1]),
+                    trading_days=[self._parse_date(value) for value in missing_dates],
+                    partition_key="date",
+                    target_partitions=len(expected_dates),
+                    existing_partitions=len(existing_target_dates),
+                    covered_partitions=len(covered_target_dates),
+                    missing_partitions=len(missing_dates),
+                    missing_partition_values=tuple(missing_dates),
+                )
 
         if fetch_mode == "symbol_quarter_range" and partition_by == "report_date":
             partition_key = "end_date" if dataset == "fundamental" else "report_date"
@@ -1217,6 +1370,7 @@ class DataPipeline:
                     dataset,
                     partition_key,
                     end,
+                    meta,
                 )
                 existing_target_quarters = [
                     value for value in expected_quarters if value in existing_quarters
@@ -1304,13 +1458,27 @@ class DataPipeline:
         dataset: str,
         partition_key: str,
         as_of_end: date,
+        meta: dict[str, object],
     ) -> set[str]:
-        return self._manifest.list_partition_coverages(
+        current_as_of = as_of_end.isoformat()
+        reuse_source_empty = bool(meta.get("reuse_source_empty_coverage", True))
+        same_asof_statuses = ("pit_blocked", "source_empty") if reuse_source_empty else ("pit_blocked",)
+        same_asof_coverages = self._manifest.list_partition_coverages(
             dataset=dataset,
             partition_key=partition_key,
-            as_of_end=as_of_end.isoformat(),
-            statuses=("pit_blocked", "source_empty"),
+            as_of_end=current_as_of,
+            statuses=same_asof_statuses,
         )
+        historical_empty_coverages: set[str] = set()
+        if reuse_source_empty:
+            historical_empty_coverages = self._manifest.list_historical_partition_coverages(
+                dataset=dataset,
+                partition_key=partition_key,
+                as_of_end=current_as_of,
+                statuses=("source_empty",),
+                require_as_of_after_partition=True,
+            )
+        return same_asof_coverages | historical_empty_coverages
 
     def _has_exact_range_coverage(
         self,
@@ -1345,6 +1513,52 @@ class DataPipeline:
                 values.append(quarter_end.strftime("%Y%m%d"))
             current = quarter_end + timedelta(days=1)
         return values
+
+    @staticmethod
+    def _expected_date_partition_values(
+        meta: dict[str, object],
+        trading_days: list[date],
+    ) -> list[str]:
+        if not trading_days:
+            return []
+
+        mode = str(meta.get("date_partition_mode") or "trade_day").strip()
+        if mode == "trade_day":
+            return [day.strftime("%Y%m%d") for day in trading_days]
+
+        buckets: dict[tuple[int, int], date] = {}
+        if mode == "week_end":
+            for day in trading_days:
+                iso = day.isocalendar()
+                buckets[(iso.year, iso.week)] = day
+            return [
+                buckets[key].strftime("%Y%m%d")
+                for key in sorted(buckets)
+            ]
+
+        if mode == "month_end":
+            for day in trading_days:
+                buckets[(day.year, day.month)] = day
+            return [
+                buckets[key].strftime("%Y%m%d")
+                for key in sorted(buckets)
+            ]
+
+        return [day.strftime("%Y%m%d") for day in trading_days]
+
+    @staticmethod
+    def _trim_recent_covered_partitions(
+        meta: dict[str, object],
+        expected_values: list[str],
+        covered_values: set[str],
+    ) -> set[str]:
+        retry_recent = int(meta.get("source_empty_retry_recent_days") or 0)
+        if retry_recent <= 0 or not expected_values or not covered_values:
+            return covered_values
+        retry_values = set(expected_values[-retry_recent:])
+        if not retry_values:
+            return covered_values
+        return {value for value in covered_values if value not in retry_values}
 
     def _apply_pit_alignment(
         self,

@@ -5,12 +5,15 @@ import argparse
 import json
 import logging
 import signal
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 import vortex.cli as cli
 from vortex.config.profile.models import DataProfile
+from vortex.data.provider.tushare_registry import get_default_tushare_datasets
 from vortex.data.manifest import SyncManifest
 from vortex.data.pipeline import RunReport
 from vortex.data.storage.parquet_duckdb import ParquetDuckDBBackend
@@ -56,6 +59,59 @@ class TestServerStart:
         assert "--foreground" in command
         assert calls[0]["kwargs"]["start_new_session"] is True
         assert "已在后台启动" in capsys.readouterr().out
+
+
+class TestUpdateFrequencyScope:
+    def test_update_uses_workday_defaults_when_user_did_not_override(self):
+        resolved = cli._resolve_update_frequency_scope(
+            "update",
+            datasets=None,
+            update_frequencies=[],
+            now=datetime(2026, 4, 17, 9, 30),
+        )
+
+        assert resolved == ["daily", "intraday"]
+
+    def test_update_uses_weekend_defaults_when_user_did_not_override(self):
+        resolved = cli._resolve_update_frequency_scope(
+            "update",
+            datasets=None,
+            update_frequencies=[],
+            now=datetime(2026, 4, 18, 9, 30),
+        )
+
+        assert resolved == ["weekly", "monthly", "quarterly", "other"]
+
+    def test_explicit_dataset_or_frequency_override_disables_default_bucket(self):
+        assert cli._resolve_update_frequency_scope(
+            "update",
+            datasets=["events"],
+            update_frequencies=[],
+            now=datetime(2026, 4, 18, 9, 30),
+        ) == []
+        assert cli._resolve_update_frequency_scope(
+            "update",
+            datasets=None,
+            update_frequencies=["daily"],
+            now=datetime(2026, 4, 18, 9, 30),
+        ) == ["daily"]
+
+
+class TestLatestLogLinks:
+    def test_refresh_latest_log_links_updates_generic_and_prefixed_aliases(self, tmp_path):
+        logs_dir = tmp_path / "logs"
+        first = logs_dir / "data-bootstrap-20260409_100117.log"
+        second = logs_dir / "data-bootstrap-20260409_120305.log"
+
+        cli._refresh_latest_log_links(first)
+        assert (logs_dir / "latest.log").is_symlink()
+        assert (logs_dir / "latest.log").readlink() == Path(first.name)
+        assert (logs_dir / "data-bootstrap-latest.log").is_symlink()
+        assert (logs_dir / "data-bootstrap-latest.log").readlink() == Path(first.name)
+
+        cli._refresh_latest_log_links(second)
+        assert (logs_dir / "latest.log").readlink() == Path(second.name)
+        assert (logs_dir / "data-bootstrap-latest.log").readlink() == Path(second.name)
 
 
 class TestDataBackgroundTasks:
@@ -118,6 +174,49 @@ class TestDataBackgroundTasks:
             profile_name="default",
             action="bootstrap",
             fmt="json",
+        )
+
+        assert first["task_id"] == second["task_id"]
+        assert second["status"] == "deduplicated"
+        assert len(calls) == 1
+
+    def test_submit_data_background_task_collapses_full_dataset_scope_for_dedup(
+        self, monkeypatch, tmp_path
+    ):
+        calls = []
+
+        class _Proc:
+            pid = 24681
+
+        def _fake_launch(command, log_path):
+            calls.append((command, log_path))
+            return _Proc()
+
+        monkeypatch.setattr(cli, "_launch_background_process", _fake_launch)
+
+        root = tmp_path / "workspace"
+        Workspace(root).initialize()
+        (root / "profiles" / "default.yaml").write_text(
+            "name: default\n"
+            "type: data\n"
+            "provider: tushare\n"
+            "history_start: '20170101'\n",
+            encoding="utf-8",
+        )
+
+        full_scope = get_default_tushare_datasets()
+        first = _submit_data_background_task(
+            root=root,
+            profile_name="default",
+            action="bootstrap",
+            fmt="json",
+        )
+        second = _submit_data_background_task(
+            root=root,
+            profile_name="default",
+            action="bootstrap",
+            fmt="json",
+            datasets=full_scope,
         )
 
         assert first["task_id"] == second["task_id"]
@@ -456,6 +555,40 @@ class TestDataBackgroundTasks:
         )
 
         assert captured["action"] == "bootstrap"
+        assert captured["update_frequencies"] == []
+
+    def test_cmd_data_update_defaults_to_workday_frequency_bucket(
+        self, monkeypatch, tmp_path
+    ):
+        captured: dict[str, object] = {}
+
+        def _fake_submit(**kwargs):
+            captured.update(kwargs)
+            return {"status": "submitted"}
+
+        monkeypatch.setattr(cli, "_submit_data_background_task", _fake_submit)
+        monkeypatch.setattr(
+            cli,
+            "_resolve_update_frequency_scope",
+            lambda action, datasets, update_frequencies, now=None: ["daily", "intraday"],
+        )
+
+        cli.cmd_data(
+            argparse.Namespace(
+                data_action="update",
+                root=str(tmp_path / "workspace"),
+                profile=None,
+                datasets=None,
+                frequencies=None,
+                verbose=False,
+                dry_run=False,
+                format="text",
+                foreground=False,
+            )
+        )
+
+        assert captured["action"] == "update"
+        assert captured["update_frequencies"] == ["daily", "intraday"]
 
     def test_cmd_data_foreground_worker_accepts_keyword_progress_callback(
         self, monkeypatch, tmp_path

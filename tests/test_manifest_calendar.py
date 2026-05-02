@@ -144,6 +144,36 @@ class TestSyncManifest:
 
         assert covered == {"20260331"}
 
+    def test_historical_partition_coverages_only_reuse_matured_empty_partitions(self, tmp_path):
+        m = SyncManifest(tmp_path / "manifest.db")
+        m.create_run("run_cov_hist", "p1", "bootstrap")
+        m.record_partition_coverage(
+            run_id="run_cov_hist",
+            dataset="bars",
+            partition_key="date",
+            partition_value="20260401",
+            as_of_end="2026-04-05",
+            status="source_empty",
+        )
+        m.record_partition_coverage(
+            run_id="run_cov_hist",
+            dataset="bars",
+            partition_key="date",
+            partition_value="20260405",
+            as_of_end="2026-04-05",
+            status="source_empty",
+        )
+
+        covered = m.list_historical_partition_coverages(
+            dataset="bars",
+            partition_key="date",
+            as_of_end="2026-04-06",
+            statuses=("source_empty",),
+            require_as_of_after_partition=True,
+        )
+
+        assert covered == {"20260401"}
+
 
 class TestDataCalendar:
     def test_load_from_provider(self, tmp_path):

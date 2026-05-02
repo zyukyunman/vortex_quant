@@ -15,6 +15,9 @@ build/
 # 报告输出
 reports/
 
+# 本地研究/交易运行态产物
+/workspace/
+
 # macOS
 .DS_Store
 

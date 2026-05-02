@@ -32,6 +32,14 @@ include = ["vortex", "pyproject.toml", "docs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "unit: fast deterministic unit tests",
+    "integration: cross-module integration tests",
+    "e2e: end-to-end workflow tests",
+    "determinism: deterministic/golden-master checks",
+    "research: explicit research regression tests, not required for default validation",
+    "local_data: tests that require local market data outside the repository",
+]
 
 [dependency-groups]
 dev = [

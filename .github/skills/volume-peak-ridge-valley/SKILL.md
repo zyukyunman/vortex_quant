@@ -1,7 +1,12 @@
 ---
 name: volume-peak-ridge-valley
-description: '高频成交量峰岭谷因子构建与检验。Use when: 从分钟级成交量提取微观结构因子、计算量峰/量岭/量谷、高频因子IC检验、多空组合回测、eruption爆发点识别。适用于: volume microstructure factor, peak ridge valley, intraday volume factor, minute-level alpha, eruption detection, high-frequency factor research.'
+description: '高频成交量峰岭谷因子构建与检验。Use when: 从分钟级成交量提取微观结构因子、计算量峰/量岭/量谷、高频因子IC检验、多空组合回测、eruption爆发点识别。'
 argument-hint: '描述您需要的峰岭谷因子计算或检验任务，如因子构建、IC分析、多空回测等'
+tags: [vortex, vortex/skill, vortex/research-domain]
+obsidian_links:
+  - "[[因子研究与评测全流程说明]]"
+  - "[[factor-evaluation skill]]"
+  - "[[研究域设计说明书]]"
 ---
 
 # 高频成交量的峰、岭、谷因子
