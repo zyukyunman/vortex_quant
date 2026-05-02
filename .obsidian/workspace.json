@@ -4,21 +4,21 @@
     "type": "split",
     "children": [
       {
-        "id": "3297fb62a30dd6e9",
+        "id": "e45e7a1d5029ffa7",
         "type": "tabs",
         "children": [
           {
-            "id": "fef755ac62d3088c",
+            "id": "76f7f89d010b1af0",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/架构设计/00-软件架构总览-v2.md",
+                "file": "docs/因子研究/README.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "00-软件架构总览-v2"
+              "title": "README"
             }
           }
         ]
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "docs/架构设计/00-软件架构总览-v2.md",
+                "file": "docs/策略研究/2026-04-28-业绩预告漂移策略测试报告.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "00-软件架构总览-v2 的反向链接列表"
+              "title": "2026-04-28-业绩预告漂移策略测试报告 的反向链接列表"
             }
           },
           {
@@ -113,12 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "docs/架构设计/00-软件架构总览-v2.md",
+                "file": "docs/策略研究/2026-04-28-业绩预告漂移策略测试报告.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "00-软件架构总览-v2 的出链列表"
+              "title": "2026-04-28-业绩预告漂移策略测试报告 的出链列表"
             }
           },
           {
@@ -156,13 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "docs/架构设计/00-软件架构总览-v2.md",
+                "file": "docs/策略研究/2026-04-28-业绩预告漂移策略测试报告.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "00-软件架构总览-v2 的大纲"
+              "title": "2026-04-28-业绩预告漂移策略测试报告 的大纲"
             }
           }
         ]
@@ -183,14 +183,46 @@
       "bases:新建数据库": false
     }
   },
-  "active": "fef755ac62d3088c",
+  "active": "76f7f89d010b1af0",
   "lastOpenFiles": [
-    "docs/产品原型/v0.2/00-产品原型总览.md",
-    "docs/产品原型/v0.1/03-因子研究体验原型-v1.md",
-    "docs/产品原型/v0.1/01-数据服务体验原型-v1.md",
-    "docs/产品原型/README.md",
-    "docs/架构设计/00-软件架构总览-v2.md",
-    "docs/README.md",
-    "2026-04-26.md"
+    "tests/__pycache__/test_research_cogalpha_fitness.cpython-311-pytest-9.0.2.pyc",
+    "tests/__pycache__/test_research_cogalpha_quality.cpython-311-pytest-9.0.2.pyc",
+    "vortex/research/cogalpha/__pycache__/reports.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/schema.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/quality.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/fitness.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/agent_catalog.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__/__init__.cpython-311.pyc",
+    "vortex/research/cogalpha/__pycache__",
+    "tests/__pycache__/test_research_cogalpha_schema.cpython-311-pytest-9.0.2.pyc",
+    "tests/test_research_cogalpha_fitness.py",
+    "docs/论文/CogAlpha/CogAlpha因子研究落地路线.md",
+    "docs/论文/CogAlpha/CogAlpha Quality Gate与Fitness规范.md",
+    "docs/论文/CogAlpha/CogAlpha Agent体系设计.md",
+    "docs/因子研究/外部Alpha资料线索.md",
+    "docs/因子研究/README.md",
+    "docs/因子研究/因子研究档案规范.md",
+    "docs/因子研究/因子实验总表.md",
+    "docs/论文/README.md",
+    "docs/论文/CogAlpha/README.md",
+    "docs/论文/CogAlpha/CogAlpha完整中文译文.md",
+    "docs/论文/CogAlpha/CogAlpha与Vortex落地讨论.md",
+    "docs/论文/CogAlpha/CogAlpha课堂讲义.md",
+    "docs/因子研究/CogAlpha论文中文精读.md",
+    "docs/因子研究/CogAlpha与Vortex因子研究映射.md",
+    "docs/因子研究/实验档案/九转与筹码因子.md",
+    "docs/策略研究/策略组合研究框架.md",
+    "docs/因子研究/101因子全库研究路线.md",
+    "docs/因子研究/因子方法论与多周期组合.md",
+    "docs/因子研究/实验档案/峰岭谷成交量结构因子.md",
+    "docs/因子研究/实验档案/动量与101量价因子.md",
+    "docs/因子研究/因子族/事件因子.md",
+    "docs/因子研究/实验档案/集合竞价因子.md",
+    "docs/因子研究/因子评价框架.md",
+    "docs/因子研究/因子族/资金流因子.md",
+    "docs/因子研究/实验档案/红利与自由现金流因子线索.md",
+    "docs/策略研究/2026-04-28-业绩预告漂移策略v3可交易约束回测报告截图.png",
+    "docs/策略研究/2026-04-28-业绩预告漂移策略v2可交易约束回测报告截图.png",
+    "docs/策略研究/2026-04-28-业绩预告漂移策略可交易约束回测报告截图.png"
   ]
 }
