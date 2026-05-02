@@ -2747,15 +2747,59 @@ def cmd_strategy(args: argparse.Namespace) -> None:
 
     if args.strategy_action != "earnings-forecast":
         raise SystemExit(f"未知 strategy 子命令: {args.strategy_action}")
-    if args.earnings_action not in {"precise-review", "shadow-plan"}:
+    if args.earnings_action not in {
+        "precise-review",
+        "shadow-plan",
+        "live-handoff",
+        "opening-liquidity-review",
+        "auction-execution-review",
+    }:
         raise SystemExit(f"未知 earnings-forecast 子命令: {args.earnings_action}")
 
     from vortex.strategy.earnings_forecast_runner import (
+        DEFAULT_AUCTION_EXECUTION_LABEL,
+        DEFAULT_LIVE_HANDOFF_LABEL,
+        DEFAULT_OPENING_LIQUIDITY_LABEL,
         DEFAULT_REVIEW_LABEL,
         DEFAULT_SHADOW_LABEL,
+        run_opening_auction_execution_review,
+        run_opening_liquidity_review,
+        run_earnings_forecast_live_handoff,
         run_earnings_forecast_shadow_plan,
         run_precise_earnings_forecast_review,
     )
+
+    if args.earnings_action == "opening-liquidity-review":
+        artifacts = run_opening_liquidity_review(
+            Path(args.root).expanduser(),
+            opening_snapshot_path=Path(args.opening_snapshots).expanduser(),
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            label=args.label or DEFAULT_OPENING_LIQUIDITY_LABEL,
+            top_n_values=_parse_int_csv(args.top_n_values),
+            position_modes=_parse_str_csv(args.position_modes),
+            portfolio_notional=float(args.portfolio_notional),
+            capped_max_weight=float(args.capped_max_weight),
+            volume_unit=args.volume_unit,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告开盘卖一容量复核完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  CSV: {artifacts.csv_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        best_variant = artifacts.summary.get("best_variant") or {}
+        if isinstance(best_variant, dict) and best_variant:
+            print(
+                "  最优变体: "
+                f"{best_variant.get('variant')}，"
+                f"一手可成交率 {float(best_variant.get('one_lot_feasible_rate', 0.0)) * 100:.2f}%，"
+                f"目标覆盖率 {float(best_variant.get('covered_shares_ratio', 0.0)) * 100:.2f}%"
+            )
+        return
 
     if args.earnings_action == "shadow-plan":
         artifacts = run_earnings_forecast_shadow_plan(
@@ -2780,6 +2824,67 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             f"持仓 {artifacts.summary['holding_count']} 只, "
             f"调仓 {artifacts.summary['trade_count']} 只"
         )
+        return
+
+    if args.earnings_action == "live-handoff":
+        artifacts = run_earnings_forecast_live_handoff(
+            Path(args.root).expanduser(),
+            start=args.start,
+            as_of=args.as_of,
+            qmt_bridge_url=args.qmt_bridge_url,
+            qmt_bridge_token=args.qmt_bridge_token,
+            qmt_account_id=args.qmt_account_id,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_LIVE_HANDOFF_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告实盘交接包已生成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  HTML: {artifacts.html_path}")
+        print(f"  目标持仓: {artifacts.target_path}")
+        print(f"  QMT 就绪: {'yes' if bool(artifacts.summary['qmt_ready']) else 'no'}")
+        if artifacts.summary.get("blocking_reasons"):
+            print("  阻断:")
+            for item in artifacts.summary["blocking_reasons"]:
+                print(f"    - {item}")
+        return
+
+    if args.earnings_action == "auction-execution-review":
+        artifacts = run_opening_auction_execution_review(
+            Path(args.root).expanduser(),
+            opening_snapshot_path=Path(args.opening_snapshots).expanduser(),
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_AUCTION_EXECUTION_LABEL,
+            top_n=int(args.top_n),
+            position_mode=args.position_mode,
+            portfolio_notional=float(args.portfolio_notional),
+            capped_max_weight=float(args.capped_max_weight),
+            volume_unit=args.volume_unit,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告开盘竞价可靠性回测完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  HTML: {artifacts.html_path}")
+        print(f"  持仓: {artifacts.holdings_path}")
+        print(f"  交易: {artifacts.trades_path}")
+        print(f"  买单意图: {artifacts.order_intents_path}")
+        execution_summary = artifacts.summary.get("auction_execution_summary") or {}
+        if isinstance(execution_summary, dict) and execution_summary:
+            print(
+                "  摘要: "
+                f"买单完全成交率 {float(execution_summary.get('filled_order_rate', 0.0)) * 100:.2f}%, "
+                f"股数执行率 {float(execution_summary.get('executed_shares_ratio', 0.0)) * 100:.2f}%"
+            )
         return
 
     costs = _parse_float_csv(args.costs) if getattr(args, "costs", None) else None
@@ -2810,6 +2915,356 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         )
 
 
+def _trade_status_summary(
+    root: Path,
+    *,
+    bridge_url: str | None = None,
+    bridge_token: str | None = None,
+    bridge_account_id: str | None = None,
+) -> dict[str, object]:
+    """Return a read-only summary of local Trade artifacts."""
+
+    trade_root = root.expanduser() / "trade"
+    executions_root = trade_root / "executions"
+    execution_dirs = sorted([path for path in executions_root.glob("*") if path.is_dir()]) if executions_root.exists() else []
+    latest = execution_dirs[-1].name if execution_dirs else None
+    payload: dict[str, object] = {
+        "workspace": str(root.expanduser()),
+        "trade_root": str(trade_root),
+        "execution_count": len(execution_dirs),
+        "latest_exec_id": latest,
+        "paper_ready": True,
+        "qmt_ready": False,
+        "qmt_blocking_reason": "Windows VM / QMT / bridge POC not connected",
+    }
+    if not bridge_url:
+        return payload
+    payload.update(
+        {
+            "qmt_bridge_url": bridge_url,
+            "qmt_account_id": bridge_account_id or "",
+        }
+    )
+    from vortex.trade import QmtBridgeAdapter, QmtBridgeConfig, is_known_connection_status_bug
+
+    adapter = QmtBridgeAdapter(
+        QmtBridgeConfig(
+            base_url=bridge_url,
+            token=bridge_token,
+            account_id=bridge_account_id or None,
+            allow_trading=False,
+        )
+    )
+    health = adapter.health()
+    payload["qmt_health"] = {"ok": health.ok, "message": health.message}
+    if not health.ok:
+        payload["qmt_blocking_reason"] = f"bridge health failed: {health.message}"
+        return payload
+    try:
+        connection = adapter.connection_status()
+        cash = adapter.get_cash()
+        positions = adapter.get_positions()
+        orders = adapter.get_orders()
+        fills = adapter.get_fills()
+    except Exception as exc:  # noqa: BLE001 - status command should surface failure in payload.
+        payload["qmt_blocking_reason"] = f"bridge read failed: {exc}"
+        return payload
+    payload.update(
+        {
+            "qmt_connection_status": connection,
+            "qmt_cash": cash.available_cash,
+            "qmt_market_value": cash.market_value,
+            "qmt_position_count": len(positions),
+            "qmt_order_count": len(orders),
+            "qmt_fill_count": len(fills),
+            "qmt_ready": True,
+            "qmt_blocking_reason": "-",
+        }
+    )
+    if isinstance(connection, dict) and connection.get("connected") is False:
+        if is_known_connection_status_bug(connection):
+            payload["qmt_connection_status_warning"] = (
+                "bridge connection_status endpoint uses incompatible xtdata API; "
+                "treated as non-blocking because cash/positions/orders/fills are readable"
+            )
+        else:
+            payload["qmt_ready"] = False
+            payload["qmt_blocking_reason"] = f"bridge connected=false: {connection}"
+    return payload
+
+
+def _trade_quote_summary(
+    root: Path,
+    *,
+    symbols: tuple[str, ...],
+    bridge_url: str | None = None,
+    bridge_token: str | None = None,
+    bridge_account_id: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "root": str(root.expanduser()),
+        "symbols": list(symbols),
+        "qmt_ready": False,
+        "qmt_blocking_reason": "-",
+        "qmt_health": {"ok": False, "message": "未探测"},
+        "quotes": {},
+    }
+    if not symbols:
+        raise ValueError("symbols 不能为空")
+    if not bridge_url:
+        payload["qmt_blocking_reason"] = "缺少 --qmt-bridge-url"
+        return payload
+
+    from vortex.trade import QmtBridgeAdapter, QmtBridgeConfig
+
+    adapter = QmtBridgeAdapter(
+        QmtBridgeConfig(
+            base_url=bridge_url,
+            token=bridge_token,
+            account_id=bridge_account_id or None,
+            allow_trading=False,
+        )
+    )
+    health = adapter.health()
+    payload["qmt_health"] = {"ok": health.ok, "message": health.message}
+    if not health.ok:
+        payload["qmt_blocking_reason"] = f"bridge health failed: {health.message}"
+        return payload
+    try:
+        quotes = adapter.get_quotes(list(symbols))
+    except Exception as exc:  # noqa: BLE001 - quote command should surface failure in payload.
+        payload["qmt_blocking_reason"] = f"bridge quote failed: {exc}"
+        return payload
+    payload["quotes"] = {
+        symbol: {
+            "open_price": quote.open_price,
+            "last_price": quote.last_price,
+            "volume": quote.volume,
+            "amount": quote.amount,
+            "is_suspended": quote.is_suspended,
+            "is_limit_up": quote.is_limit_up,
+            "is_limit_down": quote.is_limit_down,
+        }
+        for symbol, quote in quotes.items()
+    }
+    payload["qmt_ready"] = True
+    return payload
+
+
+def _trade_execution_report_path(root: Path, exec_id: str | None) -> Path:
+    root = root.expanduser()
+    if exec_id:
+        return root / "trade" / "executions" / exec_id / "execution_report.json"
+    latest = _trade_status_summary(root)["latest_exec_id"]
+    if not latest:
+        raise FileNotFoundError("没有可 inspect/reconcile 的 trade execution")
+    return root / "trade" / "executions" / str(latest) / "execution_report.json"
+
+
+def _read_trade_quotes(path: Path):
+    from vortex.trade import Quote
+    from vortex.trade.serialization import read_json
+
+    raw = read_json(path.expanduser())
+    rows = raw.get("quotes", raw) if isinstance(raw, dict) else raw
+    if not isinstance(rows, list):
+        raise ValueError("quotes JSON 必须是列表，或包含 quotes 列表字段")
+    quotes = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("quotes JSON 每一项必须是对象")
+        quotes.append(
+            Quote(
+                symbol=str(row["symbol"]),
+                open_price=float(row["open_price"]),
+                last_price=float(row["last_price"]) if row.get("last_price") is not None else None,
+                volume=int(row["volume"]) if row.get("volume") is not None else None,
+                amount=float(row["amount"]) if row.get("amount") is not None else None,
+                is_suspended=bool(row.get("is_suspended", False)),
+                is_limit_up=bool(row.get("is_limit_up", False)),
+                is_limit_down=bool(row.get("is_limit_down", False)),
+            )
+        )
+    return quotes
+
+
+def _read_trade_st_flags(path: Path | None) -> dict[str, bool] | None:
+    if path is None:
+        return None
+    from vortex.trade.serialization import read_json
+
+    raw = read_json(path.expanduser())
+    if isinstance(raw, dict) and "st_flags" in raw:
+        raw = raw["st_flags"]
+    if isinstance(raw, dict):
+        return {str(symbol): bool(flag) for symbol, flag in raw.items()}
+    if isinstance(raw, list):
+        flags: dict[str, bool] = {}
+        for row in raw:
+            if not isinstance(row, dict):
+                raise ValueError("st_flags JSON 列表每一项必须是对象")
+            flags[str(row["symbol"])] = bool(row.get("is_st", row.get("st", False)))
+        return flags
+    raise ValueError("st_flags JSON 必须是 symbol->bool 对象、列表，或包含 st_flags 字段")
+
+
+def _run_trade_paper_rebalance(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade import PaperBrokerAdapter, PaperBrokerConfig
+    from vortex.trade.execution import run_paper_rebalance
+    from vortex.trade.order_plan import OrderPlanConfig
+    from vortex.trade.risk import PreTradeRiskConfig
+    from vortex.trade.serialization import read_json, target_portfolio_from_dict
+
+    portfolio = target_portfolio_from_dict(read_json(Path(args.target_portfolio).expanduser()))
+    quotes = _read_trade_quotes(Path(args.quotes))
+    st_flags = _read_trade_st_flags(Path(args.st_flags).expanduser() if args.st_flags else None)
+    broker = PaperBrokerAdapter(
+        PaperBrokerConfig(
+            initial_cash=float(args.initial_cash),
+            commission_bps=float(args.commission_bps),
+            min_commission=float(args.min_commission),
+            stamp_duty_sell_bps=float(args.stamp_duty_sell_bps),
+            max_participation_rate=float(args.max_participation_rate),
+            allow_trading=not bool(args.disable_trading),
+        )
+    )
+    artifacts = run_paper_rebalance(
+        portfolio,
+        broker=broker,
+        quotes=quotes,
+        output_root=Path(args.root).expanduser(),
+        st_flags=st_flags,
+        order_config=OrderPlanConfig(
+            buy_limit_bps=float(args.buy_limit_bps),
+            sell_limit_bps=float(args.sell_limit_bps),
+            min_order_value=float(args.min_order_value),
+        ),
+        risk_config=PreTradeRiskConfig(
+            mode="paper",
+            require_st_data=not bool(args.allow_missing_st_data),
+            max_order_count=int(args.max_order_count),
+            max_single_order_value=float(args.max_single_order_value),
+            max_daily_order_value=float(args.max_daily_order_value),
+        ),
+    )
+    report = artifacts.report
+    return {
+        "exec_id": artifacts.exec_id,
+        "risk_passed": report.risk_result.passed,
+        "blocking_reasons": report.risk_result.blocking_reasons,
+        "order_count": len(report.orders),
+        "fill_count": len(report.fills),
+        "cash": report.cash.available_cash,
+        "market_value": report.cash.market_value,
+        "order_intent_path": str(artifacts.order_intent_path),
+        "order_plan_path": str(artifacts.order_plan_path),
+        "risk_result_path": str(artifacts.risk_result_path),
+        "execution_report_path": str(artifacts.execution_report_path),
+        "execution_report_md_path": str(artifacts.execution_report_md_path),
+    }
+
+
+def _trade_inspect_summary(root: Path, exec_id: str | None = None) -> dict[str, object]:
+    from vortex.trade.serialization import execution_report_from_dict, read_json
+
+    path = _trade_execution_report_path(root, exec_id)
+    report = execution_report_from_dict(read_json(path))
+    return {
+        "exec_id": report.exec_id,
+        "mode": report.mode,
+        "trade_date": report.trade_date,
+        "portfolio_id": report.portfolio_id,
+        "risk_passed": report.risk_result.passed,
+        "blocking_reasons": report.risk_result.blocking_reasons,
+        "warnings": report.risk_result.warnings,
+        "order_count": len(report.orders),
+        "fill_count": len(report.fills),
+        "position_count": len(report.positions),
+        "cash": report.cash.available_cash,
+        "market_value": report.cash.market_value,
+        "unfilled_summary": report.unfilled_summary,
+        "slippage_summary": report.slippage_summary,
+        "execution_report_path": str(path),
+    }
+
+
+def _run_trade_reconcile(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade.reconcile import reconcile_execution_report, write_reconcile_report
+    from vortex.trade.serialization import execution_report_from_dict, read_json
+
+    path = _trade_execution_report_path(Path(args.root), args.exec_id)
+    report = execution_report_from_dict(read_json(path))
+    reconcile = reconcile_execution_report(
+        report,
+        cash_tolerance=float(args.cash_tolerance),
+        share_tolerance=int(args.share_tolerance),
+    )
+    reconcile_path = path.parent / "reconcile_report.json"
+    write_reconcile_report(reconcile_path, reconcile)
+    return {
+        "reconcile_id": reconcile.reconcile_id,
+        "exec_id": reconcile.exec_id,
+        "abnormal": reconcile.abnormal,
+        "cash_diff": reconcile.cash_diff,
+        "position_diff_count": len(reconcile.position_diffs),
+        "order_diff_count": len(reconcile.order_diffs),
+        "fill_diff_count": len(reconcile.fill_diffs),
+        "blocking_reasons": reconcile.blocking_reasons,
+        "reconcile_report_path": str(reconcile_path),
+    }
+
+
+def _print_trade_dict(title: str, payload: dict[str, object]) -> None:
+    print(title)
+    for key, value in payload.items():
+        if isinstance(value, bool):
+            value = "yes" if value else "no"
+        elif isinstance(value, list):
+            value = ", ".join(str(item) for item in value) if value else "-"
+        elif isinstance(value, dict):
+            value = json.dumps(value, ensure_ascii=False)
+        elif value is None:
+            value = "-"
+        print(f"  {key}: {value}")
+
+
+def cmd_trade(args: argparse.Namespace) -> None:
+    """交易执行入口。"""
+
+    if args.trade_action == "status":
+        payload = _trade_status_summary(
+            Path(args.root),
+            bridge_url=getattr(args, "qmt_bridge_url", None),
+            bridge_token=getattr(args, "qmt_bridge_token", None),
+            bridge_account_id=getattr(args, "qmt_account_id", None),
+        )
+        title = "Trade 状态"
+    elif args.trade_action == "quote":
+        payload = _trade_quote_summary(
+            Path(args.root),
+            symbols=_parse_str_csv(args.symbols),
+            bridge_url=getattr(args, "qmt_bridge_url", None),
+            bridge_token=getattr(args, "qmt_bridge_token", None),
+            bridge_account_id=getattr(args, "qmt_account_id", None),
+        )
+        title = "Trade 实时行情"
+    elif args.trade_action == "inspect":
+        payload = _trade_inspect_summary(Path(args.root), args.exec_id)
+        title = "Trade 执行检查"
+    elif args.trade_action == "reconcile":
+        payload = _run_trade_reconcile(args)
+        title = "Trade 对账完成"
+    elif args.trade_action == "paper" and args.trade_paper_action == "rebalance":
+        payload = _run_trade_paper_rebalance(args)
+        title = "Paper rebalance 完成"
+    else:
+        raise SystemExit(f"未知 trade 子命令: {args.trade_action}")
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    _print_trade_dict(title, payload)
+
+
 def _parse_float_csv(raw: str) -> tuple[float, ...]:
     values = []
     for item in raw.split(","):
@@ -2819,6 +3274,24 @@ def _parse_float_csv(raw: str) -> tuple[float, ...]:
     if not values:
         raise ValueError("浮点列表不能为空")
     return tuple(values)
+
+
+def _parse_int_csv(raw: str) -> tuple[int, ...]:
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(int(item))
+    if not values:
+        raise ValueError("整数列表不能为空")
+    return tuple(values)
+
+
+def _parse_str_csv(raw: str) -> tuple[str, ...]:
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError("字符串列表不能为空")
+    return values
 
 
 # ------------------------------------------------------------------
@@ -3029,6 +3502,128 @@ def main() -> None:
     )
     shadow_sub.add_argument("--format", choices=["text", "json"], default="text")
 
+    handoff_sub = earnings_sub.add_parser(
+        "live-handoff",
+        parents=[root_parser],
+        help="生成影子目标 + qmt-bridge 账户快照的实盘交接包",
+    )
+    handoff_sub.add_argument("--start", required=True, help="影子跟踪回看起始日期 YYYYMMDD")
+    handoff_sub.add_argument("--as-of", required=True, help="目标持仓日期 YYYYMMDD")
+    handoff_sub.add_argument("--qmt-bridge-url", required=True, help="qmt-bridge 地址，例如 http://10.0.0.2:8000")
+    handoff_sub.add_argument("--qmt-bridge-token", help="qmt-bridge API Token（只读可选，按服务端配置）")
+    handoff_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
+    handoff_sub.add_argument("--output-dir", help="交接 JSON/HTML 输出目录；默认 workspace/strategy")
+    handoff_sub.add_argument("--artifact-dir", help="目标持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
+    handoff_sub.add_argument("--label", help="输出文件名前缀")
+    handoff_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    handoff_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    opening_liquidity_sub = earnings_sub.add_parser(
+        "opening-liquidity-review",
+        parents=[root_parser],
+        help="基于外部开盘快照复核开盘卖一容量",
+    )
+    opening_liquidity_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    opening_liquidity_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    opening_liquidity_sub.add_argument("--opening-snapshots", required=True, help="开盘快照 CSV/JSON/Parquet 路径")
+    opening_liquidity_sub.add_argument("--output-dir", help="JSON/CSV/Markdown 输出目录；默认 workspace/strategy")
+    opening_liquidity_sub.add_argument("--label", help="输出文件名前缀")
+    opening_liquidity_sub.add_argument("--top-n-values", default="30,40,50", help="TopN 网格，默认 30,40,50")
+    opening_liquidity_sub.add_argument(
+        "--position-modes",
+        default="full_equal_selected,capped_with_cash",
+        help="仓位模式网格，默认 full_equal_selected,capped_with_cash",
+    )
+    opening_liquidity_sub.add_argument("--portfolio-notional", type=float, default=1_000_000.0)
+    opening_liquidity_sub.add_argument("--capped-max-weight", type=float, default=0.05)
+    opening_liquidity_sub.add_argument("--volume-unit", choices=["shares", "lots"], default="shares")
+    opening_liquidity_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    opening_liquidity_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    auction_execution_sub = earnings_sub.add_parser(
+        "auction-execution-review",
+        parents=[root_parser],
+        help="把开盘竞价成交量约束真正施加到正式回测执行里",
+    )
+    auction_execution_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    auction_execution_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    auction_execution_sub.add_argument("--opening-snapshots", required=True, help="开盘竞价快照 CSV/JSON/Parquet 或 dataset 目录")
+    auction_execution_sub.add_argument("--output-dir", help="JSON/HTML 报告输出目录；默认 workspace/strategy")
+    auction_execution_sub.add_argument("--artifact-dir", help="持仓/成交/买单意图输出目录；默认 workspace/strategy/artifacts")
+    auction_execution_sub.add_argument("--label", help="输出文件名前缀")
+    auction_execution_sub.add_argument("--top-n", type=int, default=30, help="目标持仓上限，默认 30")
+    auction_execution_sub.add_argument(
+        "--position-mode",
+        choices=["full_equal_selected", "capped_with_cash"],
+        default="capped_with_cash",
+        help="仓位模式，默认 capped_with_cash",
+    )
+    auction_execution_sub.add_argument("--portfolio-notional", type=float, default=1_000_000.0)
+    auction_execution_sub.add_argument("--capped-max-weight", type=float, default=0.05)
+    auction_execution_sub.add_argument("--volume-unit", choices=["shares", "lots"], default="shares")
+    auction_execution_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    auction_execution_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    # --- vortex trade ---
+    trade_parser = subparsers.add_parser("trade", help="交易执行")
+    trade_sub = trade_parser.add_subparsers(dest="trade_action")
+    trade_status = trade_sub.add_parser("status", parents=[root_parser], help="查看交易线状态")
+    trade_status.add_argument("--qmt-bridge-url", default=os.getenv("QMT_BRIDGE_BASE_URL"), help="qmt-bridge 地址")
+    trade_status.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    trade_status.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID（可选）")
+    trade_status.add_argument("--format", choices=["text", "json"], default="text")
+    trade_quote = trade_sub.add_parser("quote", parents=[root_parser], help="通过 qmt-bridge 拉取实时行情")
+    trade_quote.add_argument("--symbols", required=True, help="股票列表，逗号分隔，例如 000001.SZ,600000.SH")
+    trade_quote.add_argument("--qmt-bridge-url", default=os.getenv("QMT_BRIDGE_BASE_URL"), help="qmt-bridge 地址")
+    trade_quote.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    trade_quote.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID（可选）")
+    trade_quote.add_argument("--format", choices=["text", "json"], default="text")
+    trade_inspect = trade_sub.add_parser("inspect", parents=[root_parser], help="查看某次执行报告摘要")
+    trade_inspect.add_argument("--exec-id", help="执行 ID；默认取最近一次")
+    trade_inspect.add_argument("--format", choices=["text", "json"], default="text")
+    trade_reconcile = trade_sub.add_parser("reconcile", parents=[root_parser], help="对账某次执行报告")
+    trade_reconcile.add_argument("--exec-id", help="执行 ID；默认取最近一次")
+    trade_reconcile.add_argument("--cash-tolerance", type=float, default=1.0, help="现金差异容忍度")
+    trade_reconcile.add_argument("--share-tolerance", type=int, default=0, help="持仓股数差异容忍度")
+    trade_reconcile.add_argument("--format", choices=["text", "json"], default="text")
+
+    trade_paper = trade_sub.add_parser("paper", help="本地 paper broker")
+    trade_paper_sub = trade_paper.add_subparsers(dest="trade_paper_action")
+    paper_rebalance = trade_paper_sub.add_parser(
+        "rebalance",
+        parents=[root_parser],
+        help="使用 target_portfolio 与 quotes JSON 运行本地 paper rebalance",
+    )
+    paper_rebalance.add_argument("--target-portfolio", required=True, help="target_portfolio.json 路径")
+    paper_rebalance.add_argument("--quotes", required=True, help="quotes JSON 路径")
+    paper_rebalance.add_argument("--st-flags", help="ST 标记 JSON 路径；默认缺失会触发 fail-closed 风控")
+    paper_rebalance.add_argument("--allow-missing-st-data", action="store_true", help="允许缺少 ST 标记数据")
+    paper_rebalance.add_argument("--initial-cash", type=float, default=1_000_000.0)
+    paper_rebalance.add_argument("--max-participation-rate", type=float, default=0.05)
+    paper_rebalance.add_argument("--commission-bps", type=float, default=2.5)
+    paper_rebalance.add_argument("--min-commission", type=float, default=5.0)
+    paper_rebalance.add_argument("--stamp-duty-sell-bps", type=float, default=5.0)
+    paper_rebalance.add_argument("--buy-limit-bps", type=float, default=30.0)
+    paper_rebalance.add_argument("--sell-limit-bps", type=float, default=30.0)
+    paper_rebalance.add_argument("--min-order-value", type=float, default=3_000.0)
+    paper_rebalance.add_argument("--max-order-count", type=int, default=80)
+    paper_rebalance.add_argument("--max-single-order-value", type=float, default=100_000.0)
+    paper_rebalance.add_argument("--max-daily-order-value", type=float, default=1_000_000.0)
+    paper_rebalance.add_argument("--disable-trading", action="store_true", help="生成报告但禁用 broker 提交")
+    paper_rebalance.add_argument("--format", choices=["text", "json"], default="text")
+
     args = parser.parse_args()
 
     # 日志
@@ -3046,5 +3641,7 @@ def main() -> None:
             cmd_data(args)
         case "strategy":
             cmd_strategy(args)
+        case "trade":
+            cmd_trade(args)
         case _:
             parser.print_help()
