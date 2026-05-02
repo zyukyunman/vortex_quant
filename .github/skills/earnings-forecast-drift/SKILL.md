@@ -69,6 +69,7 @@ forecast.ann_date
 | forecast surprise 因子评测 | 已补，结论是单因子中等偏正，60 日最好 | 后续看分组单调性和是否能发布 signal |
 | 全历史 `stk_limit` / `suspend_d` | 已补齐并完成精确复核 | 后续用 shadow trading 验证当期数据延迟和真实成交 |
 | 1 亿元容量尾部 | 默认版 P99 参与率约 8.43%，安全版约 8.20% | 继续评估更高流动性阈值、冲击成本和小资金上线规模 |
+| 开盘卖一容量复核 | 已补 conservative ask1 容量分析框架，可对比计划买单与 `ask1_volume` | 下一步接入历史开盘快照，先跑 100 万 / Top30-50 小资金矩阵 |
 | 持仓归档与报告 | 用户要看每天买了什么 | 保留持仓 CSV、JSON 摘要和安全性 HTML |
 | artifact 治理 | 大 CSV/PNG 不应长期堆在核心仓库 | 迁移到 workspace，核心仓库保留摘要和代表性报告 |
 
@@ -98,6 +99,18 @@ forecast.ann_date
 6. 复核不要再复制临时脚本，使用正式入口：
    - `vortex strategy earnings-forecast precise-review`
    - `vortex strategy earnings-forecast shadow-plan`
+   - `vortex strategy earnings-forecast opening-liquidity-review`
+
+开盘卖一容量复核要求外部快照至少提供：
+
+```text
+date,symbol,open_price,ask1_price,ask1_volume
+```
+
+这条复核的定位是保守下界，不是完整撮合回放：
+
+1. 连卖一都不够，说明“开盘价能买到”的假设不稳。
+2. 卖一已经足够覆盖至少一手或大部分目标股数，小资金版本才更接近可执行。
 
 ---
 
