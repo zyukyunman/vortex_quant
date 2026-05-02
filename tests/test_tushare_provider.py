@@ -143,6 +143,80 @@ class TestTushareTradeDayResume:
             ["daily"],
         )
 
+
+class TestTushareMinuteFetch:
+    def test_fetch_minute_range_splits_by_freq_safe_windows(self, monkeypatch):
+        provider = object.__new__(tushare_provider.TushareProvider)
+        calls: list[dict[str, object]] = []
+
+        monkeypatch.setattr(provider, "_check_cancel_requested", lambda _cancel_check: None)
+        monkeypatch.setattr(
+            provider,
+            "_emit_loop_progress",
+            lambda *_args, **_kwargs: None,
+        )
+
+        def _fake_call(api_name: str, **kwargs):
+            calls.append({"api": api_name, **kwargs})
+            return pd.DataFrame(
+                {
+                    "ts_code": [kwargs["ts_code"]],
+                    "trade_time": [str(kwargs["start_date"])],
+                    "open": [1.0],
+                    "close": [1.0],
+                    "high": [1.0],
+                    "low": [1.0],
+                    "vol": [100.0],
+                    "amount": [1000.0],
+                }
+            )
+
+        monkeypatch.setattr(provider, "_call_dataset_api", _fake_call)
+
+        result = provider._fetch_minute_range(
+            ["000001.SZ"],
+            date(2026, 1, 1),
+            date(2026, 2, 5),
+            freq="1min",
+        )
+
+        assert len(calls) == 2
+        assert calls[0]["api"] == "stk_mins"
+        assert calls[0]["freq"] == "1min"
+        assert calls[0]["start_date"] == "20260101 09:30:00"
+        assert calls[0]["end_date"] == "20260130 15:00:00"
+        assert calls[1]["start_date"] == "20260131 09:30:00"
+        assert calls[1]["end_date"] == "20260205 15:00:00"
+        assert result["freq"].tolist() == ["1min", "1min"]
+
+    def test_normalize_stk_mins_derives_date_and_minute(self):
+        provider = object.__new__(tushare_provider.TushareProvider)
+
+        result = provider._normalize_dataset_frame(
+            "stk_mins",
+            pd.DataFrame(
+                {
+                    "ts_code": ["000001.SZ"],
+                    "trade_time": ["2026-01-05 09:31:00"],
+                    "open": [10.0],
+                    "close": [10.1],
+                    "high": [10.2],
+                    "low": [9.9],
+                    "vol": [1000.0],
+                    "amount": [10000.0],
+                    "freq": ["1min"],
+                }
+            ),
+            start=date(2026, 1, 5),
+            end=date(2026, 1, 5),
+        )
+
+        assert result["symbol"].tolist() == ["000001.SZ"]
+        assert result["date"].tolist() == ["20260105"]
+        assert result["minute"].tolist() == ["09:31:00"]
+        assert result["volume"].tolist() == [1000.0]
+        assert result["freq"].tolist() == ["1min"]
+
     def test_trade_day_all_fallback_uses_current_market(self, monkeypatch):
         provider = object.__new__(tushare_provider.TushareProvider)
         captured: dict[str, object] = {}
@@ -586,6 +660,67 @@ class TestTushareApiAccessRules:
         assert get_tushare_dataset_access_rule(dataset)["min_points"] == 2000
         assert get_tushare_dataset_api_doc_url(dataset)
 
+    @pytest.mark.parametrize(
+        ("dataset", "expected_row_limit"),
+        [("stk_auction_o", 10000), ("stk_auction_c", 10000), ("stk_auction", 8000)],
+    )
+    def test_auction_datasets_are_registered_as_permission_gated_symbol_range(
+        self,
+        dataset: str,
+        expected_row_limit: int,
+    ):
+        spec = get_tushare_dataset_spec(dataset)
+
+        assert spec["fetch_mode"] == "symbol_range"
+        assert spec["partition_by"] == "date"
+        assert spec["date_batch_supported"] is True
+        assert spec["date_batch_row_limit"] == expected_row_limit
+        assert get_tushare_dataset_update_frequency(dataset) == "daily"
+        access = get_tushare_dataset_access_rule(dataset)
+        assert access["access"] == "permission"
+        assert access["permission_key"] == "stock_minutes"
+        assert get_tushare_dataset_api_doc_url(dataset)
+
+    def test_stk_mins_is_registered_as_chunked_intraday_dataset(self):
+        spec = get_tushare_dataset_spec("stk_mins")
+
+        assert spec["fetch_mode"] == "minute_range"
+        assert spec["partition_by"] == "date"
+        assert spec["freq"] == "1min"
+        assert spec["single_request_row_limit"] == 8000
+        assert get_tushare_dataset_update_frequency("stk_mins") == "intraday"
+        access = get_tushare_dataset_access_rule("stk_mins")
+        assert access["access"] == "permission"
+        assert access["permission_key"] == "stock_minutes"
+        assert get_tushare_dataset_api_doc_url("stk_mins").endswith("doc_id=370")
+
+    def test_stk_nineturn_is_registered_as_daily_technical_dataset(self):
+        spec = get_tushare_dataset_spec("stk_nineturn")
+
+        assert spec["fetch_mode"] == "symbol_range"
+        assert spec["partition_by"] == "date"
+        assert spec["date_batch_supported"] is True
+        assert spec["date_batch_row_limit"] == 10000
+        assert spec["date_batch_params"] == {"freq": "daily"}
+        assert spec["symbol_range_params"] == {"freq": "daily"}
+        assert get_tushare_dataset_update_frequency("stk_nineturn") == "daily"
+        access = get_tushare_dataset_access_rule("stk_nineturn")
+        assert access["access"] == "points"
+        assert access["min_points"] == 6000
+        assert get_tushare_dataset_api_doc_url("stk_nineturn").endswith("doc_id=364")
+
+    @pytest.mark.parametrize("dataset", ["cyq_perf", "cyq_chips"])
+    def test_cyq_datasets_are_registered_as_daily_symbol_range(self, dataset: str):
+        spec = get_tushare_dataset_spec(dataset)
+
+        assert spec["fetch_mode"] == "symbol_range"
+        assert spec["partition_by"] == "date"
+        assert get_tushare_dataset_update_frequency(dataset) == "daily"
+        access = get_tushare_dataset_access_rule(dataset)
+        assert access["access"] == "points"
+        assert access["min_points"] == 5000
+        assert get_tushare_dataset_api_doc_url(dataset)
+
     def test_quarter_statement_uses_partition_values_as_exact_quarter_gaps(self, monkeypatch):
         provider = self._build_provider(points=2000)
         calls: list[tuple[str, dict[str, object]]] = []
@@ -857,6 +992,176 @@ class TestTushareDatasetContracts:
             "partition_values": ["20260410"],
         }
 
+    def test_fetch_cyq_perf_uses_symbol_range_contract(self, monkeypatch):
+        provider = self._build_provider()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda api_name, symbols, start, end, **kwargs: (
+                captured.update(
+                    {
+                        "api_name": api_name,
+                        "symbols": list(symbols),
+                        "start": start,
+                        "end": end,
+                        "partition_values": list(kwargs.get("partition_values") or []),
+                    }
+                )
+                or pd.DataFrame({"ts_code": ["000001.SZ"], "trade_date": ["20260410"], "winner_rate": [52.3]})
+            ),
+        )
+        monkeypatch.setattr(provider, "_normalize_dataset_frame", lambda _dataset, raw, **_kwargs: raw)
+
+        result = provider.fetch_dataset(
+            "cyq_perf",
+            "cn_stock",
+            date(2026, 4, 1),
+            date(2026, 4, 30),
+            symbols=["000001.SZ"],
+            partition_values=["20260410"],
+        )
+
+        assert captured == {
+            "api_name": "cyq_perf",
+            "symbols": ["000001.SZ"],
+            "start": date(2026, 4, 1),
+            "end": date(2026, 4, 30),
+            "partition_values": ["20260410"],
+        }
+        assert result["ts_code"].tolist() == ["000001.SZ"]
+
+    def test_fetch_stk_auction_o_prefers_date_batch_contract(self, monkeypatch):
+        provider = self._build_provider()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_trade_day_all",
+            lambda api_name, trading_days, **_kwargs: (
+                captured.update(
+                    {
+                        "api_name": api_name,
+                        "trading_days": [day.strftime("%Y%m%d") for day in trading_days],
+                    }
+                )
+                or pd.DataFrame({"ts_code": ["000001.SZ"], "trade_date": ["20260410"], "vol": [45400.0]})
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda *_args, **_kwargs: pytest.fail("单日竞价数据应优先走日期整批抓取"),
+        )
+        monkeypatch.setattr(provider, "_normalize_dataset_frame", lambda _dataset, raw, **_kwargs: raw)
+
+        result = provider.fetch_dataset(
+            "stk_auction_o",
+            "cn_stock",
+            date(2026, 4, 10),
+            date(2026, 4, 10),
+            symbols=["000001.SZ"],
+            trading_days=[date(2026, 4, 10)],
+            partition_values=["20260410"],
+        )
+
+        assert captured == {
+            "api_name": "stk_auction_o",
+            "trading_days": ["20260410"],
+        }
+        assert result["ts_code"].tolist() == ["000001.SZ"]
+
+
+    def test_fetch_stk_auction_prefers_date_batch_without_symbols(self, monkeypatch):
+        provider = self._build_provider()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_trade_day_all",
+            lambda api_name, trading_days, **_kwargs: (
+                captured.update(
+                    {
+                        "api_name": api_name,
+                        "trading_days": [day.strftime("%Y%m%d") for day in trading_days],
+                    }
+                )
+                or pd.DataFrame({"ts_code": ["000001.SZ"], "trade_date": ["20260410"], "price": [10.0], "vol": [1000]})
+            ),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda *_args, **_kwargs: pytest.fail("未提供 symbols 时应直接走日期整批抓取"),
+        )
+        monkeypatch.setattr(provider, "_normalize_dataset_frame", lambda _dataset, raw, **_kwargs: raw)
+
+        result = provider.fetch_dataset(
+            "stk_auction",
+            "cn_stock",
+            date(2026, 4, 10),
+            date(2026, 4, 10),
+            trading_days=[date(2026, 4, 10)],
+            partition_values=["20260410"],
+        )
+
+        assert captured == {
+            "api_name": "stk_auction",
+            "trading_days": ["20260410"],
+        }
+        assert result["ts_code"].tolist() == ["000001.SZ"]
+
+    def test_fetch_stk_auction_falls_back_to_symbol_range_for_small_symbol_set(self, monkeypatch):
+        provider = self._build_provider()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_trade_day_all",
+            lambda *_args, **_kwargs: pytest.fail("少量股票跨多日抓取应优先走按股票区间抓取"),
+        )
+        monkeypatch.setattr(
+            provider,
+            "_fetch_symbol_range",
+            lambda api_name, symbols, start, end, **kwargs: (
+                captured.update(
+                    {
+                        "api_name": api_name,
+                        "symbols": list(symbols),
+                        "start": start,
+                        "end": end,
+                        "partition_values": list(kwargs.get("partition_values") or []),
+                    }
+                )
+                or pd.DataFrame({"ts_code": ["000001.SZ"], "trade_date": ["20260410"], "price": [10.0], "vol": [1000]})
+            ),
+        )
+        monkeypatch.setattr(provider, "_normalize_dataset_frame", lambda _dataset, raw, **_kwargs: raw)
+
+        result = provider.fetch_dataset(
+            "stk_auction",
+            "cn_stock",
+            date(2026, 4, 10),
+            date(2026, 4, 11),
+            symbols=["000001.SZ"],
+            trading_days=[date(2026, 4, 10), date(2026, 4, 11)],
+            partition_values=["20260410", "20260411"],
+        )
+
+        assert captured == {
+            "api_name": "stk_auction",
+            "symbols": ["000001.SZ"],
+            "start": date(2026, 4, 10),
+            "end": date(2026, 4, 11),
+            "partition_values": ["20260410", "20260411"],
+        }
+        assert result["ts_code"].tolist() == ["000001.SZ"]
+
     def test_index_daily_code_loader_uses_research_default_benchmark_pool(self):
         provider = self._build_provider()
         provider._fetch_index_reference = lambda _api_name: (_ for _ in ()).throw(AssertionError("should not load catalog"))
@@ -964,3 +1269,60 @@ class TestTushareDatasetContracts:
         assert "stock_company" in datasets
         assert "st" not in datasets
         assert "limit_step" not in datasets
+        assert "cyq_perf" not in datasets
+        assert "cyq_chips" not in datasets
+
+    def test_fetch_realtime_quote_uses_realtime_quote_snapshot_contract(self, monkeypatch):
+        provider = self._build_provider()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(provider, "_check_market", lambda _market: None)
+        monkeypatch.setattr(
+            provider,
+            "_fetch_realtime_quote_snapshot",
+            lambda symbols, **_kwargs: (
+                captured.update({"symbols": list(symbols)})
+                or pd.DataFrame({"TS_CODE": ["000001.SZ"], "DATE": ["20260430"], "A1_P": [11.49], "A1_V": [8673]})
+            ),
+        )
+
+        result = provider.fetch_dataset(
+            "realtime_quote",
+            "cn_stock",
+            date(2026, 4, 30),
+            date(2026, 4, 30),
+        )
+
+        assert captured == {"symbols": []}
+        assert result["symbol"].tolist() == ["000001.SZ"]
+        assert result["ask1_price"].tolist() == [11.49]
+        assert result["ask1_volume"].tolist() == [8673]
+
+    def test_normalize_realtime_quote_maps_orderbook_fields(self):
+        provider = self._build_provider()
+        raw = pd.DataFrame(
+            {
+                "TS_CODE": ["000001.SZ"],
+                "DATE": ["20260430"],
+                "TIME": ["09:30:00"],
+                "PRICE": [11.49],
+                "A1_P": [11.49],
+                "A1_V": [8673],
+                "B1_P": [11.48],
+                "B1_V": [979],
+                "VOLUME": [113924162],
+                "AMOUNT": [1312828000.0],
+            }
+        )
+
+        result = provider._normalize_dataset_frame("realtime_quote", raw)
+
+        row = result.iloc[0]
+        assert row["symbol"] == "000001.SZ"
+        assert row["date"] == "20260430"
+        assert row["time"] == "09:30:00"
+        assert row["trade_time"] == "20260430 09:30:00"
+        assert row["ask1_price"] == 11.49
+        assert row["ask1_volume"] == 8673
+        assert row["bid1_price"] == 11.48
+        assert row["bid1_volume"] == 979

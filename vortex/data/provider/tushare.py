@@ -105,6 +105,42 @@ def _normalize_date_key(value: object) -> str | None:
     return None
 
 
+def _normalize_minute_freq(value: str) -> str:
+    """校验并规范 Tushare stk_mins 的 freq 参数。"""
+
+    normalized = value.strip().lower()
+    allowed = {"1min", "5min", "15min", "30min", "60min"}
+    if normalized not in allowed:
+        raise DataError(
+            code="DATA_PROVIDER_INVALID_MINUTE_FREQ",
+            message=f"不支持的 stk_mins freq: {value}",
+            detail={"freq": value, "allowed": sorted(allowed)},
+        )
+    return normalized
+
+
+def _resolve_minute_windows(start: date, end: date, freq: str) -> list[tuple[date, date]]:
+    """按官方单次 8000 行上限，把 stk_mins 请求切成安全时间块。"""
+
+    if start > end:
+        return []
+    chunk_days_by_freq = {
+        "1min": 30,
+        "5min": 120,
+        "15min": 365,
+        "30min": 730,
+        "60min": 730,
+    }
+    chunk_days = chunk_days_by_freq[_normalize_minute_freq(freq)]
+    windows: list[tuple[date, date]] = []
+    cursor = start
+    while cursor <= end:
+        window_end = min(end, cursor + timedelta(days=chunk_days - 1))
+        windows.append((cursor, window_end))
+        cursor = window_end + timedelta(days=1)
+    return windows
+
+
 def _concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
@@ -557,6 +593,7 @@ class TushareProvider:
                     start,
                     end,
                     partition_values=partition_values,
+                    api_params=dict(spec.get("symbol_range_params") or {}),
                     progress_callback=progress_callback,
                     cancel_check=cancel_check,
                     progress_label=canonical,
@@ -615,6 +652,7 @@ class TushareProvider:
                 symbols,
                 start,
                 end,
+                freq=str(spec.get("freq") or os.getenv("VORTEX_TUSHARE_STK_MINS_FREQ", "1min")),
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -622,6 +660,14 @@ class TushareProvider:
         elif mode == "realtime_snapshot":
             raw = self._fetch_realtime_snapshot(
                 str(spec["api"]),
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+                progress_label=canonical,
+            )
+        elif mode == "realtime_quote_snapshot":
+            raw = self._fetch_realtime_quote_snapshot(
+                symbols,
+                market=market,
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_label=canonical,
@@ -791,10 +837,16 @@ class TushareProvider:
         if (
             str(spec.get("partition_by") or "").strip() != "date"
             or not spec.get("date_batch_supported")
-            or not symbols
             or not trading_days
         ):
             return "symbol_range", date_batch_api, date_batch_params
+
+        if not symbols:
+            logger.info(
+                "dataset=%s 路径选择: 未提供 symbols，直接走日期整批抓取",
+                dataset,
+            )
+            return "trade_day_all", date_batch_api, date_batch_params
 
         row_limit = spec.get("date_batch_row_limit")
         if isinstance(row_limit, int) and row_limit > 0 and len(symbols) > row_limit:
@@ -861,6 +913,7 @@ class TushareProvider:
         end: date,
         *,
         partition_values: list[str] | None = None,
+        api_params: dict[str, Any] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
@@ -873,6 +926,7 @@ class TushareProvider:
             end,
             partition_values=partition_values,
         )
+        extra_params = dict(api_params or {})
         total_steps = len(year_ranges) * len(symbols)
         current_step = 0
         for year_start, year_end in year_ranges:
@@ -883,6 +937,7 @@ class TushareProvider:
                     ts_code=symbol,
                     start_date=_to_yyyymmdd(year_start),
                     end_date=_to_yyyymmdd(year_end),
+                    **extra_params,
                 )
                 if df is not None and not df.empty:
                     frames.append(df)
@@ -1153,32 +1208,42 @@ class TushareProvider:
         start: date,
         end: date,
         *,
+        freq: str = "1min",
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress_label: str | None = None,
     ) -> pd.DataFrame:
         if not symbols:
             return pd.DataFrame()
+        normalized_freq = _normalize_minute_freq(freq)
         frames = []
-        start_text = f"{_to_yyyymmdd(start)} 09:30:00"
-        end_text = f"{_to_yyyymmdd(end)} 15:00:00"
-        total_steps = len(symbols)
-        for index, symbol in enumerate(symbols, start=1):
-            self._check_cancel_requested(cancel_check)
-            df = self._call_dataset_api(
-                "stk_mins",
-                ts_code=symbol,
-                start_date=start_text,
-                end_date=end_text,
-            )
-            if df is not None and not df.empty:
-                frames.append(df)
-            self._emit_loop_progress(
-                progress_callback,
-                index,
-                total_steps,
-                f"{progress_label or 'minute'} {symbol}",
-            )
+        windows = _resolve_minute_windows(start, end, normalized_freq)
+        total_steps = len(symbols) * len(windows)
+        current_step = 0
+        for symbol in symbols:
+            for window_start, window_end in windows:
+                self._check_cancel_requested(cancel_check)
+                df = self._call_dataset_api(
+                    "stk_mins",
+                    ts_code=symbol,
+                    freq=normalized_freq,
+                    start_date=f"{_to_yyyymmdd(window_start)} 09:30:00",
+                    end_date=f"{_to_yyyymmdd(window_end)} 15:00:00",
+                )
+                if df is not None and not df.empty:
+                    frame = df.copy()
+                    frame["freq"] = normalized_freq
+                    frames.append(frame)
+                current_step += 1
+                self._emit_loop_progress(
+                    progress_callback,
+                    current_step,
+                    total_steps,
+                    (
+                        f"{progress_label or 'minute'} {symbol} {normalized_freq} "
+                        f"{window_start:%Y%m%d}-{window_end:%Y%m%d}"
+                    ),
+                )
         return _concat_frames(frames)
 
     def _fetch_realtime_snapshot(
@@ -1199,6 +1264,38 @@ class TushareProvider:
             df["date"] = date.today().strftime("%Y%m%d")
         self._emit_loop_progress(progress_callback, 1, 1, progress_label or api_name)
         return df
+
+    def _fetch_realtime_quote_snapshot(
+        self,
+        symbols: list[str],
+        *,
+        market: str,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        progress_label: str | None = None,
+        batch_size: int = 30,
+    ) -> pd.DataFrame:
+        """Fetch realtime orderbook snapshots in batched symbol lists."""
+
+        if not symbols:
+            symbols = self.fetch_instruments(market)["symbol"].dropna().astype(str).tolist()
+        if not symbols:
+            return pd.DataFrame()
+        frames = []
+        batches = [symbols[idx : idx + batch_size] for idx in range(0, len(symbols), batch_size)]
+        total_steps = len(batches)
+        for index, batch in enumerate(batches, start=1):
+            self._check_cancel_requested(cancel_check)
+            df = self._call_dataset_api("realtime_quote", ts_code=",".join(batch))
+            if df is not None and not df.empty:
+                frames.append(df)
+            self._emit_loop_progress(
+                progress_callback,
+                index,
+                total_steps,
+                f"{progress_label or 'realtime_quote'} batch {index}/{total_steps}",
+            )
+        return _concat_frames(frames)
 
     # ------------------------------------------------------------------
     # 内部缓存
@@ -1275,6 +1372,7 @@ class TushareProvider:
         rename_map = {
             "vol": "volume",
         }
+        rename_map.update(dict(spec.get("rename_map") or {}))
         if "symbol" not in result.columns:
             for source in symbol_candidates:
                 if source in result.columns:
@@ -1292,6 +1390,10 @@ class TushareProvider:
                     break
 
         result = result.rename(columns=rename_map)
+        if canonical == "realtime_quote" and "date" in result.columns and "time" in result.columns:
+            result["trade_time"] = result["date"].astype(str) + " " + result["time"].astype(str)
+        if canonical == "stk_mins" and "trade_time" in result.columns:
+            result = self._normalize_minute_time_columns(result)
         if spec.get("partition_by") == "date":
             result = self._coalesce_date_column(
                 result,
@@ -1321,6 +1423,8 @@ class TushareProvider:
 
         if "symbol" in result.columns:
             sort_cols.append("symbol")
+        if "trade_time" in result.columns:
+            sort_cols.append("trade_time")
 
         if sort_cols:
             result = result.sort_values(sort_cols).reset_index(drop=True)
@@ -1367,6 +1471,23 @@ class TushareProvider:
 
         result = df.copy()
         result[target_column] = values
+        return result
+
+    @staticmethod
+    def _normalize_minute_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+        """从 stk_mins.trade_time 派生标准 date/minute，供 date partition 和日内聚合使用。"""
+
+        result = df.copy()
+        parsed = pd.to_datetime(result["trade_time"], errors="coerce")
+        fallback_dates = result["trade_time"].map(_normalize_date_key)
+        result["date"] = [
+            value.strftime("%Y%m%d") if pd.notna(value) else fallback
+            for value, fallback in zip(parsed, fallback_dates)
+        ]
+        result["minute"] = [
+            value.strftime("%H:%M:%S") if pd.notna(value) else str(raw)[-8:]
+            for value, raw in zip(parsed, result["trade_time"])
+        ]
         return result
 
     # ------------------------------------------------------------------
@@ -1467,6 +1588,13 @@ class TushareProvider:
                     message="当前 tushare 版本不支持 pro_bar",
                 )
             return self._call_with_retry(api_name, self._ts.pro_bar, **kwargs)
+        if api_name == "realtime_quote":
+            if not hasattr(self._ts, "realtime_quote"):
+                raise DataError(
+                    code="DATA_PROVIDER_API_NOT_FOUND",
+                    message="当前 tushare 版本不支持 realtime_quote",
+                )
+            return self._call_with_retry(api_name, self._ts.realtime_quote, **kwargs)
 
         func = getattr(self._api, api_name, None)
         if callable(func):
