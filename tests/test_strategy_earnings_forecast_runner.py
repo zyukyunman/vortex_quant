@@ -9,14 +9,26 @@ import vortex.cli as cli
 from vortex.data.storage.parquet_duckdb import ParquetDuckDBBackend
 from vortex.runtime.workspace import Workspace
 from vortex.strategy.earnings_forecast_drift import EarningsForecastDriftConfig
+from vortex.strategy.earnings_forecast_cogalpha import run_earnings_forecast_cogalpha_role_cycle
+from vortex.strategy.earnings_forecast_overlay import (
+    run_earnings_forecast_daily_mutation_grid,
+    run_earnings_forecast_factor_overlay_challenge,
+    run_earnings_forecast_overlay_execution_review,
+    run_earnings_forecast_prv_target_pool_review,
+    run_earnings_forecast_regime_budget_challenge,
+    run_earnings_forecast_strategy_robustness_matrix,
+)
 from vortex.strategy.earnings_forecast_runner import (
+    get_earnings_forecast_version_preset,
     load_earnings_forecast_inputs,
     run_opening_auction_execution_review,
     run_opening_liquidity_review,
     run_earnings_forecast_live_handoff,
     run_earnings_forecast_shadow_plan,
+    run_earnings_forecast_version_review,
     run_precise_earnings_forecast_review,
 )
+from vortex.strategy.earnings_forecast_selection import run_earnings_forecast_selection_stability_review
 
 
 def test_load_earnings_forecast_inputs_filters_pre_start_events(tmp_path):
@@ -101,6 +113,477 @@ def test_cmd_strategy_precise_review_outputs_json(tmp_path, capsys):
     assert payload["label"] == "cli-review"
     assert payload["json_path"].endswith("cli-review报告.json")
     assert (root / "strategy" / "reports" / "cli-review报告.json").exists()
+
+
+def test_get_earnings_forecast_version_preset_returns_named_preset():
+    preset = get_earnings_forecast_version_preset("aggressive_100w")
+
+    assert preset.top_n == 30
+    assert preset.candidate_pool_size == 60
+    assert preset.run_lot_execution is True
+
+    challenger = get_earnings_forecast_version_preset("baseline_top110_large")
+
+    assert challenger.top_n == 110
+    assert challenger.candidate_pool_size is None
+    assert challenger.liquidity_rerank_weight == 0.0
+    assert challenger.portfolio_notional == 100_000_000.0
+
+
+def test_run_earnings_forecast_version_review_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_version_review(
+        root,
+        preset_name="aggressive_100w",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "version-review",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="version-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.metrics_path.exists()
+    assert artifacts.weights_path.exists()
+    assert artifacts.equity_path.exists()
+    assert artifacts.annual_returns_path.exists()
+    assert artifacts.monthly_returns_path.exists()
+    assert artifacts.drawdowns_path.exists()
+    assert artifacts.trades_path is not None and artifacts.trades_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["preset"]["name"] == "aggressive_100w"
+    assert payload["lot_metrics"] is not None
+    assert "sortino" in payload["theory_metrics"]
+    assert "cvar_5pct" in payload["theory_metrics"]
+    assert "worst_5d_return" in payload["theory_metrics"]
+    assert payload["drawdowns_path"].endswith("version-test-aggressive_100w回撤区间.csv")
+
+
+def test_cmd_strategy_version_review_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="version-review",
+            root=str(root),
+            preset="aggressive_100w",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "strategy" / "version-review"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-version",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-version"
+    assert payload["preset"]["name"] == "aggressive_100w"
+    assert payload["json_path"].endswith("cli-version-aggressive_100w.json")
+    assert (root / "strategy" / "version-review" / "cli-version-aggressive_100w.json").exists()
+
+
+def test_run_earnings_forecast_selection_stability_review_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_selection_stability_review(
+        root,
+        start="20260101",
+        end="20260310",
+        presets=("stable_100w", "aggressive_100w"),
+        horizons=(1, 5),
+        output_dir=root / "strategy" / "selection",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="selection-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.md_path.exists()
+    assert artifacts.event_bucket_path.exists()
+    assert artifacts.rank_bucket_path.exists()
+    assert artifacts.holding_profile_path.exists()
+    assert artifacts.style_exposure_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "selection-test"
+    assert len(payload["preset_summaries"]) == 2
+    assert payload["research_decision"]["decision"] == "continue_factor_research"
+
+
+def test_cmd_strategy_selection_stability_review_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="selection-stability-review",
+            root=str(root),
+            start="20260101",
+            end="20260310",
+            presets="stable_100w,aggressive_100w",
+            horizons="1,5",
+            output_dir=str(root / "strategy" / "selection"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-selection",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-selection"
+    assert payload["json_path"].endswith("cli-selection.json")
+    assert (root / "strategy" / "selection" / "cli-selection.json").exists()
+
+
+def test_run_earnings_forecast_cogalpha_role_cycle_writes_artifacts(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_cogalpha_role_cycle(
+        root,
+        role="bad_holder",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "research" / "cogalpha",
+        label="cogalpha-test",
+        min_periods=5,
+        groups=3,
+        top_n=3,
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.report_path.exists()
+    assert artifacts.summary_path.exists()
+    assert artifacts.cycle_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["role"] == "bad_holder"
+    assert payload["next_step"]["role"] == "bad_holder"
+    assert payload["input_shape"]["symbols"] == 3
+
+
+def test_cmd_strategy_cogalpha_role_cycle_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="cogalpha-role-cycle",
+            root=str(root),
+            role="candidate_quality",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "research" / "cogalpha"),
+            label="cli-cogalpha",
+            min_periods=5,
+            groups=3,
+            top_n=3,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-cogalpha"
+    assert payload["role"] == "candidate_quality"
+    assert payload["json_path"].endswith("cli-cogalpha-candidate_quality.json")
+
+
+def test_run_earnings_forecast_factor_overlay_challenge_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_factor_overlay_challenge(
+        root,
+        preset_name="stable_100w",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "overlay",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="overlay-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.metrics_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "overlay-test"
+    assert payload["preset"] == "stable_100w"
+    assert payload["variant_count"] > 1
+
+
+def test_cmd_strategy_factor_overlay_challenge_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="factor-overlay-challenge",
+            root=str(root),
+            preset="stable_100w",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "strategy" / "overlay"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-overlay",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-overlay"
+    assert payload["preset"] == "stable_100w"
+    assert payload["json_path"].endswith("cli-overlay.json")
+
+
+def test_run_earnings_forecast_strategy_robustness_matrix_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_strategy_robustness_matrix(
+        root,
+        preset_name="stable_100w",
+        challenger_name="rerank_tail_risk_w010",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "robustness",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="robustness-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.matrix_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "robustness-test"
+    assert payload["challenger"] == "rerank_tail_risk_w010"
+    assert payload["scenario_count"] >= 1
+
+
+def test_cmd_strategy_robustness_matrix_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="robustness-matrix",
+            root=str(root),
+            preset="stable_100w",
+            challenger="rerank_tail_risk_w010",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "strategy" / "robustness"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-robustness",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-robustness"
+    assert payload["challenger"] == "rerank_tail_risk_w010"
+    assert payload["json_path"].endswith("cli-robustness.json")
+
+
+def test_run_earnings_forecast_daily_mutation_grid_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_daily_mutation_grid(
+        root,
+        preset_name="stable_100w",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "mutation",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="mutation-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.metrics_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "mutation-test"
+    assert payload["preset"] == "stable_100w"
+    assert payload["variant_count"] > 10
+
+
+def test_cmd_strategy_daily_mutation_grid_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="daily-mutation-grid",
+            root=str(root),
+            preset="stable_100w",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "strategy" / "mutation"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-mutation",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-mutation"
+    assert payload["preset"] == "stable_100w"
+    assert payload["json_path"].endswith("cli-mutation.json")
+
+
+def test_run_earnings_forecast_overlay_execution_review_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+    _build_minute_symbol_year_cache(root)
+
+    artifacts = run_earnings_forecast_overlay_execution_review(
+        root,
+        preset_name="stable_100w",
+        challenger_name="tail_risk_soft_q10_p25",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "execution",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="execution-test",
+        capital_tiers=(1_000_000.0,),
+        participation_rates=(0.20,),
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.metrics_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "execution-test"
+    assert payload["challenger"] == "tail_risk_soft_q10_p25"
+    assert payload["decision"]["scenario_count"] >= 1
+    assert payload["minute_coverage"][0]["minute_files"] > 0
+
+
+def test_cmd_strategy_overlay_execution_review_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+    _build_minute_symbol_year_cache(root)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="overlay-execution-review",
+            root=str(root),
+            preset="stable_100w",
+            challenger="tail_risk_soft_q10_p25",
+            start="20260101",
+            end="20260310",
+            capital_tiers="1000000",
+            participation_rates="0.20",
+            output_dir=str(root / "strategy" / "execution"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-execution",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-execution"
+    assert payload["json_path"].endswith("cli-execution.json")
+    assert payload["coverage_path"].endswith("cli-execution分钟覆盖.csv")
+
+
+def test_run_earnings_forecast_regime_budget_challenge_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_regime_budget_challenge(
+        root,
+        preset_name="stable_100w",
+        challenger_name="tail_risk_soft_q10_p25",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "regime",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="regime-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.metrics_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "regime-test"
+    assert payload["challenger"] == "tail_risk_soft_q10_p25"
+
+
+def test_cmd_strategy_regime_budget_challenge_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="regime-budget-challenge",
+            root=str(root),
+            preset="stable_100w",
+            challenger="tail_risk_soft_q10_p25",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "strategy" / "regime"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-regime",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-regime"
+    assert payload["json_path"].endswith("cli-regime.json")
+
+
+def test_run_earnings_forecast_prv_target_pool_review_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+    _build_prv_panel(root)
+
+    artifacts = run_earnings_forecast_prv_target_pool_review(
+        root,
+        preset_name="stable_100w",
+        challenger_name="tail_risk_soft_q10_p25",
+        start="20260101",
+        end="20260310",
+        output_dir=root / "strategy" / "prv",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="prv-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.factor_metrics_path.exists()
+    assert artifacts.strategy_metrics_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "prv-test"
+    assert payload["challenger"] == "tail_risk_soft_q10_p25"
+    assert payload["panels"][0]["name"] == "all_a_2025_2026"
+
+
+def test_cmd_strategy_prv_target_pool_review_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+    _build_prv_panel(root)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="prv-target-pool-review",
+            root=str(root),
+            preset="stable_100w",
+            challenger="tail_risk_soft_q10_p25",
+            start="20260101",
+            end="20260310",
+            output_dir=str(root / "strategy" / "prv"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-prv",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-prv"
+    assert payload["json_path"].endswith("cli-prv.json")
 
 
 def test_run_earnings_forecast_shadow_plan_writes_target_files(tmp_path):
@@ -471,6 +954,74 @@ def _build_earnings_workspace(tmp_path):
 def _upsert_by_date(storage: ParquetDuckDBBackend, dataset: str, frame: pd.DataFrame) -> None:
     for date, group in frame.groupby("date"):
         storage.upsert(dataset, group, {"date": str(date)})
+
+
+def _build_minute_symbol_year_cache(root):
+    dates = pd.bdate_range("2026-01-01", periods=48).strftime("%Y%m%d").tolist()
+    prices = {"000001.SZ": 10.0, "000002.SZ": 11.0, "000003.SZ": 12.0}
+    for symbol, price in prices.items():
+        rows = []
+        for date in dates:
+            rows.extend(
+                [
+                    {
+                        "symbol": symbol,
+                        "trade_time": f"{date} 09:31:00",
+                        "date": date,
+                        "minute": "09:31",
+                        "open": price,
+                        "high": price * 1.01,
+                        "low": price * 0.99,
+                        "close": price,
+                        "volume": 10_000.0,
+                        "amount": 1_000_000.0,
+                        "freq": "1min",
+                    },
+                    {
+                        "symbol": symbol,
+                        "trade_time": f"{date} 14:56:00",
+                        "date": date,
+                        "minute": "14:56",
+                        "open": price,
+                        "high": price * 1.01,
+                        "low": price * 0.99,
+                        "close": price,
+                        "volume": 10_000.0,
+                        "amount": 1_000_000.0,
+                        "freq": "1min",
+                    },
+                ]
+            )
+        path = root / "data" / "stk_mins" / "year=2026" / "universe=all_active" / f"symbol={symbol}" / "data.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+def _build_prv_panel(root):
+    dates = pd.bdate_range("2026-01-01", periods=48).strftime("%Y%m%d").tolist()
+    rows = []
+    for idx, date in enumerate(dates):
+        for symbol_idx, symbol in enumerate(["000001.SZ", "000002.SZ", "000003.SZ"]):
+            rows.append(
+                {
+                    "date": date,
+                    "symbol": symbol,
+                    "ridge3_volume_ratio": 0.1 + symbol_idx * 0.05 + idx * 0.001,
+                    "isolated_peak_volume_ratio": 0.2 + symbol_idx * 0.03,
+                    "valley_relative_vwap": -0.01 + symbol_idx * 0.002,
+                    "first30_volume_ratio": 0.3 + symbol_idx * 0.01,
+                }
+            )
+    path = (
+        root
+        / "research"
+        / "factor-reports"
+        / "volume-peak-ridge-valley"
+        / "all-a-2025-2026-prv"
+        / "volume_prv_all_a_panel_2025_2026.parquet"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(path, index=False)
 
 
 def _build_opening_snapshot_csv(path):

@@ -135,7 +135,7 @@ class ParquetDuckDBBackend:
 
         sql = (
             f"SELECT {col_clause} "
-            f"FROM read_parquet('{parquet_glob}', hive_partitioning=true) "
+            f"FROM read_parquet('{parquet_glob}', hive_partitioning=true, union_by_name=true) "
             f"WHERE {where_clause} "
         )
 
@@ -200,7 +200,7 @@ class ParquetDuckDBBackend:
 
         sql = (
             "DESCRIBE SELECT * "
-            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true)"
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true, union_by_name=true)"
         )
         conn = duckdb.connect(database=":memory:", read_only=False)
         try:
@@ -226,7 +226,7 @@ class ParquetDuckDBBackend:
         where_clause, params = self._build_where_clause(filters)
         sql = (
             "SELECT COUNT(*) AS row_count "
-            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true) "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true, union_by_name=true) "
             f"WHERE {where_clause}"
         )
         conn = duckdb.connect(database=":memory:", read_only=False)
@@ -272,7 +272,7 @@ class ParquetDuckDBBackend:
         where_clause, params = self._build_where_clause(filters)
         sql = (
             f"SELECT {col_clause} "
-            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true) "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true, union_by_name=true) "
             f"WHERE {where_clause}"
         )
 

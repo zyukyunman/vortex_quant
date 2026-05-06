@@ -21,6 +21,12 @@ from vortex.config.profile.models import DataProfile
 from vortex.data.calendar import DataCalendar
 from vortex.data.derived import DerivedMetricCalculator
 from vortex.data.manifest import SyncManifest
+from vortex.data.minute_symbol_cache import (
+    MinuteSymbolYearConfig,
+    discover_legacy_minute_cache_dirs,
+    select_active_symbols_from_bars,
+    sync_minute_symbol_year_cache,
+)
 from vortex.data.pit.aligner import PitAligner
 from vortex.data.pit.report import PitReport
 from vortex.data.provider.tushare_registry import TUSHARE_UPDATE_FREQUENCY_ORDER
@@ -947,6 +953,18 @@ class DataPipeline:
             dataset_index,
             total_datasets,
         )
+        if str(meta.get("bootstrap_layout") or "") == "symbol_year":
+            return self._sync_symbol_year_minute_dataset(
+                dataset=dataset,
+                market=market,
+                start=start,
+                end=end,
+                action=action,
+                fallback_symbols=symbols,
+                dataset_index=dataset_index,
+                total_datasets=total_datasets,
+                total_rows=total_rows,
+            )
         self._log_fetch_plan(dataset, fetch_plan)
         if (
             fetch_plan.skip_reason is None
@@ -1169,6 +1187,91 @@ class DataPipeline:
             pit_report=current_pit,
             quality_candidate=quality_candidate,
         )
+
+    def _sync_symbol_year_minute_dataset(
+        self,
+        *,
+        dataset: str,
+        market: str,
+        start: date,
+        end: date,
+        action: str,
+        fallback_symbols: list[str],
+        dataset_index: int,
+        total_datasets: int,
+        total_rows: int,
+    ) -> DatasetSyncOutcome:
+        """Bootstrap large minute datasets without a single full-market frame."""
+
+        if action not in {"bootstrap", "backfill", "repair"}:
+            logger.info("dataset=%s: %s 暂不处理 symbol-year 分钟布局", dataset, action)
+            return DatasetSyncOutcome()
+
+        root = getattr(self._storage, "root", None)
+        if root is None:
+            raise DataError(
+                code="DATA_PIPELINE_UNSUPPORTED_STORAGE",
+                message=f"dataset={dataset} 的 symbol-year 分钟布局需要可解析 root 的存储后端",
+            )
+        workspace_root = Path(root).parent
+        years = range(start.year, end.year + 1)
+        total_written = 0
+        for year in years:
+            year_start = max(start, date(year, 1, 1))
+            year_end = min(end, date(year, 12, 31))
+            symbols = select_active_symbols_from_bars(workspace_root, year, fallback_symbols)
+            if not symbols:
+                logger.warning("dataset=%s year=%s 无可用 symbol，跳过", dataset, year)
+                continue
+            source_dirs = discover_legacy_minute_cache_dirs(workspace_root, year)
+            config = MinuteSymbolYearConfig(
+                root=workspace_root,
+                dataset=dataset,
+                year=year,
+                universe="all_active",
+                symbols=symbols,
+                start_date=year_start,
+                end_date=year_end,
+                source_cache_dirs=source_dirs,
+            )
+            self._emit_progress(
+                current_stage="fetch",
+                total_stages=5,
+                completed_stages=1,
+                current_dataset=dataset,
+                total_datasets=total_datasets,
+                completed_datasets=dataset_index - 1,
+                current_chunk=0,
+                total_chunks=len(symbols),
+                written_rows=total_rows + total_written,
+                message=f"{dataset} {year}：开始 symbol-year bootstrap",
+                force=True,
+            )
+            result = sync_minute_symbol_year_cache(
+                self._provider,
+                config,
+                market=market,
+                progress_callback=self._make_dataset_progress_callback(
+                    stage="fetch",
+                    stage_index=1,
+                    dataset=dataset,
+                    dataset_index=dataset_index,
+                    total_datasets=total_datasets,
+                    written_rows=total_rows + total_written,
+                ),
+                cancel_check=self._cancel_check,
+            )
+            total_written += result.rows_written
+            logger.info(
+                "dataset=%s year=%s symbol-year 完成: target=%d rows=%d manifest=%s",
+                dataset,
+                year,
+                len(result.target_symbols),
+                result.rows_written,
+                result.manifest_path,
+            )
+
+        return DatasetSyncOutcome(rows_written=total_written)
 
     def _plan_dataset_fetch(
         self,

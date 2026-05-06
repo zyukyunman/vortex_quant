@@ -11,7 +11,7 @@ import dataclasses
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 import pandas as pd
 
@@ -33,7 +33,9 @@ from vortex.strategy.earnings_forecast_drift import (
     build_financial_st_risk_events,
     build_forecast_surprise_signal,
     build_liquidity_mask,
+    build_open_limit_price_masks,
     build_persistent_st_risk_mask,
+    build_suspend_trade_mask,
     build_stock_st_mask,
     capacity_report,
     exposure_diagnostics,
@@ -45,7 +47,10 @@ from vortex.strategy.earnings_forecast_drift import (
     segment_report,
     write_earnings_forecast_report_html,
     write_earnings_forecast_report_json,
+    _combine_masks,
 )
+from vortex.strategy.event_backtest import EventBacktestConfig, run_event_signal_backtest
+from vortex.strategy.factor_fusion import CandidateFusionRecipe, FusionLeg, build_fused_candidate_signal
 from vortex.strategy.opening_liquidity import (
     OpeningLiquidityConfig,
     analyze_opening_ask1_capacity,
@@ -61,6 +66,7 @@ DEFAULT_SHADOW_LABEL = "业绩预告漂移策略shadow跟踪"
 DEFAULT_LIVE_HANDOFF_LABEL = "业绩预告漂移策略实盘交接"
 DEFAULT_OPENING_LIQUIDITY_LABEL = "业绩预告漂移策略开盘卖一容量复核"
 DEFAULT_AUCTION_EXECUTION_LABEL = "业绩预告漂移策略开盘竞价可靠性回测"
+DEFAULT_VERSION_REVIEW_LABEL = "业绩预告策略版本复核"
 
 
 @dataclass(frozen=True)
@@ -120,6 +126,98 @@ class EarningsForecastAuctionExecutionArtifacts:
     order_intents_path: Path
     diagnostics_path: Path
     summary: dict[str, object]
+
+
+@dataclass(frozen=True)
+class EarningsForecastVersionPreset:
+    """Named strategy version preset for repeatable research and reports."""
+
+    name: str
+    description: str
+    top_n: int
+    candidate_pool_size: int | None
+    liquidity_rerank_weight: float
+    portfolio_notional: float
+    max_weight: float = 0.05
+    transaction_cost_bps: float = 20.0
+    position_mode: Literal["full_equal_selected", "capped_with_cash"] = "capped_with_cash"
+    run_lot_execution: bool = True
+
+
+@dataclass(frozen=True)
+class EarningsForecastVersionArtifacts:
+    """Version preset review outputs."""
+
+    json_path: Path
+    metrics_path: Path
+    weights_path: Path
+    equity_path: Path
+    annual_returns_path: Path
+    monthly_returns_path: Path
+    drawdowns_path: Path
+    trades_path: Path | None
+    order_intents_path: Path | None
+    diagnostics_path: Path | None
+    summary: dict[str, object]
+
+
+EARNINGS_FORECAST_VERSION_PRESETS: dict[str, EarningsForecastVersionPreset] = {
+    "aggressive_100w": EarningsForecastVersionPreset(
+        name="aggressive_100w",
+        description="100 万进攻版：Top60 候选池，amount20 liquidity rerank，选 Top30，整手撮合。",
+        top_n=30,
+        candidate_pool_size=60,
+        liquidity_rerank_weight=0.20,
+        portfolio_notional=1_000_000.0,
+    ),
+    "stable_100w": EarningsForecastVersionPreset(
+        name="stable_100w",
+        description="100 万稳健对照：baseline Top50。",
+        top_n=50,
+        candidate_pool_size=None,
+        liquidity_rerank_weight=0.0,
+        portfolio_notional=1_000_000.0,
+    ),
+    "liquidity_top80": EarningsForecastVersionPreset(
+        name="liquidity_top80",
+        description="中大资金研究版：Top160 候选池，amount20 liquidity rerank，选 Top80。",
+        top_n=80,
+        candidate_pool_size=160,
+        liquidity_rerank_weight=0.20,
+        portfolio_notional=100_000_000.0,
+    ),
+    "liquidity_top90_1000w": EarningsForecastVersionPreset(
+        name="liquidity_top90_1000w",
+        description="1000 万候选版：Top180 候选池，amount20 liquidity rerank，选 Top90。",
+        top_n=90,
+        candidate_pool_size=180,
+        liquidity_rerank_weight=0.20,
+        portfolio_notional=10_000_000.0,
+    ),
+    "baseline_top110_large": EarningsForecastVersionPreset(
+        name="baseline_top110_large",
+        description="中大资金 challenger：baseline Top110，不做 liquidity rerank，按 1 亿整手执行口径复核。",
+        top_n=110,
+        candidate_pool_size=None,
+        liquidity_rerank_weight=0.0,
+        portfolio_notional=100_000_000.0,
+    ),
+}
+
+
+def get_earnings_forecast_version_preset(name: str) -> EarningsForecastVersionPreset:
+    """Return a named earnings forecast strategy version preset."""
+
+    if name not in EARNINGS_FORECAST_VERSION_PRESETS:
+        allowed = ", ".join(sorted(EARNINGS_FORECAST_VERSION_PRESETS))
+        raise KeyError(f"未知业绩预告策略版本 preset: {name}；可选: {allowed}")
+    return EARNINGS_FORECAST_VERSION_PRESETS[name]
+
+
+def list_earnings_forecast_version_presets() -> list[EarningsForecastVersionPreset]:
+    """List available strategy version presets."""
+
+    return [EARNINGS_FORECAST_VERSION_PRESETS[name] for name in sorted(EARNINGS_FORECAST_VERSION_PRESETS)]
 
 
 @dataclass(frozen=True)
@@ -354,6 +452,418 @@ def run_earnings_forecast_shadow_plan(
         target_path=target_path,
         summary=summary,
     )
+
+
+def run_earnings_forecast_version_review(
+    root: str | Path,
+    *,
+    preset_name: str,
+    start: str,
+    end: str,
+    output_dir: str | Path | None = None,
+    artifact_dir: str | Path | None = None,
+    label: str = DEFAULT_VERSION_REVIEW_LABEL,
+    require_precise_data: bool = True,
+) -> EarningsForecastVersionArtifacts:
+    """Run a named strategy version preset and write repeatable artifacts."""
+
+    workspace = Workspace(Path(root).expanduser())
+    workspace.ensure_initialized()
+    output_root = Path(output_dir) if output_dir is not None else workspace.strategy_dir
+    artifact_root = Path(artifact_dir) if artifact_dir is not None else workspace.strategy_dir / "artifacts"
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    preset = get_earnings_forecast_version_preset(preset_name)
+    inputs = load_earnings_forecast_inputs(
+        workspace,
+        start=start,
+        end=end,
+        require_precise_data=require_precise_data,
+    )
+    quality = ExperimentQuality(
+        pit_safe=True,
+        adjusted_prices=True,
+        cost_included=True,
+        no_future_leakage=True,
+        out_of_sample_checked=True,
+    )
+    signal, market_gate, blocked_buy, blocked_sell = _build_version_signal_context(
+        inputs,
+        preset=preset,
+    )
+    returns = open_to_close_returns(inputs.open_prices, inputs.close_prices)
+    backtest = run_event_signal_backtest(
+        signal,
+        returns,
+        EventBacktestConfig(
+            top_n=preset.top_n,
+            max_weight=preset.max_weight,
+            target_exposure=1.0,
+            transaction_cost_bps=preset.transaction_cost_bps,
+            position_mode=preset.position_mode,
+        ),
+        market_gate=market_gate,
+        blocked_buy_mask=blocked_buy,
+        blocked_sell_mask=blocked_sell,
+        quality=quality,
+        goal_criteria=None,
+    )
+    weights_path = artifact_root / f"{label}-{preset.name}每日权重.csv"
+    backtest.weights.to_csv(weights_path)
+
+    small_result = None
+    trades_path = None
+    order_intents_path = None
+    diagnostics_path = None
+    if preset.run_lot_execution:
+        small_result = run_lot_constrained_backtest(
+            backtest.weights,
+            inputs.open_prices,
+            inputs.close_prices,
+            SmallCapitalExecutionConfig(initial_cash=float(preset.portfolio_notional)),
+            market_gate=market_gate,
+            signal=signal,
+        )
+        trades_path = artifact_root / f"{label}-{preset.name}成交明细.csv"
+        order_intents_path = artifact_root / f"{label}-{preset.name}买单意图.csv"
+        diagnostics_path = artifact_root / f"{label}-{preset.name}执行诊断.csv"
+        small_result.trades.to_csv(trades_path, index=False)
+        small_result.order_intents.to_csv(order_intents_path, index=False)
+        small_result.diagnostics.to_csv(diagnostics_path, index=False)
+
+    metrics_rows = [
+        {
+            "mode": "event_theory",
+            "preset": preset.name,
+            "top_n": preset.top_n,
+            "candidate_pool_size": preset.candidate_pool_size,
+            "portfolio_notional": None,
+            **backtest.metrics.__dict__,
+        }
+    ]
+    if small_result is not None:
+        metrics_rows.append(
+            {
+                "mode": "lot_execution",
+                "preset": preset.name,
+                "top_n": preset.top_n,
+                "candidate_pool_size": preset.candidate_pool_size,
+                "portfolio_notional": preset.portfolio_notional,
+                **small_result.metrics.__dict__,
+                "avg_holding_count": small_result.summary.get("avg_holding_count"),
+                "avg_cash_ratio": small_result.summary.get("avg_cash_ratio"),
+            }
+        )
+    metrics = pd.DataFrame(metrics_rows)
+    metrics_path = artifact_root / f"{label}-{preset.name}指标.csv"
+    metrics.to_csv(metrics_path, index=False)
+
+    equity = _version_equity_frame(
+        preset.name,
+        theory_equity=backtest.equity_curve,
+        theory_returns=backtest.returns,
+        lot_equity=small_result.equity_curve if small_result is not None else None,
+        lot_returns=small_result.returns if small_result is not None else None,
+    )
+    annual_returns = _version_period_returns_frame(
+        preset.name,
+        {"event_theory": backtest.returns, "lot_execution": small_result.returns if small_result is not None else None},
+        freq="Y",
+    )
+    monthly_returns = _version_period_returns_frame(
+        preset.name,
+        {"event_theory": backtest.returns, "lot_execution": small_result.returns if small_result is not None else None},
+        freq="M",
+    )
+    drawdowns = _version_drawdown_frame(
+        preset.name,
+        {"event_theory": backtest.equity_curve, "lot_execution": small_result.equity_curve if small_result is not None else None},
+    )
+    equity_path = artifact_root / f"{label}-{preset.name}资金曲线.csv"
+    annual_returns_path = artifact_root / f"{label}-{preset.name}年度收益.csv"
+    monthly_returns_path = artifact_root / f"{label}-{preset.name}月度收益.csv"
+    drawdowns_path = artifact_root / f"{label}-{preset.name}回撤区间.csv"
+    equity.to_csv(equity_path, index=False)
+    annual_returns.to_csv(annual_returns_path, index=False)
+    monthly_returns.to_csv(monthly_returns_path, index=False)
+    drawdowns.to_csv(drawdowns_path, index=False)
+
+    summary = {
+        "label": label,
+        "preset": dataclasses.asdict(preset),
+        "start": start,
+        "end": end,
+        "json_path": str(output_root / f"{label}-{preset.name}.json"),
+        "metrics_path": str(metrics_path),
+        "weights_path": str(weights_path),
+        "equity_path": str(equity_path),
+        "annual_returns_path": str(annual_returns_path),
+        "monthly_returns_path": str(monthly_returns_path),
+        "drawdowns_path": str(drawdowns_path),
+        "trades_path": str(trades_path) if trades_path is not None else None,
+        "order_intents_path": str(order_intents_path) if order_intents_path is not None else None,
+        "diagnostics_path": str(diagnostics_path) if diagnostics_path is not None else None,
+        "theory_metrics": backtest.metrics.__dict__,
+        "lot_metrics": small_result.metrics.__dict__ if small_result is not None else None,
+        "lot_summary": small_result.summary if small_result is not None else None,
+    }
+    json_path = output_root / f"{label}-{preset.name}.json"
+    json_path.write_text(
+        json.dumps(_jsonable(summary), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return EarningsForecastVersionArtifacts(
+        json_path=json_path,
+        metrics_path=metrics_path,
+        weights_path=weights_path,
+        equity_path=equity_path,
+        annual_returns_path=annual_returns_path,
+        monthly_returns_path=monthly_returns_path,
+        drawdowns_path=drawdowns_path,
+        trades_path=trades_path,
+        order_intents_path=order_intents_path,
+        diagnostics_path=diagnostics_path,
+        summary=summary,
+    )
+
+
+def _version_equity_frame(
+    preset_name: str,
+    *,
+    theory_equity: pd.Series,
+    theory_returns: pd.Series,
+    lot_equity: pd.Series | None,
+    lot_returns: pd.Series | None,
+) -> pd.DataFrame:
+    rows = []
+    for mode, equity, returns in (
+        ("event_theory", theory_equity, theory_returns),
+        ("lot_execution", lot_equity, lot_returns),
+    ):
+        if equity is None:
+            continue
+        aligned_returns = returns.reindex(equity.index) if returns is not None else pd.Series(dtype=float)
+        for date, equity_value in equity.items():
+            rows.append(
+                {
+                    "preset": preset_name,
+                    "mode": mode,
+                    "date": str(date),
+                    "equity": float(equity_value),
+                    "return": float(aligned_returns.loc[date]) if date in aligned_returns.index else None,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _version_period_returns_frame(
+    preset_name: str,
+    returns_by_mode: dict[str, pd.Series | None],
+    *,
+    freq: str,
+) -> pd.DataFrame:
+    rows = []
+    for mode, returns in returns_by_mode.items():
+        if returns is None or returns.empty:
+            continue
+        dated_returns = _series_with_datetime_index(returns).dropna()
+        if dated_returns.empty:
+            continue
+        period_returns = (1.0 + dated_returns).groupby(dated_returns.index.to_period(freq)).prod() - 1.0
+        for period, value in period_returns.items():
+            rows.append(
+                {
+                    "preset": preset_name,
+                    "mode": mode,
+                    "period": str(period),
+                    "return": float(value),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _version_drawdown_frame(
+    preset_name: str,
+    equity_by_mode: dict[str, pd.Series | None],
+) -> pd.DataFrame:
+    rows = []
+    for mode, equity in equity_by_mode.items():
+        if equity is None or equity.empty:
+            continue
+        dated_equity = _series_with_datetime_index(equity).dropna()
+        if dated_equity.empty:
+            continue
+        running_peak = dated_equity.cummax()
+        drawdown = dated_equity / running_peak - 1.0
+        peak_dates = running_peak.groupby(running_peak).apply(lambda values: values.index[0])
+        in_drawdown = False
+        start_date = None
+        trough_date = None
+        trough_drawdown = 0.0
+        peak_equity = None
+        trough_equity = None
+        for date, dd_value in drawdown.items():
+            value = float(dd_value)
+            if value < 0 and not in_drawdown:
+                in_drawdown = True
+                peak_value = float(running_peak.loc[date])
+                start_date = peak_dates.loc[peak_value]
+                trough_date = date
+                trough_drawdown = value
+                peak_equity = peak_value
+                trough_equity = float(dated_equity.loc[date])
+            elif value < 0 and in_drawdown and value < trough_drawdown:
+                trough_date = date
+                trough_drawdown = value
+                trough_equity = float(dated_equity.loc[date])
+            elif value >= 0 and in_drawdown:
+                rows.append(
+                    _drawdown_row(
+                        preset_name,
+                        mode,
+                        start_date,
+                        trough_date,
+                        date,
+                        trough_drawdown,
+                        peak_equity,
+                        trough_equity,
+                    )
+                )
+                in_drawdown = False
+        if in_drawdown:
+            rows.append(
+                _drawdown_row(
+                    preset_name,
+                    mode,
+                    start_date,
+                    trough_date,
+                    None,
+                    trough_drawdown,
+                    peak_equity,
+                    trough_equity,
+                )
+            )
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.sort_values("max_drawdown", ascending=True).reset_index(drop=True)
+    return frame
+
+
+def _drawdown_row(
+    preset_name: str,
+    mode: str,
+    start_date: pd.Timestamp | None,
+    trough_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+    max_drawdown: float,
+    peak_equity: float | None,
+    trough_equity: float | None,
+) -> dict[str, object]:
+    return {
+        "preset": preset_name,
+        "mode": mode,
+        "start_date": _format_timestamp(start_date),
+        "trough_date": _format_timestamp(trough_date),
+        "end_date": _format_timestamp(end_date),
+        "max_drawdown": float(max_drawdown),
+        "peak_equity": peak_equity,
+        "trough_equity": trough_equity,
+        "recovered": end_date is not None,
+        "duration_days": int((end_date - start_date).days) if start_date is not None and end_date is not None else None,
+        "trough_days": int((trough_date - start_date).days) if start_date is not None and trough_date is not None else None,
+    }
+
+
+def _series_with_datetime_index(series: pd.Series) -> pd.Series:
+    result = pd.to_numeric(series, errors="coerce").copy()
+    raw_index = pd.Index(result.index)
+    dates = pd.to_datetime(raw_index.astype(str), format="%Y%m%d", errors="coerce")
+    if dates.isna().all():
+        dates = pd.to_datetime(raw_index, errors="coerce")
+    result.index = dates
+    return result.loc[~result.index.isna()]
+
+
+def _format_timestamp(value: pd.Timestamp | None) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    return pd.Timestamp(value).strftime("%Y%m%d")
+
+
+def _build_version_signal_context(
+    inputs: EarningsForecastInputFrames,
+    *,
+    preset: EarningsForecastVersionPreset,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame | None, pd.DataFrame | None]:
+    config = EarningsForecastDriftConfig(
+        top_n=preset.top_n,
+        position_mode=preset.position_mode,
+        max_weight=preset.max_weight,
+        transaction_cost_bps=preset.transaction_cost_bps,
+    )
+    liquidity = build_liquidity_mask(
+        inputs.amount,
+        window=config.liquidity_window,
+        min_avg_amount=config.min_avg_amount,
+    )
+    st_mask: pd.DataFrame | None = None
+    if config.exclude_st and inputs.stock_st is not None:
+        st_mask = build_stock_st_mask(inputs.stock_st, inputs.open_prices.index, inputs.open_prices.columns)
+        liquidity = liquidity & ~st_mask
+    if config.exclude_st_risk and inputs.st_risk_events is not None:
+        risk_mask = build_persistent_st_risk_mask(
+            inputs.st_risk_events,
+            inputs.open_prices.index,
+            inputs.open_prices.columns,
+        )
+        st_mask = _combine_masks(st_mask, risk_mask)
+        liquidity = liquidity & ~risk_mask
+    signal = build_forecast_surprise_signal(
+        inputs.forecast,
+        target_index=inputs.open_prices.index,
+        target_columns=inputs.open_prices.columns,
+        liquidity_mask=liquidity,
+        delay_days=config.delay_days,
+        hold_days=config.hold_days,
+    )
+    if st_mask is not None:
+        signal = signal.where(~st_mask.reindex_like(signal).fillna(False))
+    if preset.candidate_pool_size is not None and preset.liquidity_rerank_weight > 0:
+        amount20 = (
+            inputs.amount.rolling(config.liquidity_window, min_periods=5)
+            .mean()
+            .shift(1)
+            .reindex(index=signal.index, columns=signal.columns)
+        )
+        signal = build_fused_candidate_signal(
+            signal,
+            {"amount20": amount20},
+            CandidateFusionRecipe(
+                candidate_pool_size=preset.candidate_pool_size,
+                base_weight=1.0,
+                legs=(FusionLeg("amount20", preset.liquidity_rerank_weight),),
+            ),
+        )
+    market_gate = market_gate_from_state(build_market_state(inputs.index_close, config.market_state))
+    limit_up_mask: pd.DataFrame | None = None
+    limit_down_mask: pd.DataFrame | None = None
+    if inputs.stk_limit is not None:
+        price_limit_up, price_limit_down = build_open_limit_price_masks(
+            inputs.stk_limit,
+            inputs.raw_open_prices.reindex(index=inputs.open_prices.index, columns=inputs.open_prices.columns),
+        )
+        limit_up_mask = _combine_masks(limit_up_mask, price_limit_up)
+        limit_down_mask = _combine_masks(limit_down_mask, price_limit_down)
+    if inputs.suspend_events is not None:
+        suspend_mask = build_suspend_trade_mask(
+            inputs.suspend_events,
+            inputs.open_prices.index,
+            inputs.open_prices.columns,
+        )
+        limit_up_mask = _combine_masks(limit_up_mask, suspend_mask)
+        limit_down_mask = _combine_masks(limit_down_mask, suspend_mask)
+    return signal, market_gate, limit_up_mask, limit_down_mask
 
 
 def run_earnings_forecast_live_handoff(

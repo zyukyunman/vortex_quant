@@ -487,6 +487,7 @@ def _build_default_data_config(
     *,
     history_start: str = "20170101",
     schedule: str | None = None,
+    datasets: list[str] | None = None,
 ) -> dict:
     """构建最小可读的默认数据配置。
 
@@ -501,9 +502,24 @@ def _build_default_data_config(
         "provider": "tushare",
         "history_start": history_start,
     }
+    if datasets is not None:
+        config["datasets"] = list(datasets)
     if schedule:
         config["schedule"] = schedule
     return config
+
+
+def _merge_dataset_lists(*groups: list[str]) -> list[str]:
+    """Merge dataset lists while preserving first-seen order."""
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for dataset in group:
+            if dataset not in seen:
+                merged.append(dataset)
+                seen.add(dataset)
+    return merged
 
 
 def _resolve_data_profile_name(raw: str | None) -> str:
@@ -1524,9 +1540,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     from vortex.data.provider.tushare_registry import (
         DEFAULT_TUSHARE_PRIORITY_DATASETS,
         get_default_tushare_datasets,
+        get_optional_tushare_bootstrap_datasets,
+        get_tushare_dataset_access_rule,
+        get_tushare_dataset_spec,
+        parse_tushare_permission_keys,
     )
 
     all_datasets = get_default_tushare_datasets()
+    optional_bootstrap_datasets = get_optional_tushare_bootstrap_datasets()
     default_priority = [name for name in DEFAULT_TUSHARE_PRIORITY_DATASETS if name in all_datasets]
 
     # 构建初始化配置
@@ -1535,6 +1556,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     tushare_token = None
     run_bootstrap_now = False
     bootstrap_datasets: list[str] = []
+    enabled_optional_datasets: list[str] = []
     write_profile = True
     init_state: dict[str, object] | None = None
     # 通知/Agent 交互结果，init 成功后统一写入 .env
@@ -1567,6 +1589,36 @@ def cmd_init(args: argparse.Namespace) -> None:
             print("📌 Step 2/6: 历史数据范围")
             history_start = _prompt("历史数据起始日 (YYYYMMDD)", "20170101")
             config["history_start"] = history_start
+            if optional_bootstrap_datasets:
+                print()
+                print("   可选高成本数据集")
+                print("   这些数据不会默认启用，需要明确选择后才写入 data profile。")
+                for dataset in optional_bootstrap_datasets:
+                    spec = get_tushare_dataset_spec(dataset)
+                    warning = spec.get("bootstrap_warning") or spec.get("description") or dataset
+                    print(f"   - {dataset}: {warning}")
+                enable_minute = _prompt_yes_no(
+                    "是否启用股票分钟行情 stk_mins（需要 stock_minutes 权限，数据量很大）？",
+                    default=False,
+                )
+                if enable_minute and "stk_mins" in optional_bootstrap_datasets:
+                    enabled_optional_datasets = ["stk_mins"]
+                    config["datasets"] = _merge_dataset_lists(
+                        all_datasets,
+                        enabled_optional_datasets,
+                    )
+                    permissions = parse_tushare_permission_keys(
+                        os.environ.get("TUSHARE_EXTRA_PERMISSIONS")
+                    )
+                    access = get_tushare_dataset_access_rule("stk_mins")
+                    permission_key = str(access.get("permission_key") or "")
+                    if permission_key and permission_key not in permissions:
+                        print(
+                            "   ⚠️  未检测到 "
+                            f"TUSHARE_EXTRA_PERMISSIONS={permission_key}；"
+                            "已写入配置，但 bootstrap 时可能因权限不足跳过。"
+                        )
+                    print("   ✅ 已将 stk_mins 加入默认 data profile。")
             print()
 
             # Step 3: 首次数据更新
@@ -1578,9 +1630,13 @@ def cmd_init(args: argparse.Namespace) -> None:
                     print("   ⚠️  当前没有可用的 TUSHARE_TOKEN，无法立即更新，已跳过。")
                     run_bootstrap_now = False
                 else:
+                    selectable_datasets = _merge_dataset_lists(
+                        all_datasets,
+                        enabled_optional_datasets,
+                    )
                     priority = _prompt_multi_select(
                         "选择现在立刻更新的数据集（其余数据集后续自动/手动补齐）:",
-                        all_datasets,
+                        selectable_datasets,
                         default_priority,
                     )
                     bootstrap_datasets = priority
@@ -2753,20 +2809,48 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         "live-handoff",
         "opening-liquidity-review",
         "auction-execution-review",
+        "version-review",
+        "selection-stability-review",
+        "cogalpha-role-cycle",
+        "factor-overlay-challenge",
+        "robustness-matrix",
+        "daily-mutation-grid",
+        "overlay-execution-review",
+        "regime-budget-challenge",
+        "prv-target-pool-review",
     }:
         raise SystemExit(f"未知 earnings-forecast 子命令: {args.earnings_action}")
 
+    from vortex.strategy.earnings_forecast_overlay import (
+        DEFAULT_FACTOR_OVERLAY_LABEL,
+        run_earnings_forecast_daily_mutation_grid,
+        run_earnings_forecast_factor_overlay_challenge,
+        run_earnings_forecast_overlay_execution_review,
+        run_earnings_forecast_prv_target_pool_review,
+        run_earnings_forecast_regime_budget_challenge,
+        run_earnings_forecast_strategy_robustness_matrix,
+    )
+    from vortex.strategy.earnings_forecast_cogalpha import (
+        DEFAULT_COGALPHA_ROLE_LABEL,
+        run_earnings_forecast_cogalpha_role_cycle,
+    )
     from vortex.strategy.earnings_forecast_runner import (
         DEFAULT_AUCTION_EXECUTION_LABEL,
         DEFAULT_LIVE_HANDOFF_LABEL,
         DEFAULT_OPENING_LIQUIDITY_LABEL,
         DEFAULT_REVIEW_LABEL,
         DEFAULT_SHADOW_LABEL,
+        DEFAULT_VERSION_REVIEW_LABEL,
         run_opening_auction_execution_review,
         run_opening_liquidity_review,
         run_earnings_forecast_live_handoff,
         run_earnings_forecast_shadow_plan,
+        run_earnings_forecast_version_review,
         run_precise_earnings_forecast_review,
+    )
+    from vortex.strategy.earnings_forecast_selection import (
+        DEFAULT_SELECTION_STABILITY_LABEL,
+        run_earnings_forecast_selection_stability_review,
     )
 
     if args.earnings_action == "opening-liquidity-review":
@@ -2851,6 +2935,230 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             print("  阻断:")
             for item in artifacts.summary["blocking_reasons"]:
                 print(f"    - {item}")
+        return
+
+    if args.earnings_action == "version-review":
+        artifacts = run_earnings_forecast_version_review(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_VERSION_REVIEW_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告策略版本复核完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  指标: {artifacts.metrics_path}")
+        print(f"  权重: {artifacts.weights_path}")
+        lot_metrics = artifacts.summary.get("lot_metrics") or {}
+        if isinstance(lot_metrics, dict) and lot_metrics:
+            print(
+                "  整手指标: "
+                f"年化 {float(lot_metrics.get('annual_return', 0.0)) * 100:.2f}%, "
+                f"最大回撤 {float(lot_metrics.get('max_drawdown', 0.0)) * 100:.2f}%, "
+                f"Calmar {float(lot_metrics.get('calmar', 0.0)):.2f}"
+            )
+        return
+
+    if args.earnings_action == "daily-mutation-grid":
+        artifacts = run_earnings_forecast_daily_mutation_grid(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or "业绩预告日频tail-risk mutation网格",
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告日频 tail-risk mutation 网格完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  指标: {artifacts.metrics_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        next_step = artifacts.summary.get("next_step") or {}
+        if isinstance(next_step, dict):
+            print(f"  下一步: {next_step.get('decision', 'run_walk_forward_acceptance')}")
+        return
+
+    if args.earnings_action == "overlay-execution-review":
+        artifacts = run_earnings_forecast_overlay_execution_review(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            challenger_name=args.challenger,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or "业绩预告overlay整手分钟执行复核",
+            capital_tiers=tuple(_parse_float_csv(args.capital_tiers)),
+            participation_rates=tuple(_parse_float_csv(args.participation_rates)),
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告 overlay 整手/分钟执行复核完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  指标: {artifacts.metrics_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        decision = artifacts.summary.get("decision") or {}
+        if isinstance(decision, dict):
+            print(f"  状态: {decision.get('status', 'unknown')}")
+        return
+
+    if args.earnings_action == "regime-budget-challenge":
+        artifacts = run_earnings_forecast_regime_budget_challenge(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            challenger_name=args.challenger,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or "业绩预告regime风险预算挑战",
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告 regime 风险预算挑战完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  指标: {artifacts.metrics_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        decision = artifacts.summary.get("decision") or {}
+        if isinstance(decision, dict):
+            print(f"  状态: {decision.get('status', 'unknown')}")
+        return
+
+    if args.earnings_action == "prv-target-pool-review":
+        artifacts = run_earnings_forecast_prv_target_pool_review(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            challenger_name=args.challenger,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or "业绩预告PRV目标池复验",
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告 PRV 目标池复验完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  因子指标: {artifacts.factor_metrics_path}")
+        print(f"  策略指标: {artifacts.strategy_metrics_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        decision = artifacts.summary.get("decision") or {}
+        if isinstance(decision, dict):
+            print(f"  状态: {decision.get('status', 'unknown')}")
+        return
+
+    if args.earnings_action == "robustness-matrix":
+        artifacts = run_earnings_forecast_strategy_robustness_matrix(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            challenger_name=args.challenger,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or "业绩预告策略鲁棒性矩阵",
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告策略鲁棒性矩阵完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  矩阵: {artifacts.matrix_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        status = artifacts.summary.get("robustness_status") or {}
+        if isinstance(status, dict):
+            print(f"  状态: {status.get('status', 'unknown')}")
+        return
+
+    if args.earnings_action == "factor-overlay-challenge":
+        artifacts = run_earnings_forecast_factor_overlay_challenge(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_FACTOR_OVERLAY_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告因子角色融合挑战完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  指标: {artifacts.metrics_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        next_step = artifacts.summary.get("next_step") or {}
+        if isinstance(next_step, dict):
+            print(f"  下一步: {next_step.get('decision', 'run_robustness_matrix')}")
+        return
+
+    if args.earnings_action == "cogalpha-role-cycle":
+        artifacts = run_earnings_forecast_cogalpha_role_cycle(
+            Path(args.root).expanduser(),
+            role=args.role,
+            start=args.start,
+            end=args.end,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            label=args.label or DEFAULT_COGALPHA_ROLE_LABEL,
+            min_periods=int(args.min_periods),
+            groups=int(args.groups),
+            top_n=int(args.top_n),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告 CogAlpha 角色因子循环完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  Generation report: {artifacts.report_path}")
+        print(f"  Generation summary: {artifacts.summary_path}")
+        print(f"  Research cycle: {artifacts.cycle_path}")
+        next_step = artifacts.summary.get("next_step") or {}
+        if isinstance(next_step, dict):
+            print(f"  下一步: {next_step.get('decision', 'enter_factor_overlay_challenge')}")
+        return
+
+    if args.earnings_action == "selection-stability-review":
+        artifacts = run_earnings_forecast_selection_stability_review(
+            Path(args.root).expanduser(),
+            start=args.start,
+            end=args.end,
+            presets=_parse_str_csv(args.presets),
+            horizons=_parse_int_csv(args.horizons),
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_SELECTION_STABILITY_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告选股稳定性审判完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        print(f"  事件分桶: {artifacts.event_bucket_path}")
+        print(f"  排名层级: {artifacts.rank_bucket_path}")
+        print(f"  持仓画像: {artifacts.holding_profile_path}")
+        decision = artifacts.summary.get("research_decision") or {}
+        if isinstance(decision, dict):
+            print(f"  下一步: {decision.get('decision', 'continue_factor_research')}")
         return
 
     if args.earnings_action == "auction-execution-review":
@@ -3521,6 +3829,258 @@ def main() -> None:
         help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
     )
     handoff_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    version_sub = earnings_sub.add_parser(
+        "version-review",
+        parents=[root_parser],
+        help="运行已定策略版本 preset，并输出理论与整手执行复核",
+    )
+    version_sub.add_argument(
+        "--preset",
+        default="aggressive_100w",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="策略版本 preset，默认 aggressive_100w",
+    )
+    version_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    version_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    version_sub.add_argument("--output-dir", help="JSON 输出目录；默认 workspace/strategy")
+    version_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    version_sub.add_argument("--label", help="输出文件名前缀")
+    version_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    version_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    selection_sub = earnings_sub.add_parser(
+        "selection-stability-review",
+        parents=[root_parser],
+        help="审判业绩预告策略的选股有效性、排名层级、持仓赢家/输家和风格暴露",
+    )
+    selection_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    selection_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    selection_sub.add_argument(
+        "--presets",
+        default="baseline_top110_large,stable_100w,aggressive_100w",
+        help="逗号分隔 preset 列表，默认 baseline_top110_large,stable_100w,aggressive_100w",
+    )
+    selection_sub.add_argument("--horizons", default="1,5,20", help="前瞻收益窗口，默认 1,5,20")
+    selection_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    selection_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    selection_sub.add_argument("--label", help="输出文件名前缀")
+    selection_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    selection_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    cogalpha_role_sub = earnings_sub.add_parser(
+        "cogalpha-role-cycle",
+        parents=[root_parser],
+        help="运行业绩预告策略的 CogAlpha 角色因子循环：坏持仓、候选质量或状态执行门控",
+    )
+    cogalpha_role_sub.add_argument(
+        "--role",
+        required=True,
+        choices=["bad_holder", "candidate_quality", "regime_execution"],
+        help="因子角色循环",
+    )
+    cogalpha_role_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    cogalpha_role_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    cogalpha_role_sub.add_argument("--output-dir", help="CogAlpha artifact 输出目录；默认 workspace/research/cogalpha/earnings_forecast")
+    cogalpha_role_sub.add_argument("--label", help="输出 JSON 文件名前缀")
+    cogalpha_role_sub.add_argument("--min-periods", type=int, default=30, help="最少有效期数，默认 30")
+    cogalpha_role_sub.add_argument("--groups", type=int, default=5, help="多空分组数，默认 5")
+    cogalpha_role_sub.add_argument("--top-n", type=int, default=10, help="summary 输出候选数，默认 10")
+    cogalpha_role_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    overlay_sub = earnings_sub.add_parser(
+        "factor-overlay-challenge",
+        parents=[root_parser],
+        help="把 CogAlpha 因子按排序/过滤/风险角色接入业绩预告 preset 并做对照",
+    )
+    overlay_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="被挑战的策略版本 preset，默认 baseline_top110_large",
+    )
+    overlay_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    overlay_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    overlay_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    overlay_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    overlay_sub.add_argument("--label", help="输出文件名前缀")
+    overlay_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    overlay_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    robustness_sub = earnings_sub.add_parser(
+        "robustness-matrix",
+        parents=[root_parser],
+        help="对 promoted overlay 做时间、成本和 TopN 扰动鲁棒性矩阵",
+    )
+    robustness_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="基准策略版本 preset，默认 baseline_top110_large",
+    )
+    robustness_sub.add_argument("--challenger", default="rerank_tail_risk_w010", help="被验证的 overlay variant")
+    robustness_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    robustness_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    robustness_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    robustness_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    robustness_sub.add_argument("--label", help="输出文件名前缀")
+    robustness_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    robustness_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    mutation_sub = earnings_sub.add_parser(
+        "daily-mutation-grid",
+        parents=[root_parser],
+        help="用 2017-2026 日频数据测试 tail-risk rerank 权重、候选池、soft trim 和轻量 regime mutation",
+    )
+    mutation_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="被挑战的策略版本 preset，默认 baseline_top110_large",
+    )
+    mutation_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    mutation_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    mutation_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    mutation_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    mutation_sub.add_argument("--label", help="输出文件名前缀")
+    mutation_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    mutation_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    execution_sub = earnings_sub.add_parser(
+        "overlay-execution-review",
+        parents=[root_parser],
+        help="对 overlay challenger 做整手撮合和目标价全天分钟容量执行复核",
+    )
+    execution_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="基准策略版本 preset，默认 baseline_top110_large",
+    )
+    execution_sub.add_argument("--challenger", default="tail_risk_soft_q10_p25", help="被验证的 overlay variant")
+    execution_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    execution_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    execution_sub.add_argument("--capital-tiers", default="10000000,50000000,100000000", help="逗号分隔资金档")
+    execution_sub.add_argument("--participation-rates", default="0.10,0.20,0.30", help="目标价可成交额参与率")
+    execution_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    execution_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    execution_sub.add_argument("--label", help="输出文件名前缀")
+    execution_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    execution_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    regime_budget_sub = earnings_sub.add_parser(
+        "regime-budget-challenge",
+        parents=[root_parser],
+        help="对 overlay challenger 测试轻量市场/regime 风险预算",
+    )
+    regime_budget_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="基准策略版本 preset，默认 baseline_top110_large",
+    )
+    regime_budget_sub.add_argument("--challenger", default="tail_risk_soft_q10_p25", help="被验证的 overlay variant")
+    regime_budget_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    regime_budget_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    regime_budget_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    regime_budget_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    regime_budget_sub.add_argument("--label", help="输出文件名前缀")
+    regime_budget_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    regime_budget_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    prv_target_pool_sub = earnings_sub.add_parser(
+        "prv-target-pool-review",
+        parents=[root_parser],
+        help="复用已有 PRV panel，对业绩预告 baseline/challenger 目标池做全 A/长窗口精确复验",
+    )
+    prv_target_pool_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="基准策略版本 preset，默认 baseline_top110_large",
+    )
+    prv_target_pool_sub.add_argument("--challenger", default="tail_risk_soft_q10_p25", help="被验证的 overlay variant")
+    prv_target_pool_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    prv_target_pool_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    prv_target_pool_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    prv_target_pool_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    prv_target_pool_sub.add_argument("--label", help="输出文件名前缀")
+    prv_target_pool_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    prv_target_pool_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     opening_liquidity_sub = earnings_sub.add_parser(
         "opening-liquidity-review",

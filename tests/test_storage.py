@@ -139,6 +139,35 @@ class TestRead:
         assert storage.count_rows("bars") == 2
         assert storage.count_rows("bars", filters={"symbol": "600519.SH"}) == 1
 
+    def test_read_handles_mixed_null_and_string_partition_schema(self, storage):
+        storage.upsert(
+            "suspend_d",
+            pd.DataFrame({
+                "date": ["20260401"],
+                "symbol": ["000001.SZ"],
+                "suspend_type": ["R"],
+                "suspend_timing": [None],
+            }),
+            {"date": "20260401"},
+        )
+        storage.upsert(
+            "suspend_d",
+            pd.DataFrame({
+                "date": ["20260402"],
+                "symbol": ["000001.SZ"],
+                "suspend_type": ["S"],
+                "suspend_timing": ["上午停牌"],
+            }),
+            {"date": "20260402"},
+        )
+
+        result = storage.read("suspend_d")
+
+        assert len(result) == 2
+        assert set(result["suspend_timing"].dropna()) == {"上午停牌"}
+        assert storage.count_rows("suspend_d") == 2
+        assert {item["name"] for item in storage.schema("suspend_d")} >= {"date", "symbol", "suspend_timing"}
+
 
 class TestListPartitions:
     def test_empty_partitions(self, storage):

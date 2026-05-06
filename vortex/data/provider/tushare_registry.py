@@ -1158,6 +1158,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "3B",
         "fetch_mode": "minute_range",
         "partition_by": "date",
+        "bootstrap_layout": "symbol_year",
+        "bootstrap_opt_in": True,
+        "bootstrap_warning": "高成本分钟数据集：需要 stock_minutes 权限，按 symbol-year 可恢复下载，体量很大。",
         "freq": "1min",
         "single_request_row_limit": 8000,
         "date_field_priority": ("date",),
@@ -1365,6 +1368,16 @@ def filter_tushare_datasets_by_update_frequency(
         dataset
         for dataset in datasets
         if get_tushare_dataset_update_frequency(dataset) in allowed
+    ]
+
+
+def get_optional_tushare_bootstrap_datasets() -> list[str]:
+    """Datasets shown as explicit opt-in choices during workspace initialization."""
+
+    return [
+        name
+        for name, meta in TUSHARE_DATASET_REGISTRY.items()
+        if bool(meta.get("bootstrap_opt_in", False))
     ]
 
 

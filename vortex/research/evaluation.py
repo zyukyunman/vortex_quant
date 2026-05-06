@@ -123,6 +123,8 @@ def rank_ic_series(
         valid = pd.concat([f.rename("factor"), r.rename("ret")], axis=1).dropna()
         if len(valid) < min_periods:
             continue
+        if valid["factor"].nunique(dropna=True) < 2 or valid["ret"].nunique(dropna=True) < 2:
+            continue
         ic = valid["factor"].rank().corr(valid["ret"].rank())
         if pd.notna(ic):
             values.append({"date": dt, "ic": float(ic)})
@@ -318,6 +320,9 @@ def _factor_correlations(factors: dict[str, pd.DataFrame]) -> pd.DataFrame:
         for name, frame in factors.items()
     }
     panel = pd.concat(flattened.values(), axis=1, join="inner")
+    if panel.empty or len(panel.columns) <= 1:
+        return pd.DataFrame(index=factors.keys(), columns=factors.keys(), dtype=float)
+    panel = panel.loc[:, panel.nunique(dropna=True) >= 2]
     if panel.empty or len(panel.columns) <= 1:
         return pd.DataFrame(index=factors.keys(), columns=factors.keys(), dtype=float)
     return panel.corr(method="spearman").fillna(0.0)

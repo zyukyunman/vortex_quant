@@ -1322,3 +1322,108 @@ class TestGenericDatasetPipeline:
         assert report.detail["skipped_datasets"] == [
             {"dataset": "broken", "reason": "[DATA_PROVIDER_FETCH_FAILED] boom"}
         ]
+
+    def test_bootstrap_manages_stk_mins_with_internal_symbol_year_layout(self, tmp_path):
+        class MinuteBootstrapProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "stk_mins": {
+                        "api": "stk_mins",
+                        "description": "股票分钟行情",
+                        "fetch_mode": "minute_range",
+                        "partition_by": "symbol_year",
+                        "bootstrap_layout": "symbol_year",
+                    },
+                }
+
+            def fetch_instruments(self, market: str) -> pd.DataFrame:
+                return pd.DataFrame(
+                    {
+                        "symbol": ["000001.SZ", "000002.SZ", "600000.SH"],
+                        "name": ["平安银行", "万科A", "浦发银行"],
+                    }
+                )
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                return [date(2026, 4, 1), date(2026, 4, 2)]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "stk_mins"
+                assert symbols is not None and len(symbols) == 1
+                symbol = symbols[0]
+                self.calls.append(symbol)
+                return pd.DataFrame(
+                    {
+                        "symbol": [symbol, symbol],
+                        "date": ["20260401", "20260402"],
+                        "trade_time": ["2026-04-01 09:31:00", "2026-04-02 09:31:00"],
+                        "open": [10.0, 10.1],
+                        "close": [10.1, 10.2],
+                        "high": [10.2, 10.3],
+                        "low": [9.9, 10.0],
+                        "vol": [1000.0, 1100.0],
+                        "amount": [1_000_000.0, 1_100_000.0],
+                    }
+                )
+
+        provider = MinuteBootstrapProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        storage.upsert(
+            "bars",
+            pd.DataFrame(
+                {
+                    "symbol": ["000001.SZ", "000002.SZ"],
+                    "date": ["20260401", "20260401"],
+                    "open": [10.0, 20.0],
+                    "close": [10.1, 20.2],
+                }
+            ),
+            {"date": "20260401"},
+        )
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(name="minute", datasets=["stk_mins"], history_start="20260401")
+
+        first = pipeline.repair(profile, (date(2026, 4, 1), date(2026, 4, 2)), action="bootstrap")
+        second = pipeline.repair(profile, (date(2026, 4, 1), date(2026, 4, 2)), action="bootstrap")
+
+        assert first.status == "success"
+        assert second.status == "success"
+        assert provider.calls == ["000001.SZ", "000002.SZ"]
+        minute_file = (
+            tmp_path
+            / "data"
+            / "stk_mins"
+            / "year=2026"
+            / "universe=all_active"
+            / "symbol=000001.SZ"
+            / "data.parquet"
+        )
+        assert minute_file.exists()
+        assert len(pd.read_parquet(minute_file)) == 2
+        assert (
+            tmp_path
+            / "state"
+            / "manifests"
+            / "minute_cache"
+            / "stk_mins_2026_all_active_manifest.json"
+        ).exists()
