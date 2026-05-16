@@ -14,6 +14,7 @@ from vortex.runtime.workspace import Workspace
 from vortex.strategy.earnings_forecast_drift import EarningsForecastDriftConfig
 from vortex.strategy.earnings_forecast_cogalpha import run_earnings_forecast_cogalpha_role_cycle
 from vortex.strategy.earnings_forecast_overlay import (
+    run_earnings_forecast_cpcv_backtest,
     run_earnings_forecast_daily_mutation_grid,
     run_earnings_forecast_factor_overlay_challenge,
     run_earnings_forecast_overlay_execution_review,
@@ -434,6 +435,72 @@ def test_cmd_strategy_robustness_matrix_outputs_json(tmp_path, capsys):
     assert payload["label"] == "cli-robustness"
     assert payload["challenger"] == "rerank_tail_risk_w010"
     assert payload["json_path"].endswith("cli-robustness.json")
+
+
+def test_run_earnings_forecast_cpcv_backtest_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_cpcv_backtest(
+        root,
+        preset_name="stable_100w",
+        challenger_name="tail_risk_soft_q10_p25",
+        start="20260101",
+        end="20260310",
+        n_groups=4,
+        n_test_groups=2,
+        purge_horizon=5,
+        embargo=2,
+        output_dir=root / "strategy" / "cpcv",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="cpcv-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.matrix_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "cpcv-test"
+    assert payload["preset"] == "stable_100w"
+    assert payload["challenger"] == "tail_risk_soft_q10_p25"
+    assert payload["n_groups"] == 4
+    assert payload["n_test_groups"] == 2
+    assert payload["split_count"] == 6
+    assert payload["cpcv_status"]["status"] in {
+        "cpcv_pass_reference_baseline_candidate",
+        "cpcv_conditional_shadow",
+        "cpcv_fail_keep_baseline",
+    }
+
+
+def test_cmd_strategy_cpcv_backtest_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="cpcv-backtest",
+            root=str(root),
+            preset="stable_100w",
+            challenger="tail_risk_soft_q10_p25",
+            start="20260101",
+            end="20260310",
+            n_groups=4,
+            n_test_groups=2,
+            purge_horizon=5,
+            embargo=2,
+            max_combinations=None,
+            output_dir=str(root / "strategy" / "cpcv"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-cpcv",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-cpcv"
+    assert payload["json_path"].endswith("cli-cpcv.json")
+    assert payload["matrix_path"].endswith("cli-cpcv矩阵.csv")
 
 
 def test_run_earnings_forecast_daily_mutation_grid_writes_reports(tmp_path):

@@ -1,4 +1,4 @@
-"""Feishu 通道。"""
+"""Feishu/Lark 通道。"""
 
 from __future__ import annotations
 
@@ -14,30 +14,51 @@ from typing import Any
 from vortex.notification.models import NotificationMessage
 from vortex.shared.errors import NotificationError
 
-DEFAULT_API_BASE = "https://open.feishu.cn"
+FEISHU_API_BASE = "https://open.feishu.cn"
+LARK_API_BASE = "https://open.larksuite.com"
+DEFAULT_API_BASE = FEISHU_API_BASE
 _VALID_RECEIVE_ID_TYPES = {"open_id", "user_id", "union_id", "email", "chat_id"}
+_VALID_PROVIDERS = {"feishu", "lark"}
+_PROVIDER_ENV_PREFIX = {"feishu": "FEISHU", "lark": "LARK"}
+_PROVIDER_API_BASE = {"feishu": FEISHU_API_BASE, "lark": LARK_API_BASE}
 
 
 @dataclass(frozen=True)
 class FeishuConfig:
-    """Feishu Bot 配置。"""
+    """Feishu/Lark Bot 配置。"""
 
     app_id: str
     app_secret: str
     default_receive_id: str
     default_receive_id_type: str = "open_id"
     api_base: str = DEFAULT_API_BASE
+    provider: str = "feishu"
+
+    def __post_init__(self) -> None:
+        provider = self.provider.strip().lower()
+        if provider not in _VALID_PROVIDERS:
+            raise NotificationError(
+                code="NOTIFICATION_PROVIDER_INVALID",
+                message="通知 provider 必须是 lark 或 feishu",
+            )
+        object.__setattr__(self, "provider", provider)
+        if provider == "lark" and self.api_base == DEFAULT_API_BASE:
+            object.__setattr__(self, "api_base", LARK_API_BASE)
 
     @classmethod
-    def from_env(cls) -> "FeishuConfig":
-        app_id = os.environ.get("FEISHU_APP_ID", "").strip()
-        app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
-        default_receive_id = os.environ.get("FEISHU_DEFAULT_RECEIVE_ID", "").strip()
+    def from_env(cls, provider: str | None = None) -> "FeishuConfig":
+        resolved_provider = _resolve_provider(provider)
+        prefix = _PROVIDER_ENV_PREFIX[resolved_provider]
+        default_api_base = _PROVIDER_API_BASE[resolved_provider]
+
+        app_id = os.environ.get(f"{prefix}_APP_ID", "").strip()
+        app_secret = os.environ.get(f"{prefix}_APP_SECRET", "").strip()
+        default_receive_id = os.environ.get(f"{prefix}_DEFAULT_RECEIVE_ID", "").strip()
         default_receive_id_type = (
-            os.environ.get("FEISHU_DEFAULT_RECEIVE_ID_TYPE", "").strip() or "open_id"
+            os.environ.get(f"{prefix}_DEFAULT_RECEIVE_ID_TYPE", "").strip() or "open_id"
         )
-        default_open_id = os.environ.get("FEISHU_DEFAULT_OPEN_ID", "").strip()
-        api_base = os.environ.get("FEISHU_API_BASE", DEFAULT_API_BASE).strip() or DEFAULT_API_BASE
+        default_open_id = os.environ.get(f"{prefix}_DEFAULT_OPEN_ID", "").strip()
+        api_base = os.environ.get(f"{prefix}_API_BASE", default_api_base).strip() or default_api_base
 
         if not default_receive_id and default_open_id:
             default_receive_id = default_open_id
@@ -46,21 +67,21 @@ class FeishuConfig:
         missing = [
             name
             for name, value in (
-                ("FEISHU_APP_ID", app_id),
-                ("FEISHU_APP_SECRET", app_secret),
-                ("FEISHU_DEFAULT_RECEIVE_ID", default_receive_id),
+                (f"{prefix}_APP_ID", app_id),
+                (f"{prefix}_APP_SECRET", app_secret),
+                (f"{prefix}_DEFAULT_RECEIVE_ID", default_receive_id),
             )
             if not value
         ]
         if missing:
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_CONFIG_MISSING",
-                message=f"缺少飞书配置: {', '.join(missing)}",
+                code=f"NOTIFICATION_{prefix}_CONFIG_MISSING",
+                message=f"缺少 {resolved_provider} 配置: {', '.join(missing)}",
             )
         if default_receive_id_type not in _VALID_RECEIVE_ID_TYPES:
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_CONFIG_INVALID",
-                message="FEISHU_DEFAULT_RECEIVE_ID_TYPE 不合法",
+                code=f"NOTIFICATION_{prefix}_CONFIG_INVALID",
+                message=f"{prefix}_DEFAULT_RECEIVE_ID_TYPE 不合法",
             )
         return cls(
             app_id=app_id,
@@ -68,11 +89,12 @@ class FeishuConfig:
             default_receive_id=default_receive_id,
             default_receive_id_type=default_receive_id_type,
             api_base=api_base.rstrip("/"),
+            provider=resolved_provider,
         )
 
 
 class _FeishuClient:
-    """飞书开放平台最小客户端。"""
+    """Feishu/Lark Open Platform 最小客户端。"""
 
     def __init__(self, config: FeishuConfig) -> None:
         self._config = config
@@ -145,8 +167,8 @@ class _FeishuClient:
         expires_in = int(response.get("expire", response.get("expires_in", 0)) or 0)
         if not token or expires_in <= 0:
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_TOKEN_INVALID",
-                message="飞书返回了空 token 或非法过期时间",
+                code=f"NOTIFICATION_{self._prefix}_TOKEN_INVALID",
+                message=f"{self._label} 返回了空 token 或非法过期时间",
             )
         self._tenant_access_token = token
         self._token_expire_at = now + max(expires_in - 60, 60)
@@ -183,36 +205,44 @@ class _FeishuClient:
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_HTTP_FAILED",
-                message=f"飞书 HTTP 错误: status={exc.code}, body={error_body}",
+                code=f"NOTIFICATION_{self._prefix}_HTTP_FAILED",
+                message=f"{self._label} HTTP 错误: status={exc.code}, body={error_body}",
             ) from exc
         except urllib.error.URLError as exc:
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_CONNECT_FAILED",
-                message=f"连接飞书失败: {exc.reason}",
+                code=f"NOTIFICATION_{self._prefix}_CONNECT_FAILED",
+                message=f"连接 {self._label} 失败: {exc.reason}",
             ) from exc
 
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_RESPONSE_INVALID",
-                message=f"飞书返回了非法 JSON: {raw}",
+                code=f"NOTIFICATION_{self._prefix}_RESPONSE_INVALID",
+                message=f"{self._label} 返回了非法 JSON: {raw}",
             ) from exc
         if parsed.get("code", 0) != 0:
             raise NotificationError(
-                code="NOTIFICATION_FEISHU_API_FAILED",
+                code=f"NOTIFICATION_{self._prefix}_API_FAILED",
                 message=(
-                    "飞书 API 返回失败: "
+                    f"{self._label} API 返回失败: "
                     f"code={parsed.get('code')}, msg={parsed.get('msg')}, "
                     f"log_id={parsed.get('log_id')}"
                 ),
             )
         return parsed
 
+    @property
+    def _prefix(self) -> str:
+        return _PROVIDER_ENV_PREFIX.get(self._config.provider, "FEISHU")
+
+    @property
+    def _label(self) -> str:
+        return "Lark" if self._config.provider == "lark" else "飞书"
+
 
 class FeishuChannel:
-    """Feishu 文本通知渠道。"""
+    """Feishu/Lark 文本通知渠道。"""
 
     def __init__(self, config: FeishuConfig | None = None) -> None:
         self._config = config or FeishuConfig.from_env()
@@ -220,12 +250,12 @@ class FeishuChannel:
 
     @property
     def name(self) -> str:
-        return "feishu"
+        return self._config.provider
 
     @classmethod
-    def from_env_if_available(cls) -> "FeishuChannel | None":
+    def from_env_if_available(cls, provider: str | None = None) -> "FeishuChannel | None":
         try:
-            return cls()
+            return cls(FeishuConfig.from_env(provider))
         except NotificationError:
             return None
 
@@ -244,3 +274,32 @@ class FeishuChannel:
             receive_id=receive_id,
             receive_id_type=receive_id_type,
         )
+
+
+def _resolve_provider(provider: str | None) -> str:
+    raw = (
+        provider
+        or os.environ.get("VORTEX_NOTIFICATION_PROVIDER")
+        or os.environ.get("NOTIFICATION_PROVIDER")
+        or ""
+    ).strip().lower()
+    if not raw:
+        raw = "lark" if _has_lark_env() else "feishu"
+    if raw not in _VALID_PROVIDERS:
+        raise NotificationError(
+            code="NOTIFICATION_PROVIDER_INVALID",
+            message="通知 provider 必须是 lark 或 feishu",
+        )
+    return raw
+
+
+def _has_lark_env() -> bool:
+    return any(
+        os.environ.get(name, "").strip()
+        for name in (
+            "LARK_APP_ID",
+            "LARK_APP_SECRET",
+            "LARK_DEFAULT_RECEIVE_ID",
+            "LARK_DEFAULT_OPEN_ID",
+        )
+    )

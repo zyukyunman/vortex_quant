@@ -36,11 +36,15 @@ class NotificationService:
         self._router = router or NotificationRouter()
         self._channels: dict[str, NotificationChannel] = dict(channels or {})
 
-        # 自动发现飞书渠道
+        # 自动发现 Feishu/Lark 渠道。Lark 国际版与国内飞书共享协议但域名不同。
         if "feishu" not in self._channels:
-            feishu = FeishuChannel.from_env_if_available()
+            feishu = FeishuChannel.from_env_if_available("feishu")
             if feishu is not None:
                 self._channels["feishu"] = feishu
+        if "lark" not in self._channels:
+            lark = FeishuChannel.from_env_if_available("lark")
+            if lark is not None:
+                self._channels["lark"] = lark
 
         # 自动发现 Agent 渠道
         if "agent" not in self._channels:

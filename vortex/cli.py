@@ -1929,6 +1929,18 @@ def cmd_server(args: argparse.Namespace) -> None:
             sys.exit(1)
 
 
+def cmd_console(args: argparse.Namespace) -> None:
+    """本地控制台。"""
+    from vortex.runtime.control_console import run_control_console
+
+    root = Path(getattr(args, "root", DEFAULT_WORKSPACE)).expanduser().resolve()
+    run_control_console(
+        root,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8765)),
+    )
+
+
 def cmd_profile(args: argparse.Namespace) -> None:
     """配置管理。"""
     from vortex.config.profile.resolver import ProfileResolver
@@ -2944,6 +2956,7 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         "cogalpha-role-cycle",
         "factor-overlay-challenge",
         "robustness-matrix",
+        "cpcv-backtest",
         "daily-mutation-grid",
         "overlay-execution-review",
         "regime-budget-challenge",
@@ -2952,7 +2965,9 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         raise SystemExit(f"未知 earnings-forecast 子命令: {args.earnings_action}")
 
     from vortex.strategy.earnings_forecast_overlay import (
+        DEFAULT_CPCV_BACKTEST_LABEL,
         DEFAULT_FACTOR_OVERLAY_LABEL,
+        run_earnings_forecast_cpcv_backtest,
         run_earnings_forecast_daily_mutation_grid,
         run_earnings_forecast_factor_overlay_challenge,
         run_earnings_forecast_overlay_execution_review,
@@ -3306,6 +3321,36 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         print(f"  矩阵: {artifacts.matrix_path}")
         print(f"  Markdown: {artifacts.md_path}")
         status = artifacts.summary.get("robustness_status") or {}
+        if isinstance(status, dict):
+            print(f"  状态: {status.get('status', 'unknown')}")
+        return
+
+    if args.earnings_action == "cpcv-backtest":
+        artifacts = run_earnings_forecast_cpcv_backtest(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            reference_name=getattr(args, "reference", None),
+            challenger_name=args.challenger,
+            start=args.start,
+            end=args.end,
+            n_groups=int(args.n_groups),
+            n_test_groups=int(args.n_test_groups),
+            purge_horizon=int(args.purge_horizon),
+            embargo=int(args.embargo),
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_CPCV_BACKTEST_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+            max_combinations=getattr(args, "max_combinations", None),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告冻结候选 CPCV 回测完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  矩阵: {artifacts.matrix_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        status = artifacts.summary.get("cpcv_status") or {}
         if isinstance(status, dict):
             print(f"  状态: {status.get('status', 'unknown')}")
         return
@@ -3880,6 +3925,58 @@ def _print_trade_dict(title: str, payload: dict[str, object]) -> None:
         print(f"  {key}: {value}")
 
 
+def _run_research_cogalpha_cycle(args: argparse.Namespace) -> dict[str, object]:
+    if not args.demo:
+        raise SystemExit("第一版 research cogalpha-cycle 只支持 --demo 确定性演示数据")
+
+    from vortex.research.cogalpha import run_cogalpha_company_demo_cycle
+
+    notification_config = None
+    if getattr(args, "notify", False):
+        notification_config = {
+            "enabled": True,
+            "level": args.notification_level,
+            "channel": args.notification_channel,
+        }
+    return run_cogalpha_company_demo_cycle(
+        args.root,
+        output_dir=args.output_dir,
+        run_id=args.run_id,
+        days=args.days,
+        symbols=args.symbols,
+        min_periods=args.min_periods,
+        groups=args.groups,
+        top_n=args.top_n,
+        notify=args.notify,
+        notification_config=notification_config,
+    )
+
+
+def cmd_research(args: argparse.Namespace) -> None:
+    """因子研究与研发公司运行入口。"""
+
+    if args.research_action == "cogalpha-cycle":
+        payload = _run_research_cogalpha_cycle(args)
+        title = "CogAlpha 因子研究公司级运行完成"
+    else:
+        raise SystemExit(f"未知 research 子命令: {args.research_action}")
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    run = payload.get("run", {})
+    quality_gate = payload.get("quality_gate", {})
+    artifacts = payload.get("artifacts", {})
+    print(title)
+    print(f"  run_id: {run.get('run_id')}")
+    print(f"  status: {run.get('status')}")
+    print(f"  output_dir: {run.get('output_dir')}")
+    print(f"  quality_gate: {quality_gate.get('status')}")
+    print(f"  promoted_candidate_count: {quality_gate.get('promoted_candidate_count')}")
+    manifest = artifacts.get("run_manifest") if isinstance(artifacts, dict) else None
+    if isinstance(manifest, dict):
+        print(f"  run_manifest: {manifest.get('path')}")
+
+
 def cmd_trade(args: argparse.Namespace) -> None:
     """交易执行入口。"""
 
@@ -3995,6 +4092,13 @@ def main() -> None:
     start_parser.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     for action in ("stop", "status"):
         server_sub.add_parser(action, parents=[root_parser])
+
+    # --- vortex console start ---
+    console_parser = subparsers.add_parser("console", help="本地控制台")
+    console_sub = console_parser.add_subparsers(dest="console_action")
+    console_start = console_sub.add_parser("start", parents=[root_parser], help="启动本地控制台页面")
+    console_start.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1")
+    console_start.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
 
     # --- vortex profile {explain|resolve} ---
     profile_parser = subparsers.add_parser("profile", help="配置管理")
@@ -4113,6 +4217,41 @@ def main() -> None:
     )
     inspect_sub.add_argument("--limit", type=int, default=10, help="样例行数（默认 10，0 表示只看元信息）")
     inspect_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    # --- vortex research ---
+    research_parser = subparsers.add_parser("research", help="因子研究与研发公司运行")
+    research_sub = research_parser.add_subparsers(dest="research_action")
+    cogalpha_cycle_sub = research_sub.add_parser(
+        "cogalpha-cycle",
+        parents=[root_parser],
+        help="运行公司级 CogAlpha 因子研究闭环",
+    )
+    cogalpha_cycle_sub.add_argument(
+        "--demo",
+        action="store_true",
+        help="使用确定性演示数据跑通公司级研究闭环",
+    )
+    cogalpha_cycle_sub.add_argument("--output-dir", help="artifact 输出目录；默认 workspace/research/cogalpha/company_runs/{run_id}")
+    cogalpha_cycle_sub.add_argument("--run-id", help="运行编号；默认自动生成")
+    cogalpha_cycle_sub.add_argument("--days", type=int, default=220, help="演示数据交易日数量，默认 220")
+    cogalpha_cycle_sub.add_argument("--symbols", type=int, default=60, help="演示数据股票数量，默认 60")
+    cogalpha_cycle_sub.add_argument("--min-periods", type=int, default=30, help="最少有效期数，默认 30")
+    cogalpha_cycle_sub.add_argument("--groups", type=int, default=5, help="多空分组数，默认 5")
+    cogalpha_cycle_sub.add_argument("--top-n", type=int, default=10, help="summary 输出候选数，默认 10")
+    cogalpha_cycle_sub.add_argument("--notify", action="store_true", help="运行完成后通过通知服务发送出站通知")
+    cogalpha_cycle_sub.add_argument(
+        "--notification-channel",
+        choices=["lark", "feishu", "agent"],
+        default="lark",
+        help="通知渠道，默认 lark",
+    )
+    cogalpha_cycle_sub.add_argument(
+        "--notification-level",
+        choices=["info", "warning", "critical"],
+        default="info",
+        help="通知最低级别，默认 info",
+    )
+    cogalpha_cycle_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     # --- vortex strategy earnings-forecast precise-review ---
     strategy_parser = subparsers.add_parser("strategy", help="策略研究与复核")
@@ -4398,6 +4537,42 @@ def main() -> None:
         help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
     )
     robustness_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    cpcv_sub = earnings_sub.add_parser(
+        "cpcv-backtest",
+        parents=[root_parser],
+        help="对冻结 overlay challenger 做 CPCV 式样本外分块回测，并与 baseline 对比",
+    )
+    cpcv_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="基准策略版本 preset，默认 baseline_top110_large",
+    )
+    cpcv_sub.add_argument("--challenger", default="tail_risk_soft_q10_p25", help="被冻结验证的 overlay variant")
+    cpcv_sub.add_argument("--reference", help="可选：用某个 overlay variant 作为参考基准；默认使用 preset baseline")
+    cpcv_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    cpcv_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    cpcv_sub.add_argument("--n-groups", type=int, default=8, help="连续时间分块数，默认 8")
+    cpcv_sub.add_argument("--n-test-groups", type=int, default=2, help="每次作为测试集的分块数，默认 2")
+    cpcv_sub.add_argument("--purge-horizon", type=int, default=40, help="从训练集中剔除测试块前的交易日数，默认 40")
+    cpcv_sub.add_argument("--embargo", type=int, default=20, help="从训练集中剔除测试块后的交易日数，默认 20")
+    cpcv_sub.add_argument("--max-combinations", type=int, help="只运行前 N 个组合，用于快速验收")
+    cpcv_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    cpcv_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    cpcv_sub.add_argument("--label", help="输出文件名前缀")
+    cpcv_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    cpcv_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     mutation_sub = earnings_sub.add_parser(
         "daily-mutation-grid",
@@ -4686,10 +4861,14 @@ def main() -> None:
             cmd_init(args)
         case "server":
             cmd_server(args)
+        case "console":
+            cmd_console(args)
         case "profile":
             cmd_profile(args)
         case "data":
             cmd_data(args)
+        case "research":
+            cmd_research(args)
         case "strategy":
             cmd_strategy(args)
         case "trade":

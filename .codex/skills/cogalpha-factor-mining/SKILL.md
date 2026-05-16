@@ -62,9 +62,10 @@ Step 3: 用 diversified guidance 生成多个候选表达
 Step 4: 转成安全候选：优先公式 DSL / FormulaSpec 风格，不直接写任意 Python
 Step 5: 执行 quality gate：字段、算子、PIT、数值、覆盖率、经济逻辑
 Step 6: 调用 factor-evaluation 做多周期 fitness
-Step 7: 调用 factor-research-archive 记录好因子、坏因子和失败原因
-Step 8: 汇总 qualified / elite / rejected
-Step 9: 基于失败原因设计下一轮 mutation / crossover
+Step 7: 调用 factor-evidence-reviewer 审查结论可信度、过拟合、重复度和下一步接力
+Step 8: 调用 factor-research-archive 记录好因子、坏因子和失败原因
+Step 9: 汇总 qualified / elite / rejected / informative failure
+Step 10: 基于失败原因和证据评审设计下一轮 mutation / crossover
 ```
 
 当前工程入口：
@@ -94,7 +95,8 @@ from vortex.research.cogalpha import run_cogalpha_research_cycle
 4. quality gate 通过/失败原因。
 5. fitness 指标和准入判断。
 6. lineage：父代、变异、交叉、prompt/guidance 来源。
-7. 下一轮 evolution 建议。
+7. evidence review：可信证据、薄弱证据、过拟合/重复风险、搜索预算。
+8. 下一轮 evolution 建议。
 
 ---
 
@@ -207,6 +209,49 @@ Fitness 不等于策略收益。标准指标：
 
 每个 child 必须记录父代、变异/交叉类型、保留的经济假设和新增风险。
 
+### 8.1 长时研究接力
+
+CogAlpha 长时研究的目标不是一次生成完，而是让每轮都能把上下文交给下一轮。这里说的“继续”是研究员或 Codex 按 skill 读取接力包后继续工作，不是要求在代码里写死自动调度，也不要求 API key。
+
+```text
+parent_pool / rejected_pool
+  -> next_generation_queue
+  -> perspective_selection
+  -> mutation / crossover / regenerate
+  -> quality gate
+  -> fitness
+  -> evidence review
+  -> handoff note
+  -> archive writeback
+```
+
+可继续条件：
+
+1. 至少有一个 `qualified/elite` parent 可以 mutation 或 crossover。
+2. 或者 rejected_pool 中存在 `rejected_informative`，能明确指导视角缩小、方向翻转、门控或标准化变化。
+3. 或者本轮失败来自字段/表达式问题，修复后仍回答同一假设。
+
+应停止条件：
+
+1. 连续多轮没有新增证据。
+2. 通过候选只来自单一窗口、单一年份或高度重复父代。
+3. 质量门禁反复失败，说明字段或表达式空间不可靠。
+4. 证据评审判断策略角色不成立。
+5. 到达时间、候选数、失败轮数或人工审批边界。
+
+### 8.2 证据评审 handoff
+
+`qualified` 和 `elite` 不能直接进入策略晋升。必须先交给 `factor-evidence-reviewer` 输出：
+
+```text
+是否回答原假设：
+是否只是重复父代：
+是否存在过拟合风险：
+是否需要 robustness / overlay / execution review：
+下一位 Agent：
+接力包：
+```
+
 ---
 
 ## 九、与其他 skills 的协作
@@ -215,6 +260,7 @@ Fitness 不等于策略收益。标准指标：
 |---|---|
 | `factor-mining-research` | 默认上游和总编排：读取资料/档案、选择方向，然后调用 CogAlpha generation |
 | `factor-evaluation` | 执行多周期 IC、多空和准入判断 |
+| `ai-company/roles/factor-evidence-reviewer` | 评审 fitness 之后的结论可信度、过拟合、重复度和下一位 Agent 接力包 |
 | `factor-research-archive` | 记录好因子、坏因子、失败原因和 artifact |
 | `goal-achievement-review` | 判断 experiment / candidate / promoted |
 | `strategy-development-experience` | 防过拟合、walk-forward、容量和可交易性 |

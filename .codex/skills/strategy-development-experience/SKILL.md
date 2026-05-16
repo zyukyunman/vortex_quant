@@ -57,6 +57,44 @@ obsidian_links:
 | 持仓 | 每日持仓、贡献、行业/市值/估值暴露 |
 | artifact | JSON 是事实来源，HTML 只是展示 |
 
+## 三点五、回测与 CPCV 晋升协议
+
+当用户讨论“回测好于 baseline 就替代 baseline”时，必须先区分替代对象：
+
+| 替代对象 | 规则 |
+|---|---|
+| 研究 reference baseline | 冻结候选后，通过测试级 CPCV / 样本外 / 成本 / 执行复核，可以替代 |
+| 正式 preset / live 默认 | 不能只凭回测替代；还需要 paper shadow、用户审批和回滚方案 |
+
+执行顺序：
+
+```text
+Research spike
+  -> Train/dev 参数选择
+  -> 冻结候选和搜索预算
+  -> Test/CPCV
+  -> 成本、容量、执行复核
+  -> paper shadow
+  -> 用户审批后才允许替换正式 preset
+```
+
+CPCV 默认口径参考 `docs/AI量化公司OS/13-回测与CPCV评估协议-v1.md`：
+
+1. 时间序列切成 8 或 10 个连续组。
+2. 每次选择 2 个组做测试。
+3. purge horizon 使用策略持有期或标签前瞻期；业绩预告漂移初始用 40 个交易日。
+4. embargo 初始用 20 个交易日或样本 1%-3%。
+5. 输出 baseline delta 分布，不只输出一个全样本指标。
+
+最低替代门槛：
+
+1. CPCV 样本外 `calmar_delta` 中位数 > 0。
+2. CPCV 样本外 `annual_return_delta` 中位数 > 0。
+3. 样本外胜率 >= 60%；如果候选来自较大搜索，要求 >= 70%。
+4. `max_drawdown_delta` 的 25% 分位不低于 -1 个百分点。
+5. 成本、容量和执行约束不明显弱于 baseline。
+6. 搜索预算、失败路径和参数冻结时间必须记录。
+
 ---
 
 ## 四、artifact 归位
