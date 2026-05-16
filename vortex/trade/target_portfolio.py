@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from vortex.trade.market_rules import min_order_shares
 from vortex.trade.models import Lineage, TargetPortfolio, TargetPosition
 
 
@@ -51,6 +52,8 @@ def build_target_portfolio(
     for row, reason in zip(rows.itertuples(index=False), reason_series, strict=False):
         target_value = float(config.notional * row.target_weight)
         shares = int(target_value / float(row.reference_price) // config.lot_size) * config.lot_size
+        if shares < min_order_shares(str(row.symbol), "buy"):
+            continue
         rounded_value = shares * float(row.reference_price)
         if shares <= 0 or rounded_value < config.min_position_value:
             continue

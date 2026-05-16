@@ -120,6 +120,9 @@ def build_forecast_surprise_signal(
         }
     )
     events["event_score"] = avg_growth.clip(-200, 500).fillna(0.0) / 100 + type_score.fillna(0.0)
+    events = events.loc[events["event_score"] > 0].copy()
+    if events.empty:
+        return pd.DataFrame(index=target_index, columns=target_columns, dtype=float)
     return _ranked_event_signal(
         events,
         target_index=target_index,

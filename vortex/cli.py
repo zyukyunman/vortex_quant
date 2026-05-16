@@ -2295,6 +2295,132 @@ def _watch_data_status(root: Path, profile_name: str, fmt: str, interval: float)
         time.sleep(refresh_interval)
 
 
+def _collect_earnings_forecast_auto_status(root: Path) -> dict[str, object]:
+    """读取业绩预告 auto-run 最新状态，并补充 PID 存活性。"""
+
+    from vortex.runtime.workspace import Workspace
+    from vortex.strategy.earnings_forecast_live import read_earnings_forecast_auto_status
+
+    ws = Workspace(root)
+    ws.ensure_initialized()
+    status = read_earnings_forecast_auto_status(root)
+    pid = status.get("pid")
+    pid_int = int(pid) if pid is not None else None
+    return {
+        "root": str(root),
+        **status,
+        "pid_alive": _is_pid_alive(pid_int),
+    }
+
+
+def _print_earnings_forecast_auto_status(root: Path, fmt: str) -> None:
+    """输出业绩预告 auto-run 的最近一轮状态。"""
+
+    status = _collect_earnings_forecast_auto_status(root)
+    if fmt == "json":
+        _print_result(status, fmt)
+        return
+
+    print("📡 业绩预告 auto-run 状态")
+    print(f"  service_status: {status.get('service_status')}")
+    if status.get("pid") is not None:
+        state = "alive" if status.get("pid_alive") else "dead"
+        print(f"  pid: {status.get('pid')} ({state})")
+    if status.get("updated_at"):
+        print(f"  updated_at: {status.get('updated_at')}")
+    if status.get("log_path"):
+        print(f"  log: {status.get('log_path')}")
+    if status.get("status_path"):
+        print(f"  status_file: {status.get('status_path')}")
+
+    config = status.get("config")
+    if isinstance(config, dict) and config:
+        print("  config:")
+        for key in [
+            "profile_name",
+            "start",
+            "preset_name",
+            "prepare_time",
+            "execute_time",
+            "poll_seconds",
+            "allow_trading",
+        ]:
+            if key in config:
+                print(f"    {key}: {config[key]}")
+
+    print(f"  last_tick_status: {status.get('last_tick_status')}")
+    if status.get("last_tick_at"):
+        print(f"  last_tick_at: {status.get('last_tick_at')}")
+    last_tick = status.get("last_tick")
+    if isinstance(last_tick, dict) and last_tick:
+        print("  last_tick:")
+        for key, value in last_tick.items():
+            print(f"    {key}: {value}")
+    last_error = status.get("last_error")
+    if isinstance(last_error, dict) and last_error:
+        print("  last_error:")
+        print(f"    type: {last_error.get('type')}")
+        print(f"    message: {last_error.get('message')}")
+    print(f"  logs_cmd: vortex strategy earnings-forecast auto-logs --root {root} --follow")
+
+
+def _print_earnings_forecast_auto_logs(
+    root: Path,
+    *,
+    lines: int,
+    follow: bool,
+    fmt: str,
+) -> None:
+    """输出业绩预告 auto-run 的稳定日志文件。"""
+
+    from vortex.strategy.earnings_forecast_live import get_earnings_forecast_auto_observability_paths
+
+    status = _collect_earnings_forecast_auto_status(root)
+    path = Path(str(status.get("log_path") or get_earnings_forecast_auto_observability_paths(root).log_path))
+    if fmt == "json":
+        if follow:
+            print("❌ --follow 与 --format json 不能同时使用", file=sys.stderr)
+            sys.exit(1)
+        _print_result(
+            {
+                "service_status": status.get("service_status"),
+                "pid": status.get("pid"),
+                "pid_alive": status.get("pid_alive"),
+                "log_path": str(path),
+                "tail": _tail_text_file(path, max_lines=lines),
+            },
+            fmt,
+        )
+        return
+
+    print("📄 业绩预告 auto-run 日志")
+    print(f"   log: {path}")
+    tail = _tail_text_file(path, max_lines=lines)
+    if tail:
+        print(tail)
+    else:
+        print("ℹ️  日志文件暂无内容")
+
+    if not follow:
+        return
+
+    print("---- follow mode (Ctrl+C 退出) ----")
+    while not path.exists():
+        time.sleep(0.5)
+
+    last_size = 0
+    while True:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if len(text) < last_size:
+            last_size = 0
+        if len(text) > last_size:
+            chunk = text[last_size:]
+            if chunk:
+                print(chunk, end="" if chunk.endswith("\n") else "\n")
+            last_size = len(text)
+        time.sleep(0.5)
+
+
 def cmd_data(args: argparse.Namespace) -> None:
     """数据管理（Phase 1A: Data Ingestion & Storage）。
 
@@ -2807,6 +2933,10 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         "precise-review",
         "shadow-plan",
         "live-handoff",
+        "prepare-next-session",
+        "auto-run",
+        "auto-status",
+        "auto-logs",
         "opening-liquidity-review",
         "auction-execution-review",
         "version-review",
@@ -2833,6 +2963,18 @@ def cmd_strategy(args: argparse.Namespace) -> None:
     from vortex.strategy.earnings_forecast_cogalpha import (
         DEFAULT_COGALPHA_ROLE_LABEL,
         run_earnings_forecast_cogalpha_role_cycle,
+    )
+    from vortex.strategy.earnings_forecast_live import (
+        DEFAULT_AUTO_EXECUTE_TIME,
+        DEFAULT_AUTO_LABEL,
+        DEFAULT_AUTO_NAV_BENCHMARK,
+        DEFAULT_AUTO_NAV_INITIAL_EQUITY,
+        DEFAULT_AUTO_PREPARE_TIME,
+        DEFAULT_AUTO_PRESET,
+        prepare_earnings_forecast_next_session,
+        run_earnings_forecast_auto_once,
+        run_earnings_forecast_auto_cycle_once,
+        run_earnings_forecast_auto_loop,
     )
     from vortex.strategy.earnings_forecast_runner import (
         DEFAULT_AUCTION_EXECUTION_LABEL,
@@ -2893,6 +3035,7 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
             artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
             label=args.label or DEFAULT_SHADOW_LABEL,
+            preset_name=getattr(args, "preset", None),
             require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
         )
         if args.format == "json":
@@ -2921,6 +3064,7 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
             artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
             label=args.label or DEFAULT_LIVE_HANDOFF_LABEL,
+            preset_name=getattr(args, "preset", None),
             require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
         )
         if args.format == "json":
@@ -2935,6 +3079,85 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             print("  阻断:")
             for item in artifacts.summary["blocking_reasons"]:
                 print(f"    - {item}")
+        return
+
+    if args.earnings_action == "prepare-next-session":
+        artifacts = prepare_earnings_forecast_next_session(
+            Path(args.root).expanduser(),
+            start=args.start,
+            as_of=args.as_of,
+            qmt_bridge_url=args.qmt_bridge_url,
+            qmt_bridge_token=args.qmt_bridge_token,
+            qmt_account_id=args.qmt_account_id,
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_LIVE_HANDOFF_LABEL,
+            preset_name=args.preset or DEFAULT_AUTO_PRESET,
+            portfolio_notional=float(args.portfolio_notional),
+            min_position_value=float(args.min_position_value),
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告执行计划已生成")
+        print(f"  Handoff: {artifacts.handoff_json_path}")
+        print(f"  Target portfolio: {artifacts.target_portfolio_path}")
+        print(f"  Pending task: {artifacts.task_path}")
+        return
+
+    if args.earnings_action == "auto-status":
+        _print_earnings_forecast_auto_status(Path(args.root).expanduser(), args.format)
+        return
+
+    if args.earnings_action == "auto-logs":
+        _print_earnings_forecast_auto_logs(
+            Path(args.root).expanduser(),
+            lines=int(getattr(args, "lines", 40)),
+            follow=bool(getattr(args, "follow", False)),
+            fmt=args.format,
+        )
+        return
+
+    if args.earnings_action == "auto-run":
+        if not bool(args.once):
+            run_earnings_forecast_auto_loop(
+                Path(args.root).expanduser(),
+                start=args.start,
+                profile_name=args.profile,
+                qmt_bridge_url=args.qmt_bridge_url,
+                qmt_bridge_token=args.qmt_bridge_token,
+                qmt_account_id=args.qmt_account_id,
+                preset_name=args.preset or DEFAULT_AUTO_PRESET,
+                label=args.label or DEFAULT_AUTO_LABEL,
+                prepare_time=args.prepare_time or DEFAULT_AUTO_PREPARE_TIME,
+                execute_time=args.execute_time or DEFAULT_AUTO_EXECUTE_TIME,
+                poll_seconds=int(args.poll_seconds),
+                allow_trading=not bool(args.disable_trading),
+                nav_initial_equity=float(args.nav_initial_equity),
+                nav_benchmark=args.nav_benchmark or DEFAULT_AUTO_NAV_BENCHMARK,
+            )
+            return
+        payload = run_earnings_forecast_auto_once(
+            Path(args.root).expanduser(),
+            start=args.start,
+            profile_name=args.profile,
+            qmt_bridge_url=args.qmt_bridge_url,
+            qmt_bridge_token=args.qmt_bridge_token,
+            qmt_account_id=args.qmt_account_id,
+            preset_name=args.preset or DEFAULT_AUTO_PRESET,
+            label=args.label or DEFAULT_AUTO_LABEL,
+            prepare_time=args.prepare_time or DEFAULT_AUTO_PREPARE_TIME,
+            execute_time=args.execute_time or DEFAULT_AUTO_EXECUTE_TIME,
+            allow_trading=not bool(args.disable_trading),
+            nav_initial_equity=float(args.nav_initial_equity),
+            nav_benchmark=args.nav_benchmark or DEFAULT_AUTO_NAV_BENCHMARK,
+        )
+        if args.format == "json":
+            print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告自动编排 tick 完成")
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return
 
     if args.earnings_action == "version-review":
@@ -3472,6 +3695,127 @@ def _run_trade_paper_rebalance(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _run_trade_qmt_rebalance(args: argparse.Namespace) -> dict[str, object]:
+    import vortex.trade as trade_module
+
+    from vortex.strategy.earnings_forecast_live import load_trade_st_flags
+    from vortex.trade.execution import run_qmt_rebalance
+    from vortex.trade.order_plan import OrderPlanConfig
+    from vortex.trade.risk import PreTradeRiskConfig
+    from vortex.trade.serialization import read_json, target_portfolio_from_dict
+
+    if not args.qmt_bridge_url:
+        raise ValueError("缺少 --qmt-bridge-url")
+    portfolio = target_portfolio_from_dict(read_json(Path(args.target_portfolio).expanduser()))
+    if args.st_flags:
+        st_flags = _read_trade_st_flags(Path(args.st_flags).expanduser())
+    else:
+        probe = trade_module.QmtBridgeAdapter(
+            trade_module.QmtBridgeConfig(
+                base_url=args.qmt_bridge_url,
+                token=args.qmt_bridge_token,
+                account_id=args.qmt_account_id or None,
+                allow_trading=False,
+            )
+        )
+        positions = probe.get_positions()
+        symbols = sorted(
+            {
+                *(item.symbol for item in portfolio.positions),
+                *(item.symbol for item in positions),
+            }
+        )
+        st_flags = load_trade_st_flags(
+            Path(args.root).expanduser(),
+            as_of=args.st_as_of or portfolio.trade_date,
+            symbols=symbols,
+        )
+    artifacts = run_qmt_rebalance(
+        portfolio,
+        bridge_config=trade_module.QmtBridgeConfig(
+            base_url=args.qmt_bridge_url,
+            token=args.qmt_bridge_token,
+            account_id=args.qmt_account_id or None,
+            allow_trading=not bool(args.disable_trading),
+        ),
+        output_root=Path(args.root).expanduser(),
+        st_flags=st_flags,
+        order_config=OrderPlanConfig(
+            buy_limit_bps=float(args.buy_limit_bps),
+            sell_limit_bps=float(args.sell_limit_bps),
+            min_order_value=float(args.min_order_value),
+        ),
+        risk_config=PreTradeRiskConfig(
+            mode="qmt_sim",
+            allow_live=not bool(args.disable_trading),
+            require_st_data=not bool(args.allow_missing_st_data),
+            max_order_count=int(args.max_order_count),
+            max_single_order_value=float(args.max_single_order_value),
+            max_daily_order_value=float(args.max_daily_order_value),
+        ),
+    )
+    report = artifacts.report
+    return {
+        "exec_id": artifacts.exec_id,
+        "risk_passed": report.risk_result.passed,
+        "blocking_reasons": report.risk_result.blocking_reasons,
+        "order_count": len(report.orders),
+        "fill_count": len(report.fills),
+        "cash": report.cash.available_cash,
+        "market_value": report.cash.market_value,
+        "execution_report_path": str(artifacts.execution_report_path),
+        "execution_report_md_path": str(artifacts.execution_report_md_path),
+    }
+
+
+def _run_trade_nav_snapshot(args: argparse.Namespace) -> dict[str, object]:
+    import vortex.trade as trade_module
+    from vortex.trade.nav import ensure_nav_binding, latest_benchmark_close, record_nav_snapshot
+
+    if not args.qmt_bridge_url:
+        raise ValueError("缺少 --qmt-bridge-url")
+    if not args.qmt_account_id:
+        raise ValueError("缺少 --qmt-account-id")
+    trade_date = args.trade_date or datetime.now().strftime("%Y%m%d")
+    binding = ensure_nav_binding(
+        Path(args.root).expanduser(),
+        strategy_name=args.strategy_name,
+        strategy_version=args.strategy_version,
+        account_id=args.qmt_account_id,
+        initial_equity=float(args.initial_equity),
+        benchmark=args.benchmark,
+        start_date=args.start_date or trade_date,
+        run_id=args.run_id,
+        reset=bool(args.reset),
+    )
+    adapter = trade_module.QmtBridgeAdapter(
+        trade_module.QmtBridgeConfig(
+            base_url=args.qmt_bridge_url,
+            token=args.qmt_bridge_token,
+            account_id=args.qmt_account_id,
+            allow_trading=False,
+        )
+    )
+    cash = adapter.get_cash()
+    benchmark_close = latest_benchmark_close(Path(args.root).expanduser(), benchmark=binding.benchmark, trade_date=trade_date)
+    return record_nav_snapshot(
+        Path(args.root).expanduser(),
+        binding=binding,
+        trade_date=trade_date,
+        cash=cash,
+        benchmark_close=benchmark_close,
+    )
+
+
+def _run_trade_nav_status(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade.nav import default_nav_run_id, summarize_nav
+
+    if not args.run_id and not args.qmt_account_id:
+        raise ValueError("缺少 --qmt-account-id；或显式提供 --run-id")
+    run_id = args.run_id or default_nav_run_id(args.strategy_name, args.strategy_version, args.qmt_account_id)
+    return summarize_nav(Path(args.root).expanduser(), run_id)
+
+
 def _trade_inspect_summary(root: Path, exec_id: str | None = None) -> dict[str, object]:
     from vortex.trade.serialization import execution_report_from_dict, read_json
 
@@ -3565,6 +3909,15 @@ def cmd_trade(args: argparse.Namespace) -> None:
     elif args.trade_action == "paper" and args.trade_paper_action == "rebalance":
         payload = _run_trade_paper_rebalance(args)
         title = "Paper rebalance 完成"
+    elif args.trade_action == "qmt" and args.trade_qmt_action == "rebalance":
+        payload = _run_trade_qmt_rebalance(args)
+        title = "QMT rebalance 完成"
+    elif args.trade_action == "nav" and args.trade_nav_action == "snapshot":
+        payload = _run_trade_nav_snapshot(args)
+        title = "策略净值快照已记录"
+    elif args.trade_action == "nav" and args.trade_nav_action == "status":
+        payload = _run_trade_nav_status(args)
+        title = "策略净值状态"
     else:
         raise SystemExit(f"未知 trade 子命令: {args.trade_action}")
     if args.format == "json":
@@ -3766,6 +4119,13 @@ def main() -> None:
     strategy_sub = strategy_parser.add_subparsers(dest="strategy_action")
     earnings_parser = strategy_sub.add_parser("earnings-forecast", help="业绩预告漂移策略")
     earnings_sub = earnings_parser.add_subparsers(dest="earnings_action")
+    earnings_preset_choices = [
+        "aggressive_100w",
+        "stable_100w",
+        "liquidity_top80",
+        "liquidity_top90_1000w",
+        "baseline_top110_large",
+    ]
     precise_sub = earnings_sub.add_parser(
         "precise-review",
         parents=[root_parser],
@@ -3804,6 +4164,11 @@ def main() -> None:
     shadow_sub.add_argument("--artifact-dir", help="目标持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
     shadow_sub.add_argument("--label", help="输出文件名前缀")
     shadow_sub.add_argument(
+        "--preset",
+        choices=earnings_preset_choices,
+        help="可选：按已固化策略版本 preset 生成影子目标；不传则保持原 config 口径",
+    )
+    shadow_sub.add_argument(
         "--allow-missing-precise-data",
         action="store_true",
         help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
@@ -3818,17 +4183,96 @@ def main() -> None:
     handoff_sub.add_argument("--start", required=True, help="影子跟踪回看起始日期 YYYYMMDD")
     handoff_sub.add_argument("--as-of", required=True, help="目标持仓日期 YYYYMMDD")
     handoff_sub.add_argument("--qmt-bridge-url", required=True, help="qmt-bridge 地址，例如 http://10.0.0.2:8000")
-    handoff_sub.add_argument("--qmt-bridge-token", help="qmt-bridge API Token（只读可选，按服务端配置）")
+    handoff_sub.add_argument(
+        "--qmt-bridge-token",
+        default=os.getenv("QMT_BRIDGE_TOKEN"),
+        help="qmt-bridge API Token（默认读取环境变量 QMT_BRIDGE_TOKEN）",
+    )
     handoff_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
     handoff_sub.add_argument("--output-dir", help="交接 JSON/HTML 输出目录；默认 workspace/strategy")
     handoff_sub.add_argument("--artifact-dir", help="目标持仓 CSV 输出目录；默认 workspace/strategy/artifacts")
     handoff_sub.add_argument("--label", help="输出文件名前缀")
+    handoff_sub.add_argument(
+        "--preset",
+        choices=earnings_preset_choices,
+        help="可选：按已固化策略版本 preset 生成交接目标；不传则保持原 config 口径",
+    )
     handoff_sub.add_argument(
         "--allow-missing-precise-data",
         action="store_true",
         help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
     )
     handoff_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    prepare_sub = earnings_sub.add_parser(
+        "prepare-next-session",
+        parents=[root_parser],
+        help="按最新可见数据生成冻结组合与待执行任务（交易日默认落到当天）",
+    )
+    prepare_sub.add_argument("--start", required=True, help="策略回看起始日期 YYYYMMDD")
+    prepare_sub.add_argument("--as-of", required=True, help="最新可见数据基准日 YYYYMMDD；若为交易日则默认生成当天计划")
+    prepare_sub.add_argument("--qmt-bridge-url", required=True, help="qmt-bridge 地址，例如 http://10.0.0.2:8000")
+    prepare_sub.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    prepare_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
+    prepare_sub.add_argument("--output-dir", help="handoff JSON/HTML 输出目录；默认 workspace/strategy")
+    prepare_sub.add_argument("--artifact-dir", help="shadow artifact 输出目录；默认 workspace/strategy/artifacts")
+    prepare_sub.add_argument("--label", help="输出文件名前缀")
+    prepare_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=earnings_preset_choices,
+        help="冻结组合默认使用 baseline_top110_large",
+    )
+    prepare_sub.add_argument("--portfolio-notional", type=float, default=1_000_000.0, help="冻结目标本金，默认 100 万")
+    prepare_sub.add_argument("--min-position-value", type=float, default=3_000.0, help="单个目标持仓最小金额，默认 3000")
+    prepare_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    prepare_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    auto_sub = earnings_sub.add_parser(
+        "auto-run",
+        parents=[root_parser],
+        help="常驻自动编排：交易日开盘前拉数并生成当日计划，开盘执行 qmt rebalance",
+    )
+    auto_sub.add_argument("--start", required=True, help="策略回看起始日期 YYYYMMDD")
+    auto_sub.add_argument("--profile", default="default", help="data update 使用的 profile，默认 default")
+    auto_sub.add_argument("--qmt-bridge-url", required=True, help="qmt-bridge 地址，例如 http://10.0.0.2:8000")
+    auto_sub.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    auto_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
+    auto_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=earnings_preset_choices,
+        help="自动编排默认使用 baseline_top110_large",
+    )
+    auto_sub.add_argument("--label", help="自动编排标签")
+    auto_sub.add_argument("--prepare-time", default="08:10", help="开盘前生成当日执行计划的触发时间 HH:MM，默认 08:10")
+    auto_sub.add_argument("--execute-time", default="09:25", help="执行当日任务的触发时间 HH:MM，默认 09:25")
+    auto_sub.add_argument("--poll-seconds", type=int, default=60, help="循环轮询秒数，默认 60")
+    auto_sub.add_argument("--nav-initial-equity", type=float, default=1_000_000.0, help="账户级净值初始资金，默认 100 万")
+    auto_sub.add_argument("--nav-benchmark", default="000852.SH", help="账户级净值对标指数，默认中证1000")
+    auto_sub.add_argument("--once", action="store_true", help="只跑一轮 tick，不进入常驻循环")
+    auto_sub.add_argument("--disable-trading", action="store_true", help="生成计划但不真正 submit_order")
+    auto_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    auto_status_sub = earnings_sub.add_parser(
+        "auto-status",
+        parents=[root_parser],
+        help="查看 auto-run 最近一轮 tick 状态与错误",
+    )
+    auto_status_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    auto_logs_sub = earnings_sub.add_parser(
+        "auto-logs",
+        parents=[root_parser],
+        help="查看 auto-run 的稳定日志文件",
+    )
+    auto_logs_sub.add_argument("--lines", type=int, default=40, help="默认输出末尾 40 行")
+    auto_logs_sub.add_argument("--follow", action="store_true", help="持续跟随日志输出")
+    auto_logs_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     version_sub = earnings_sub.add_parser(
         "version-review",
@@ -3838,13 +4282,7 @@ def main() -> None:
     version_sub.add_argument(
         "--preset",
         default="aggressive_100w",
-        choices=[
-            "aggressive_100w",
-            "stable_100w",
-            "liquidity_top80",
-            "liquidity_top90_1000w",
-            "baseline_top110_large",
-        ],
+        choices=earnings_preset_choices,
         help="策略版本 preset，默认 aggressive_100w",
     )
     version_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
@@ -4183,6 +4621,59 @@ def main() -> None:
     paper_rebalance.add_argument("--max-daily-order-value", type=float, default=1_000_000.0)
     paper_rebalance.add_argument("--disable-trading", action="store_true", help="生成报告但禁用 broker 提交")
     paper_rebalance.add_argument("--format", choices=["text", "json"], default="text")
+
+    trade_qmt = trade_sub.add_parser("qmt", help="QMT / qmt-bridge 执行")
+    trade_qmt_sub = trade_qmt.add_subparsers(dest="trade_qmt_action")
+    qmt_rebalance = trade_qmt_sub.add_parser(
+        "rebalance",
+        parents=[root_parser],
+        help="使用 target_portfolio 通过 qmt-bridge 执行调仓（先卖后买，默认 fail-closed）",
+    )
+    qmt_rebalance.add_argument("--target-portfolio", required=True, help="target_portfolio.json 路径")
+    qmt_rebalance.add_argument("--qmt-bridge-url", default=os.getenv("QMT_BRIDGE_BASE_URL"), help="qmt-bridge 地址")
+    qmt_rebalance.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    qmt_rebalance.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID（可选）")
+    qmt_rebalance.add_argument("--st-flags", help="可选：手工提供 ST 标记 JSON；默认按 workspace 数据自动计算")
+    qmt_rebalance.add_argument("--st-as-of", help="ST 风险日期，默认使用 target_portfolio.trade_date")
+    qmt_rebalance.add_argument("--allow-missing-st-data", action="store_true", help="允许缺少 ST 标记数据")
+    qmt_rebalance.add_argument("--buy-limit-bps", type=float, default=30.0)
+    qmt_rebalance.add_argument("--sell-limit-bps", type=float, default=30.0)
+    qmt_rebalance.add_argument("--min-order-value", type=float, default=3_000.0)
+    qmt_rebalance.add_argument("--max-order-count", type=int, default=80)
+    qmt_rebalance.add_argument("--max-single-order-value", type=float, default=100_000.0)
+    qmt_rebalance.add_argument("--max-daily-order-value", type=float, default=1_000_000.0)
+    qmt_rebalance.add_argument("--disable-trading", action="store_true", help="只生成报告，不真正 submit_order")
+    qmt_rebalance.add_argument("--format", choices=["text", "json"], default="text")
+
+    trade_nav = trade_sub.add_parser("nav", help="账户级策略净值台账")
+    trade_nav_sub = trade_nav.add_subparsers(dest="trade_nav_action")
+    nav_snapshot = trade_nav_sub.add_parser(
+        "snapshot",
+        parents=[root_parser],
+        help="从 QMT 账户资产记录一条策略净值快照",
+    )
+    nav_snapshot.add_argument("--strategy-name", default="earnings_forecast_auto", help="策略名称")
+    nav_snapshot.add_argument("--strategy-version", default="baseline_top110_large", help="策略版本或 preset")
+    nav_snapshot.add_argument("--run-id", help="净值 run id；默认由策略、版本和账户生成")
+    nav_snapshot.add_argument("--initial-equity", type=float, default=1_000_000.0, help="初始策略资金")
+    nav_snapshot.add_argument("--benchmark", default="000852.SH", help="对标指数代码，默认中证1000")
+    nav_snapshot.add_argument("--start-date", help="净值起始日期；默认使用本次 trade-date")
+    nav_snapshot.add_argument("--trade-date", help="快照交易日，默认今天")
+    nav_snapshot.add_argument("--qmt-bridge-url", default=os.getenv("QMT_BRIDGE_BASE_URL"), help="qmt-bridge 地址")
+    nav_snapshot.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
+    nav_snapshot.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID")
+    nav_snapshot.add_argument("--reset", action="store_true", help="显式开启新的净值序列并清空旧 ledger")
+    nav_snapshot.add_argument("--format", choices=["text", "json"], default="text")
+    nav_status = trade_nav_sub.add_parser(
+        "status",
+        parents=[root_parser],
+        help="查看策略净值、基准和窗口超额",
+    )
+    nav_status.add_argument("--strategy-name", default="earnings_forecast_auto", help="策略名称")
+    nav_status.add_argument("--strategy-version", default="baseline_top110_large", help="策略版本或 preset")
+    nav_status.add_argument("--run-id", help="净值 run id；默认由策略、版本和账户生成")
+    nav_status.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID")
+    nav_status.add_argument("--format", choices=["text", "json"], default="text")
 
     args = parser.parse_args()
 

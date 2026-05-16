@@ -569,6 +569,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "1A",
         "fetch_mode": "trade_day_all",
         "partition_by": "date",
+        # `daily` 是收盘后数据。盘前/盘中出现 source_empty 只代表“当天分区尚未发布”，
+        # 不能像历史永久空分区那样复用，否则会把当天收盘后的 bars 永久跳过去。
+        "reuse_source_empty_coverage": False,
         "default_enabled": True,
         "quality_check": True,
     },

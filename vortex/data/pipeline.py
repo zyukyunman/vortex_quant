@@ -40,6 +40,7 @@ from vortex.shared.ids import generate_run_id
 from vortex.shared.logging import get_logger
 
 logger = get_logger(__name__)
+_CN_STOCK_DAILY_VISIBLE_AFTER = datetime.strptime("18:00", "%H:%M").time()
 
 # DataProfile 即为当前阶段的 ResolvedProfile
 # 完整的 profile 合并解析将在 config 域后续迭代中实现
@@ -251,6 +252,7 @@ class DataPipeline:
         *,
         run_id: str | None = None,
         action: str = "bootstrap",
+        current: datetime | None = None,
     ) -> RunReport:
         """全量初始化：history_start → 最新交易日。
 
@@ -274,8 +276,14 @@ class DataPipeline:
                 message=f"{action}：准备交易日历与标的列表",
                 force=True,
             )
+            market = "cn_stock"
             start = self._parse_date(profile.history_start)
-            end = date.today()
+            end = self._resolve_effective_sync_end(
+                market=market,
+                start=start,
+                end=date.today(),
+                current=current,
+            )
 
             report = self._run_sync(
                 run_id=run_id,
@@ -330,6 +338,7 @@ class DataPipeline:
         *,
         run_id: str | None = None,
         action: str = "update",
+        current: datetime | None = None,
     ) -> RunReport:
         """增量更新：上次 as_of + 1 → 最新交易日。
 
@@ -347,6 +356,7 @@ class DataPipeline:
                 message=f"{action}：计算增量范围",
                 force=True,
             )
+            market = "cn_stock"
             # 查找最近一次成功同步的结束日期（含 bootstrap 和 update）
             latest = self._manifest.get_latest_run(profile.name)
             if latest and latest.get("status") == "success" and latest.get("as_of_end"):
@@ -356,11 +366,23 @@ class DataPipeline:
                 # 无成功历史，退化为从 history_start 开始
                 start = self._parse_date(profile.history_start)
 
-            end = date.today()
+            end = self._resolve_effective_sync_end(
+                market=market,
+                start=start,
+                end=date.today(),
+                current=current,
+            )
 
             if start > end:
-                logger.info("无需更新：数据已是最新")
-                self._manifest.update_status(run_id, "success", total_rows=0)
+                logger.info("无需更新：最新可见数据已同步（visible_end=%s）", end.isoformat())
+                self._manifest.update_status(
+                    run_id,
+                    "success",
+                    total_rows=0,
+                    as_of_start=end.isoformat(),
+                    as_of_end=end.isoformat(),
+                    quality_status="skipped",
+                )
                 self._emit_progress(
                     current_stage="finished",
                     total_stages=5,
@@ -370,7 +392,7 @@ class DataPipeline:
                     current_chunk=0,
                     total_chunks=0,
                     written_rows=0,
-                    message="无需更新：数据已是最新",
+                    message=f"无需更新：最新可见数据已同步（visible_end={end.isoformat()}）",
                     force=True,
                 )
                 return RunReport(
@@ -1545,6 +1567,58 @@ class DataPipeline:
             return bool(self._storage.list_partitions(dataset))
         existing = self._storage.read(dataset)
         return not existing.empty
+
+    def _resolve_effective_sync_end(
+        self,
+        *,
+        market: str,
+        start: date,
+        end: date,
+        current: datetime | None = None,
+    ) -> date:
+        """按“最新可见数据”口径裁切本轮同步结束日。
+
+        盘前/盘中运行时，A 股 `daily` / `daily_basic` 这一类日级数据通常还没有
+        当天完整分区。若仍把 `end=today` 写进增量水位，会导致：
+        1. 质量门禁把“今天尚未发布”的日线误判成缺失；
+        2. 成功 run 把 as_of_end 提前推进到 today，后续再也不会补抓今天收盘后的日线。
+
+        因此当前先采用最小可见性口径：
+        - 仅对 `cn_stock` 生效；
+        - 若今天是交易日且当前时间早于 `_CN_STOCK_DAILY_VISIBLE_AFTER`，
+          则把本轮 `end` 回退到最近一个已完成交易日。
+        """
+
+        current_dt = current or datetime.now()
+        candidate_end = min(end, current_dt.date())
+        if market != "cn_stock":
+            return candidate_end
+        if candidate_end != current_dt.date():
+            return candidate_end
+        if current_dt.time() >= _CN_STOCK_DAILY_VISIBLE_AFTER:
+            return candidate_end
+
+        calendar_start = min(start, candidate_end) - timedelta(days=31)
+        if self._calendar is not None:
+            trading_days = self._calendar.load_or_fetch(market, calendar_start, candidate_end)
+        else:
+            trading_days = self._provider.fetch_calendar(market, calendar_start, candidate_end)
+        if candidate_end not in trading_days:
+            return candidate_end
+
+        completed_days = [day for day in trading_days if day < candidate_end]
+        if not completed_days:
+            return candidate_end
+
+        visible_end = completed_days[-1]
+        logger.info(
+            "盘中/盘前数据更新回退到最近已完成交易日: market=%s, requested_end=%s, visible_end=%s, cutoff=%s",
+            market,
+            candidate_end.isoformat(),
+            visible_end.isoformat(),
+            _CN_STOCK_DAILY_VISIBLE_AFTER.strftime("%H:%M"),
+        )
+        return visible_end
 
     def _existing_partition_values(self, dataset: str, partition_key: str) -> set[str]:
         values: set[str] = set()

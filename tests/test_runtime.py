@@ -20,6 +20,7 @@ class TestWorkspace:
         ws = Workspace(tmp_path / "ws")
         ws.initialize()
         assert ws.state_dir.is_dir()
+        assert ws.logs_dir.is_dir()
         assert ws.data_dir.is_dir()
         assert ws.research_dir.is_dir()
         assert ws.strategy_dir.is_dir()

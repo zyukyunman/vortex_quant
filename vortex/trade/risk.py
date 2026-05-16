@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from vortex.trade.broker import BrokerHealth, CashSnapshot, OrderIntent, Quote
+from vortex.trade.market_rules import is_valid_order_shares
 from vortex.trade.models import Lineage, OrderPlan, RiskCheckResult, RiskRuleResult
 
 
@@ -69,13 +70,27 @@ def run_pre_trade_risk_check(
             "limit-down sell blocked",
             order.symbol,
         )
-        _append(results, "lot_size", order.shares > 0 and order.shares % 100 == 0, "critical", "not board lot", order.symbol)
+        _append(
+            results,
+            "lot_size",
+            is_valid_order_shares(order.symbol, order.side, order.shares),
+            "critical",
+            "not board lot",
+            order.symbol,
+        )
         _append(results, "limit_price", _limit_price_ok(order), "critical", "invalid limit price", order.symbol)
         if config.require_st_data:
             if st_flags is None or order.symbol not in st_flags:
                 _append(results, "st_data_available", False, "critical", "missing ST flag", order.symbol)
             else:
-                _append(results, "not_st", not st_flags[order.symbol], "critical", "ST symbol blocked", order.symbol)
+                _append(
+                    results,
+                    "not_st_buy",
+                    not (order.side == "buy" and st_flags[order.symbol]),
+                    "critical",
+                    "ST buy blocked",
+                    order.symbol,
+                )
 
     _append(
         results,

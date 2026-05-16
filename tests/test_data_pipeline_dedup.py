@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
@@ -91,6 +91,134 @@ class GenericDatasetProvider:
 
 
 class TestGenericDatasetPipeline:
+    def test_update_uses_latest_completed_trade_day_before_daily_cutoff(self, tmp_path):
+        class VisibleEndProvider(GenericDatasetProvider):
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "bars": {
+                        "api": "daily",
+                        "description": "A 股日线",
+                        "phase": "1A",
+                        "fetch_mode": "trade_day_all",
+                        "partition_by": "date",
+                    },
+                }
+
+            def fetch_calendar(self, market: str, start: date, end: date) -> list[date]:
+                all_days = [date(2026, 5, 6), date(2026, 5, 7)]
+                return [day for day in all_days if start <= day <= end]
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+            ) -> pd.DataFrame:
+                if dataset == "bars":
+                    return pd.DataFrame(
+                        columns=["symbol", "date", "open", "high", "low", "close", "vol", "amount"]
+                    )
+                return super().fetch_dataset(
+                    dataset,
+                    market,
+                    start,
+                    end,
+                    symbols=symbols,
+                    trading_days=trading_days,
+                )
+
+        provider = VisibleEndProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        manifest.create_run("seed_run", "default", "update")
+        manifest.update_status(
+            "seed_run",
+            "success",
+            total_rows=1,
+            as_of_start="2026-05-06",
+            as_of_end="2026-05-06",
+            quality_status="passed",
+        )
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["bars"],
+            history_start="20260506",
+        )
+
+        report = pipeline.update(
+            profile,
+            current=datetime(2026, 5, 7, 8, 10),
+        )
+        latest = manifest.get_run(report.run_id)
+
+        assert report.status == "success"
+        assert latest is not None
+        assert latest["as_of_end"] == "2026-05-06"
+        assert latest["quality_status"] == "skipped"
+
+    def test_trade_day_all_bars_do_not_reuse_source_empty_coverage(self, tmp_path):
+        provider = GenericDatasetProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        storage.upsert(
+            "bars",
+            pd.DataFrame(
+                {
+                    "symbol": ["600519.SH"],
+                    "date": ["20260401"],
+                    "close": [1500.0],
+                }
+            ),
+            {"date": "20260401"},
+        )
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        manifest.create_run("empty_run", "default", "update")
+        manifest.record_partition_coverage(
+            run_id="empty_run",
+            dataset="bars",
+            partition_key="date",
+            partition_value="20260402",
+            as_of_end="2026-04-02",
+            status="source_empty",
+        )
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        meta = {
+            "api": "daily",
+            "description": "A 股日线",
+            "phase": "1A",
+            "fetch_mode": "trade_day_all",
+            "partition_by": "date",
+            "reuse_source_empty_coverage": False,
+        }
+
+        plan = pipeline._plan_dataset_fetch(
+            "bars",
+            meta,
+            start=date(2026, 4, 1),
+            end=date(2026, 4, 2),
+            trading_days=[date(2026, 4, 1), date(2026, 4, 2)],
+            action="bootstrap",
+        )
+
+        assert plan.missing_partition_values == ("20260402",)
+
     def test_bootstrap_writes_non_core_dataset_via_fetch_dataset(self, tmp_path):
         provider = GenericDatasetProvider()
         storage = ParquetDuckDBBackend(tmp_path / "data")

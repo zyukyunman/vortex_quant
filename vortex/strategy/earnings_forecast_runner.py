@@ -83,6 +83,7 @@ class EarningsForecastInputFrames:
     suspend_events: pd.DataFrame | None
     stock_st: pd.DataFrame | None
     st_risk_events: pd.DataFrame | None
+    market_cap: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,8 @@ class EarningsForecastVersionPreset:
     transaction_cost_bps: float = 20.0
     position_mode: Literal["full_equal_selected", "capped_with_cash"] = "capped_with_cash"
     run_lot_execution: bool = True
+    market_cap_top_pct: float | None = None
+    market_cap_field: Literal["total_mv", "circ_mv"] = "total_mv"
 
 
 @dataclass(frozen=True)
@@ -169,6 +172,7 @@ EARNINGS_FORECAST_VERSION_PRESETS: dict[str, EarningsForecastVersionPreset] = {
         candidate_pool_size=60,
         liquidity_rerank_weight=0.20,
         portfolio_notional=1_000_000.0,
+        market_cap_top_pct=0.50,
     ),
     "stable_100w": EarningsForecastVersionPreset(
         name="stable_100w",
@@ -177,6 +181,7 @@ EARNINGS_FORECAST_VERSION_PRESETS: dict[str, EarningsForecastVersionPreset] = {
         candidate_pool_size=None,
         liquidity_rerank_weight=0.0,
         portfolio_notional=1_000_000.0,
+        market_cap_top_pct=0.50,
     ),
     "liquidity_top80": EarningsForecastVersionPreset(
         name="liquidity_top80",
@@ -185,6 +190,7 @@ EARNINGS_FORECAST_VERSION_PRESETS: dict[str, EarningsForecastVersionPreset] = {
         candidate_pool_size=160,
         liquidity_rerank_weight=0.20,
         portfolio_notional=100_000_000.0,
+        market_cap_top_pct=0.50,
     ),
     "liquidity_top90_1000w": EarningsForecastVersionPreset(
         name="liquidity_top90_1000w",
@@ -193,6 +199,7 @@ EARNINGS_FORECAST_VERSION_PRESETS: dict[str, EarningsForecastVersionPreset] = {
         candidate_pool_size=180,
         liquidity_rerank_weight=0.20,
         portfolio_notional=10_000_000.0,
+        market_cap_top_pct=0.50,
     ),
     "baseline_top110_large": EarningsForecastVersionPreset(
         name="baseline_top110_large",
@@ -201,6 +208,7 @@ EARNINGS_FORECAST_VERSION_PRESETS: dict[str, EarningsForecastVersionPreset] = {
         candidate_pool_size=None,
         liquidity_rerank_weight=0.0,
         portfolio_notional=100_000_000.0,
+        market_cap_top_pct=0.50,
     ),
 }
 
@@ -378,6 +386,7 @@ def run_earnings_forecast_shadow_plan(
     artifact_dir: str | Path | None = None,
     label: str = DEFAULT_SHADOW_LABEL,
     config: EarningsForecastDriftConfig | None = None,
+    preset_name: str | None = None,
     require_precise_data: bool = True,
 ) -> EarningsForecastShadowArtifacts:
     """生成某个交易日的影子跟踪目标持仓与交易变化。
@@ -393,7 +402,6 @@ def run_earnings_forecast_shadow_plan(
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    strategy_config = config or EarningsForecastDriftConfig()
     inputs = load_earnings_forecast_inputs(
         workspace,
         start=start,
@@ -407,30 +415,24 @@ def run_earnings_forecast_shadow_plan(
         no_future_leakage=True,
         out_of_sample_checked=True,
     )
-    result = run_earnings_forecast_drift(
-        inputs.forecast,
-        inputs.open_prices,
-        inputs.close_prices,
-        inputs.amount,
-        inputs.index_close,
-        strategy_config,
+    result, preset = _run_shadow_backtest_result(
+        inputs,
         quality=quality,
-        segments=(),
-        stk_limit=inputs.stk_limit,
-        limit_open_prices=inputs.raw_open_prices,
-        suspend_events=inputs.suspend_events,
-        stock_st=inputs.stock_st,
-        st_risk_events=inputs.st_risk_events,
+        config=config,
+        preset_name=preset_name,
     )
     target = _latest_target_frame(result.weights)
-    target_path = artifact_root / f"{label}-{target['date'].iloc[0]}目标持仓.csv"
+    artifact_label = f"{label}-{preset.name}" if preset is not None else label
+    target_path = artifact_root / f"{artifact_label}-{target['date'].iloc[0]}目标持仓.csv"
     target.to_csv(target_path, index=False)
     summary = {
         "label": label,
         "as_of": str(target["date"].iloc[0]),
         "requested_as_of": as_of,
-        "json_path": str(output_root / f"{label}-{target['date'].iloc[0]}.json"),
-        "html_path": str(output_root / f"{label}-{target['date'].iloc[0]}.html"),
+        "preset": dataclasses.asdict(preset) if preset is not None else None,
+        "strategy_mode": "preset" if preset is not None else "config",
+        "json_path": str(output_root / f"{artifact_label}-{target['date'].iloc[0]}.json"),
+        "html_path": str(output_root / f"{artifact_label}-{target['date'].iloc[0]}.html"),
         "target_path": str(target_path),
         "holding_count": int((target["weight"] > 0).sum()),
         "trade_count": int((target["trade_delta"].abs() > 1e-12).sum()),
@@ -439,8 +441,8 @@ def run_earnings_forecast_shadow_plan(
         "metrics_to_date": result.backtest.metrics.__dict__,
         "candidate_review": result.candidate_review.to_dict(),
     }
-    json_path = output_root / f"{label}-{target['date'].iloc[0]}.json"
-    html_path = output_root / f"{label}-{target['date'].iloc[0]}.html"
+    json_path = output_root / f"{artifact_label}-{target['date'].iloc[0]}.json"
+    html_path = output_root / f"{artifact_label}-{target['date'].iloc[0]}.html"
     json_path.write_text(
         json.dumps(_jsonable(summary), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -829,6 +831,15 @@ def _build_version_signal_context(
     )
     if st_mask is not None:
         signal = signal.where(~st_mask.reindex_like(signal).fillna(False))
+    if preset.market_cap_top_pct is not None:
+        market_cap_mask = _build_market_cap_top_pct_mask(
+            inputs.market_cap,
+            target_index=signal.index,
+            target_columns=signal.columns,
+            top_pct=preset.market_cap_top_pct,
+            value_column=preset.market_cap_field,
+        )
+        signal = signal.where(market_cap_mask)
     if preset.candidate_pool_size is not None and preset.liquidity_rerank_weight > 0:
         amount20 = (
             inputs.amount.rolling(config.liquidity_window, min_periods=5)
@@ -866,6 +877,32 @@ def _build_version_signal_context(
     return signal, market_gate, limit_up_mask, limit_down_mask
 
 
+def _build_market_cap_top_pct_mask(
+    market_cap: pd.DataFrame | None,
+    *,
+    target_index: pd.Index,
+    target_columns: pd.Index,
+    top_pct: float,
+    value_column: str = "total_mv",
+) -> pd.DataFrame:
+    """用上一交易日可见市值筛选横截面前 N% 股票，避免用当日收盘市值。"""
+
+    if market_cap is None or market_cap.empty:
+        raise ValueError("策略要求 A 股市值前百分位过滤，但缺少 valuation 市值数据")
+    if not 0 < float(top_pct) <= 1:
+        raise ValueError("market_cap_top_pct 必须在 (0, 1] 范围内")
+    if value_column not in market_cap.columns:
+        raise ValueError(f"valuation 缺少市值字段: {value_column}")
+    cap = _pivot_market_frame(market_cap, value_column)
+    available_cap = (
+        cap.reindex(index=target_index, columns=target_columns)
+        .ffill()
+        .shift(1)
+    )
+    ranks = available_cap.rank(axis=1, pct=True, ascending=False)
+    return ranks.le(float(top_pct)).fillna(False)
+
+
 def run_earnings_forecast_live_handoff(
     root: str | Path,
     *,
@@ -878,6 +915,7 @@ def run_earnings_forecast_live_handoff(
     artifact_dir: str | Path | None = None,
     label: str = DEFAULT_LIVE_HANDOFF_LABEL,
     config: EarningsForecastDriftConfig | None = None,
+    preset_name: str | None = None,
     require_precise_data: bool = True,
     bridge_transport: Transport | None = None,
 ) -> EarningsForecastLiveHandoffArtifacts:
@@ -902,6 +940,7 @@ def run_earnings_forecast_live_handoff(
         artifact_dir=artifact_root,
         label=f"{label}-shadow",
         config=config,
+        preset_name=preset_name,
         require_precise_data=require_precise_data,
     )
     target = pd.read_csv(shadow.target_path)
@@ -960,12 +999,20 @@ def run_earnings_forecast_live_handoff(
 
     qmt_ready = len(blocking_reasons) == 0
     handoff_date = str(shadow.summary["as_of"])
-    json_path = output_root / f"{label}-{handoff_date}.json"
-    html_path = output_root / f"{label}-{handoff_date}.html"
+    shadow_preset = shadow.summary.get("preset")
+    artifact_label = (
+        f"{label}-{shadow_preset['name']}"
+        if isinstance(shadow_preset, dict) and shadow_preset.get("name")
+        else label
+    )
+    json_path = output_root / f"{artifact_label}-{handoff_date}.json"
+    html_path = output_root / f"{artifact_label}-{handoff_date}.html"
     summary = {
         "label": label,
         "as_of": handoff_date,
         "requested_as_of": as_of,
+        "preset": shadow_preset,
+        "strategy_mode": shadow.summary.get("strategy_mode", "config"),
         "qmt_bridge_url": qmt_bridge_url,
         "qmt_account_id": qmt_account_id or "",
         "qmt_ready": qmt_ready,
@@ -990,6 +1037,80 @@ def run_earnings_forecast_live_handoff(
         html_path=html_path,
         target_path=shadow.target_path,
         summary=summary,
+    )
+
+
+def _run_shadow_backtest_result(
+    inputs: EarningsForecastInputFrames,
+    *,
+    quality: ExperimentQuality,
+    config: EarningsForecastDriftConfig | None,
+    preset_name: str | None,
+) -> tuple[EarningsForecastDriftResult, EarningsForecastVersionPreset | None]:
+    if preset_name is not None and config is not None:
+        raise ValueError("preset_name 与 config 不能同时传入；请二选一")
+    if preset_name is None:
+        strategy_config = config or EarningsForecastDriftConfig()
+        return (
+            run_earnings_forecast_drift(
+                inputs.forecast,
+                inputs.open_prices,
+                inputs.close_prices,
+                inputs.amount,
+                inputs.index_close,
+                strategy_config,
+                quality=quality,
+                segments=(),
+                stk_limit=inputs.stk_limit,
+                limit_open_prices=inputs.raw_open_prices,
+                suspend_events=inputs.suspend_events,
+                stock_st=inputs.stock_st,
+                st_risk_events=inputs.st_risk_events,
+            ),
+            None,
+        )
+
+    preset = get_earnings_forecast_version_preset(preset_name)
+    signal, market_gate, blocked_buy, blocked_sell = _build_version_signal_context(inputs, preset=preset)
+    returns = open_to_close_returns(inputs.open_prices, inputs.close_prices)
+    backtest = run_event_signal_backtest(
+        signal,
+        returns,
+        EventBacktestConfig(
+            top_n=preset.top_n,
+            max_weight=preset.max_weight,
+            target_exposure=1.0,
+            transaction_cost_bps=preset.transaction_cost_bps,
+            position_mode=preset.position_mode,
+        ),
+        market_gate=market_gate,
+        blocked_buy_mask=blocked_buy,
+        blocked_sell_mask=blocked_sell,
+        quality=quality,
+        goal_criteria=None,
+    )
+    annual = period_returns(backtest.returns, "Y")
+    monthly = period_returns(backtest.returns, "M")
+    positive_year_rate = float((annual > 0).mean()) if not annual.empty else None
+    candidate_review = review_strategy_candidate(
+        StrategyCandidateInput(
+            annual_return=backtest.metrics.annual_return,
+            max_drawdown=backtest.metrics.max_drawdown,
+            sharpe=backtest.metrics.sharpe,
+            calmar=backtest.metrics.calmar,
+            positive_year_rate=positive_year_rate,
+            quality=quality,
+        )
+    )
+    return (
+        EarningsForecastDriftResult(
+            backtest=backtest,
+            candidate_review=candidate_review,
+            annual_returns=annual,
+            monthly_returns=monthly,
+            segments=(),
+        ),
+        preset,
     )
 
 
@@ -1444,6 +1565,13 @@ def load_earnings_forecast_inputs(
         end=end,
         columns=["date", "symbol", "type", "type_name"],
     )
+    market_cap = _optional_dated_dataset(
+        storage,
+        "valuation",
+        start=start,
+        end=end,
+        columns=["date", "symbol", "total_mv", "circ_mv"],
+    )
     stk_limit = _optional_dated_dataset(
         storage,
         "stk_limit",
@@ -1511,6 +1639,7 @@ def load_earnings_forecast_inputs(
         suspend_events=suspend_events,
         stock_st=stock_st,
         st_risk_events=None if st_risk_events.empty else st_risk_events,
+        market_cap=market_cap,
     )
 
 

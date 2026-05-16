@@ -1,19 +1,32 @@
-"""Paper rebalance orchestration and execution report writing."""
+"""Paper / QMT rebalance orchestration and execution report writing."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from vortex.trade.broker import PaperBrokerAdapter, Quote
+from vortex.trade.broker import OrderRecord, PaperBrokerAdapter, Quote
 from vortex.trade.models import ExecutionReport, TargetPortfolio
 from vortex.trade.order_plan import OrderPlanConfig, generate_order_plan
+from vortex.trade.qmt_bridge import QmtBridgeAdapter, QmtBridgeConfig
 from vortex.trade.risk import PreTradeRiskConfig, run_pre_trade_risk_check
 from vortex.trade.serialization import write_json
 
 
 @dataclass(frozen=True)
 class PaperRebalanceArtifacts:
+    exec_id: str
+    root_dir: Path
+    order_intent_path: Path
+    order_plan_path: Path
+    risk_result_path: Path
+    execution_report_path: Path
+    execution_report_md_path: Path
+    report: ExecutionReport
+
+
+@dataclass(frozen=True)
+class QmtRebalanceArtifacts:
     exec_id: str
     root_dir: Path
     order_intent_path: Path
@@ -98,6 +111,104 @@ def run_paper_rebalance(
     )
 
 
+def run_qmt_rebalance(
+    portfolio: TargetPortfolio,
+    *,
+    bridge_config: QmtBridgeConfig,
+    output_root: Path,
+    st_flags: dict[str, bool] | None,
+    order_config: OrderPlanConfig | None = None,
+    risk_config: PreTradeRiskConfig | None = None,
+) -> QmtRebalanceArtifacts:
+    """Run a QMT bridge rebalance and persist all audit artifacts.
+
+    第一版保持最小职责：
+    1. 从 bridge 读取 cash / positions / quotes；
+    2. 生成 sell-first order plan；
+    3. 做 fail-closed pre-trade risk；
+    4. 风控通过后逐笔 submit_order；
+    5. 立即写 execution report，盘后再由 reconcile 补最终核对。
+    """
+
+    adapter = QmtBridgeAdapter(bridge_config)
+    health = adapter.health()
+    if not health.ok:
+        raise ValueError(f"bridge health failed: {health.message}")
+
+    cash = adapter.get_cash()
+    positions = adapter.get_positions()
+    symbols = sorted(
+        {
+            *(item.symbol for item in portfolio.positions),
+            *(item.symbol for item in positions),
+        }
+    )
+    quotes = adapter.get_quotes(symbols)
+    plan = generate_order_plan(
+        portfolio,
+        cash=cash,
+        positions=positions,
+        quotes=quotes,
+        config=order_config,
+    )
+    risk = run_pre_trade_risk_check(
+        plan,
+        health=health,
+        cash=cash,
+        quotes=quotes,
+        st_flags=st_flags,
+        config=risk_config,
+    )
+    exec_dir = output_root / "trade" / "executions" / plan.exec_id
+    state_dir = output_root / "state" / "trade" / plan.exec_id
+    order_intent_path = state_dir / "order_intent.json"
+    order_plan_path = exec_dir / "order_plan.json"
+    risk_result_path = exec_dir / "pre_trade_result.json"
+    report_path = exec_dir / "execution_report.json"
+    report_md_path = exec_dir / "execution_report.md"
+
+    write_json(order_plan_path, plan)
+    write_json(risk_result_path, risk)
+    write_json(order_intent_path, plan.orders)
+
+    submitted_orders: list[OrderRecord] = []
+    if risk.passed:
+        for order in plan.orders:
+            submitted_orders.append(adapter.submit_order(order))
+
+    latest_cash = adapter.get_cash()
+    latest_positions = adapter.get_positions()
+    latest_orders = _merge_order_records(adapter.get_orders(), submitted_orders)
+    latest_fills = adapter.get_fills()
+    report = ExecutionReport(
+        exec_id=plan.exec_id,
+        mode="qmt_sim" if bridge_config.allow_trading else "qmt_dry_run",
+        portfolio_id=portfolio.portfolio_id,
+        trade_date=portfolio.trade_date,
+        order_plan=plan,
+        risk_result=risk,
+        cash=latest_cash,
+        positions=latest_positions,
+        orders=latest_orders,
+        fills=latest_fills,
+        slippage_summary=_slippage_summary(latest_fills, plan.orders),
+        unfilled_summary=_unfilled_summary(latest_orders),
+        lineage=plan.lineage,
+    )
+    write_json(report_path, report)
+    _write_markdown_report(report_md_path, report)
+    return QmtRebalanceArtifacts(
+        exec_id=plan.exec_id,
+        root_dir=exec_dir,
+        order_intent_path=order_intent_path,
+        order_plan_path=order_plan_path,
+        risk_result_path=risk_result_path,
+        execution_report_path=report_path,
+        execution_report_md_path=report_md_path,
+        report=report,
+    )
+
+
 def _slippage_summary(fills, intents) -> dict[str, float]:
     limit_by_symbol_side = {(item.symbol, item.side): item.limit_price for item in intents}
     slips: list[float] = []
@@ -120,10 +231,20 @@ def _unfilled_summary(orders) -> dict[str, int]:
     }
 
 
+def _merge_order_records(orders: list[OrderRecord], submitted: list[OrderRecord]) -> list[OrderRecord]:
+    merged: dict[str, OrderRecord] = {
+        order.order_id: order for order in orders if order.order_id
+    }
+    for order in submitted:
+        if order.order_id and order.order_id not in merged:
+            merged[order.order_id] = order
+    return list(merged.values()) if merged else list(submitted)
+
+
 def _write_markdown_report(path: Path, report: ExecutionReport) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        f"# Paper Rebalance Execution Report: {report.exec_id}",
+        f"# {report.mode} Rebalance Execution Report: {report.exec_id}",
         "",
         "## Summary",
         "",

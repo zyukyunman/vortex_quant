@@ -209,3 +209,28 @@ class TestSnapshot:
         time.sleep(0.01)
         s2 = storage.snapshot("p", date(2026, 4, 1))
         assert s1 != s2  # 不同时间生成的快照 ID 不同
+
+    def test_snapshot_publishes_symlinks_and_replaces_legacy_files(self, storage):
+        df = pd.DataFrame({
+            "symbol": ["600519.SH"],
+            "date": ["20260401"],
+            "close": [1800.0],
+        })
+        storage.upsert("bars", df, {"date": "20260401"})
+
+        published_file = (
+            storage._root / "authoritative" / "p" / "bars" / "date=20260401" / "data.parquet"
+        )
+        published_file.parent.mkdir(parents=True, exist_ok=True)
+        published_file.write_text("legacy copied parquet placeholder")
+
+        storage.snapshot("p", date(2026, 4, 1))
+
+        source_file = storage._root / "bars" / "date=20260401" / "data.parquet"
+        assert published_file.is_symlink()
+        assert published_file.resolve() == source_file.resolve()
+
+        published_storage = ParquetDuckDBBackend(storage._root / "authoritative" / "p")
+        result = published_storage.read("bars")
+        assert len(result) == 1
+        assert result.iloc[0]["symbol"] == "600519.SH"

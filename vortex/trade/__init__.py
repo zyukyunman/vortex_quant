@@ -11,7 +11,12 @@ from vortex.trade.broker import (
     Position,
     Quote,
 )
-from vortex.trade.execution import PaperRebalanceArtifacts, run_paper_rebalance
+from vortex.trade.execution import (
+    PaperRebalanceArtifacts,
+    QmtRebalanceArtifacts,
+    run_paper_rebalance,
+    run_qmt_rebalance,
+)
 from vortex.trade.models import (
     ExecutionReport,
     Lineage,
@@ -44,6 +49,7 @@ __all__ = [
     "Position",
     "PreTradeRiskConfig",
     "Quote",
+    "QmtRebalanceArtifacts",
     "QmtBridgeAdapter",
     "QmtBridgeConfig",
     "is_known_connection_status_bug",
@@ -58,6 +64,7 @@ __all__ = [
     "reconcile_execution",
     "reconcile_execution_report",
     "run_paper_rebalance",
+    "run_qmt_rebalance",
     "run_pre_trade_risk_check",
     "write_reconcile_report",
 ]

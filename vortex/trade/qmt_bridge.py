@@ -83,25 +83,35 @@ class QmtBridgeAdapter:
     def get_positions(self) -> list[Position]:
         data = self._get("positions", params=self._account_params())
         rows = _rows(data, "positions")
-        return [
-            Position(
-                symbol=str(_first(row, "symbol", "stock_code", "code")),
-                shares=int(_first(row, "shares", "volume", "total_volume", "m_nVolume")),
-                available_shares=int(
-                    _first(
-                        row,
-                        "available_shares",
-                        "available_volume",
-                        "enable_amount",
-                        "can_use_volume",
-                        "m_nCanUseVolume",
-                    )
-                ),
-                cost_price=float(_first(row, "cost_price", "avg_price", "open_price", "m_dOpenPrice")),
-                last_price=float(_first_optional(row, "last_price", "price", "market_price", "m_dLastPrice", default=0.0)),
+        positions: list[Position] = []
+        for row in rows:
+            shares = int(_first(row, "shares", "volume", "total_volume", "m_nVolume"))
+            available_shares = int(
+                _first(
+                    row,
+                    "available_shares",
+                    "available_volume",
+                    "enable_amount",
+                    "can_use_volume",
+                    "m_nCanUseVolume",
+                )
             )
-            for row in rows
-        ]
+            # 柜台有时会保留 0 股位的历史壳记录；执行差分与状态对账时应忽略这类空仓，
+            # 否则会把“已卖完”的旧股票误当成当前持仓，持续污染目标差分和执行报告。
+            if shares <= 0 and available_shares <= 0:
+                continue
+            positions.append(
+                Position(
+                    symbol=str(_first(row, "symbol", "stock_code", "code")),
+                    shares=shares,
+                    available_shares=available_shares,
+                    cost_price=float(_first(row, "cost_price", "avg_price", "open_price", "m_dOpenPrice")),
+                    last_price=float(
+                        _first_optional(row, "last_price", "price", "market_price", "m_dLastPrice", default=0.0)
+                    ),
+                )
+            )
+        return positions
 
     def get_orders(self) -> list[OrderRecord]:
         data = self._get("orders", params=self._account_params())
@@ -131,6 +141,8 @@ class QmtBridgeAdapter:
                 symbol=str(_first(row, "symbol", "stock_code", "code")),
                 open_price=float(_first_optional(row, "open_price", "open", "price", "lastClose", default=0.0)),
                 last_price=float(_first_optional(row, "last_price", "lastPrice", "price", default=0.0)),
+                ask_price_1=_price_level(row.get("askPrice"), 0),
+                bid_price_1=_price_level(row.get("bidPrice"), 0),
                 volume=int(row["volume"]) if "volume" in row and row["volume"] is not None else None,
                 amount=float(row["amount"]) if "amount" in row and row["amount"] is not None else None,
                 is_suspended=bool(row.get("is_suspended", False)),
@@ -308,12 +320,20 @@ def _quote_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
     raise ValueError("unexpected quotes response shape")
 
 
+def _price_level(value: Any, index: int) -> float | None:
+    if isinstance(value, list) and len(value) > index and value[index] is not None:
+        level = float(value[index])
+        if level > 0:
+            return round(level, 4)
+    return None
+
+
 def _order_record_from_bridge(row: dict[str, Any]) -> OrderRecord:
     shares = int(_first(row, "shares", "volume", "order_volume", "m_nOrderVolume"))
     filled = int(_first_optional(row, "filled_shares", "filled_volume", "traded_volume", "m_nTradedVolume", default=0))
     intent = OrderIntent(
         symbol=str(_first(row, "symbol", "stock_code", "code")),
-        side=_normalize_side(_first_optional(row, "side", "direction", "order_type", "offset_flag", default="buy")),
+        side=_normalize_side(_first_optional(row, "side", "order_type", "offset_flag", "direction", default="buy")),
         shares=shares,
         price_type=str(_first_optional(row, "price_type", default="limit")),
         limit_price=float(_first_optional(row, "limit_price", "price", "price_value", default=0.0))
@@ -345,7 +365,7 @@ def _fill_record_from_bridge(row: dict[str, Any]) -> FillRecord:
         fill_id=str(_first(row, "fill_id", "trade_id", "traded_id", "id")),
         order_id=str(_first_optional(row, "order_id", "entrust_no", default="")),
         symbol=str(_first(row, "symbol", "stock_code", "code")),
-        side=_normalize_side(_first_optional(row, "side", "direction", "offset_flag", default="buy")),
+        side=_normalize_side(_first_optional(row, "side", "order_type", "offset_flag", "direction", default="buy")),
         shares=shares,
         price=price,
         gross_value=gross,
@@ -376,7 +396,22 @@ def _append_query(endpoint: str, params: dict[str, Any]) -> str:
 
 
 def _normalize_status(value: Any) -> str:
+    """归一化桥接委托状态。
+
+    当前联调已确认的 QMT / qmt-bridge 数字状态码口径：
+    - 54 -> cancelled
+    - 56 -> filled
+    - 57 -> rejected
+
+    其他未知状态保持原文返回，避免在 fail-closed 场景里误归类。
+    """
     text = str(value).strip().lower()
+    if text in {"54"}:
+        return "cancelled"
+    if text in {"56"}:
+        return "filled"
+    if text in {"57"}:
+        return "rejected"
     if text in {"submitted", "open", "pending", "已报"}:
         return "open"
     if "part" in text or "部分" in text:
