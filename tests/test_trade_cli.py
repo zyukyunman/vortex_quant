@@ -70,6 +70,75 @@ def test_trade_status_summary_reports_qmt_bridge_snapshot(monkeypatch, tmp_path:
     assert summary["qmt_position_count"] == 0
 
 
+def test_cmd_trade_status_loads_workspace_qmt_env(monkeypatch, tmp_path: Path, capsys) -> None:
+    for key in (
+        "QMT_BRIDGE_URL",
+        "QMT_BRIDGE_BASE_URL",
+        "QMT_BRIDGE_TOKEN",
+        "QMT_BRIDGE_API_KEY",
+        "QMT_ACCOUNT_ID",
+        "QMT_BRIDGE_TRADING_ACCOUNT_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "QMT_BRIDGE_URL=http://127.0.0.1:8000",
+                "QMT_BRIDGE_API_KEY=workspace_secret",
+                "QMT_ACCOUNT_ID=99034443",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class _FakeAdapter:
+        def __init__(self, config):
+            assert config.base_url == "http://127.0.0.1:8000"
+            assert config.token == "workspace_secret"
+            assert config.account_id == "99034443"
+
+        def health(self):
+            return trade_module.BrokerHealth(ok=True, mode="qmt_bridge", message="ok")
+
+        def connection_status(self):
+            return {"connected": True}
+
+        def get_cash(self):
+            return trade_module.CashSnapshot(
+                available_cash=1_000_000.0,
+                frozen_cash=0.0,
+                total_asset=1_200_000.0,
+                market_value=200_000.0,
+            )
+
+        def get_positions(self):
+            return []
+
+        def get_orders(self):
+            return []
+
+        def get_fills(self):
+            return []
+
+    monkeypatch.setattr(trade_module, "QmtBridgeAdapter", _FakeAdapter)
+
+    cli.cmd_trade(
+        argparse.Namespace(
+            trade_action="status",
+            root=str(tmp_path),
+            qmt_bridge_url=None,
+            qmt_bridge_token=None,
+            qmt_account_id=None,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["qmt_ready"] is True
+    assert payload["qmt_account_id"] == "99034443"
+
+
 def test_trade_quote_summary_reports_realtime_quotes(monkeypatch, tmp_path: Path) -> None:
     class _FakeAdapter:
         def __init__(self, config):

@@ -3640,6 +3640,33 @@ def _trade_status_summary(
     return payload
 
 
+def _load_workspace_env_for_cli(root: Path) -> None:
+    """Load workspace .env values without overriding explicitly exported env vars."""
+
+    env_file = root.expanduser() / ".env"
+    if not env_file.exists():
+        return
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _first_text(*values: object) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _trade_quote_summary(
     root: Path,
     *,
@@ -4093,25 +4120,52 @@ def cmd_research(args: argparse.Namespace) -> None:
 def cmd_trade(args: argparse.Namespace) -> None:
     """交易执行入口。"""
 
+    root = Path(args.root)
+    _load_workspace_env_for_cli(root)
+
     if args.trade_action == "status":
         payload = _trade_status_summary(
-            Path(args.root),
-            bridge_url=getattr(args, "qmt_bridge_url", None),
-            bridge_token=getattr(args, "qmt_bridge_token", None),
-            bridge_account_id=getattr(args, "qmt_account_id", None),
+            root,
+            bridge_url=_first_text(
+                getattr(args, "qmt_bridge_url", None),
+                os.getenv("QMT_BRIDGE_URL"),
+                os.getenv("QMT_BRIDGE_BASE_URL"),
+            ),
+            bridge_token=_first_text(
+                getattr(args, "qmt_bridge_token", None),
+                os.getenv("QMT_BRIDGE_TOKEN"),
+                os.getenv("QMT_BRIDGE_API_KEY"),
+            ),
+            bridge_account_id=_first_text(
+                getattr(args, "qmt_account_id", None),
+                os.getenv("QMT_ACCOUNT_ID"),
+                os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID"),
+            ),
         )
         title = "Trade 状态"
     elif args.trade_action == "quote":
         payload = _trade_quote_summary(
-            Path(args.root),
+            root,
             symbols=_parse_str_csv(args.symbols),
-            bridge_url=getattr(args, "qmt_bridge_url", None),
-            bridge_token=getattr(args, "qmt_bridge_token", None),
-            bridge_account_id=getattr(args, "qmt_account_id", None),
+            bridge_url=_first_text(
+                getattr(args, "qmt_bridge_url", None),
+                os.getenv("QMT_BRIDGE_URL"),
+                os.getenv("QMT_BRIDGE_BASE_URL"),
+            ),
+            bridge_token=_first_text(
+                getattr(args, "qmt_bridge_token", None),
+                os.getenv("QMT_BRIDGE_TOKEN"),
+                os.getenv("QMT_BRIDGE_API_KEY"),
+            ),
+            bridge_account_id=_first_text(
+                getattr(args, "qmt_account_id", None),
+                os.getenv("QMT_ACCOUNT_ID"),
+                os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID"),
+            ),
         )
         title = "Trade 实时行情"
     elif args.trade_action == "inspect":
-        payload = _trade_inspect_summary(Path(args.root), args.exec_id)
+        payload = _trade_inspect_summary(root, args.exec_id)
         title = "Trade 执行检查"
     elif args.trade_action == "reconcile":
         payload = _run_trade_reconcile(args)
