@@ -12,7 +12,7 @@ status: design_note
 
 ## 一句话结论
 
-Vortex 不应把 CogAlpha 的 21 个 agent 立即做成 21 个独立工具。更合理的做法是：**先把它们定义为研究员角色卡，用来约束候选因子的来源、字段、horizon、质量检查和归档方式；等某类 agent 反复稳定产出有效候选后，再产品化为独立模块或 skill。**
+Vortex 已把 CogAlpha 的 21 个 agent 从“角色卡”推进到 **21 个 baseline proxy recipe**：每个 agent 至少有一个可执行、可审计、可评测的本地代理因子。但这不等于已经完整复现论文中的智能 agent；当前实现是工程闭环和研究起点，真正的 LLM generation / mutation / crossover 仍在后续阶段。
 
 ## 为什么先做 agent catalog
 
@@ -25,6 +25,88 @@ Vortex 不应把 CogAlpha 的 21 个 agent 立即做成 21 个独立工具。更
 5. 它最容易犯什么未来函数或经济逻辑错误？
 
 这会让 Vortex 的 AI 研究员不是“随机生成公式”，而是像一个分工明确的因子研究团队。
+
+## Agent 的三层实现状态
+
+为了避免“agent 只有名字但不能工作”，Vortex 把 CogAlpha agent 分成三层：
+
+| 状态 | 含义 | 当前落点 |
+|---|---|---|
+| `catalog` | 只有研究视角、字段、horizon、风险说明 | `agent_catalog.py` |
+| `recipe` | 能生成 `AlphaCandidate` 和安全 `FormulaSpec.builder`；当前多为 baseline proxy | `recipes.py` |
+| `prompt/evolution` | 能接 LLM guidance、mutation、crossover | 后续 Phase 4 |
+
+当前已实现的最小可执行层是 `recipe`，不是 prompt 人格。一个 agent 只有满足以下条件，才从角色卡升级为可执行研究单元：
+
+1. 有明确 `template_id`。
+2. 有可审计 `hypothesis` 和 `expression`。
+3. 有 `required_fields` 和 `default_horizons`。
+4. 有安全 `builder(DailyFactorInputs) -> DataFrame`。
+5. builder 只调用 Vortex 内置安全算子或 PIT-safe pandas rolling/shift，不使用 `eval` / `exec` / 任意文件网络访问。
+
+## 当前可执行 recipe
+
+Phase 2.6 已补齐全部 21 个低依赖、可用日频 OHLCV 数据验证的 baseline proxy recipe。Phase 2.7 进一步对 review 中最弱的 5 个 proxy 做了语义硬化，让它们更接近论文描述，但仍不等同于完整 LLM agent 复现。
+
+| Agent | recipe | 作用 |
+|---|---|---|
+| `AgentMarketCycle` | `market_cycle_relative_trend_60d` | 市场趋势、宽度、波动 regime 门控后的个股趋势 |
+| `AgentVolatilityRegime` | `volatility_regime_compression_20d` | 短波动相对长波动压缩 |
+| `AgentTailRisk` | `tail_risk_downside_vol_20d` | 下行波动风险过滤 |
+| `AgentCrashPredictor` | `crash_fragility_high_range_low_liquidity_20d` | 波动扩张、下行 range、市场同步和流动性枯竭的脆弱性过滤 |
+| `AgentLiquidity` | `liquidity_range_impact` | 价格区间/成交额冲击，连接流动性与容量风险 |
+| `AgentOrderImbalance` | `order_imbalance_close_strength_5d` | 收盘位置、K 线实体和成交参与代理买压 |
+| `AgentPriceVolumeCoherence` | `price_volume_coherence_20d` | 价格变化与成交额变化的滚动一致性 |
+| `AgentVolumeStructure` | `volume_structure_surge_decay_20d` | 成交量相对基准的稳定性 |
+| `AgentDailyTrend` | `daily_trend_20d` | 20 日相对强弱趋势 |
+| `AgentReversal` | `short_reversal_5d` | 5 日短反转 |
+| `AgentRangeVol` | `range_vol_20d` | 20 日高低价区间波动 |
+| `AgentLagResponse` | `lag_response_volume_leads_price_20d` | 成交额领先、价格滞后响应 |
+| `AgentVolAsymmetry` | `vol_asymmetry_downside_upside_20d` | 下行/上行波动非对称 |
+| `AgentDrawdown` | `drawdown_recovery_position_60d` | 当前价格相对 60 日高点位置 |
+| `AgentFractal` | `fractal_multiscale_consistency_20_60d` | path efficiency、方差比例和多尺度 gap 的粗糙度代理 |
+| `AgentRegimeGating` | `regime_gated_trend_lowvol_60d` | 低波门控后的 60 日趋势 |
+| `AgentStability` | `stability_signal_smoothness_20d` | 20 日收益路径平滑度 |
+| `AgentComposite` | `composite_trend_reversal_liquidity` | 趋势、短反转、流动性等权融合 |
+| `AgentCreative` | `creative_soft_rank_range_liquidity` | trend/reversal/liquidity 父模板的确定性非线性 mutation proxy |
+| `AgentBarShape` | `bar_shape_close_location_5d` | 5 日 K 线收盘位置与实体强度 |
+| `AgentHerding` | `herding_amount_crowding_reversal_20d` | 截面方向共识、个股对齐和成交额拥挤的羊群代理 |
+
+`planned_recipes()` 现在返回空 tuple；如果未来新增 agent，必须先补安全 builder 和测试，不能只登记角色名。每个 recipe 都带 `semantic_status`、`semantic_notes` 和可选 `parent_templates`：
+
+| semantic_status | 含义 |
+|---|---|
+| `proxy` | 可执行代理公式，能研究，但不能宣称完整复现论文 agent |
+| `faithful_proxy` | 在当前 OHLCV 字段内对论文语义做过强化，但仍不是完整 LLM agent |
+| `mutation_proxy` | 更接近变换、组合、变异器的可执行代理，当前用于 `AgentCreative` |
+
+Phase 2.7 中 `AgentMarketCycle`、`AgentCrashPredictor`、`AgentFractal`、`AgentHerding` 标为 `faithful_proxy`；`AgentCreative` 标为 `mutation_proxy`。
+
+## 与现有研究代码的接缝
+
+CogAlpha recipe 通过 `FormulaSpec` 接回现有 Research 主流程：
+
+```text
+CogAlphaAgentRecipe
+  -> AlphaCandidate
+  -> FormulaSpec
+  -> compute_formula(DailyFactorInputs)
+  -> run_quality_gate
+  -> rank_cogalpha_candidates
+  -> write_generation_report_json
+```
+
+同时，`adapters.py` 可以把现有 `registered_specs()` 包装为 CogAlpha candidates，让旧有 101 个公式也进入同一套 agent 归因、quality gate 和 fitness 审查。
+
+最小演示入口：
+
+```python
+from vortex.research.cogalpha import run_cogalpha_demo
+
+run_cogalpha_demo("workspace/cogalpha/latest")
+```
+
+它会真实执行 21 个 baseline proxy recipe，写出 `generation_report.json` 和 `generation_summary.json`。这个 synthetic demo 只证明工程闭环，不代表真实 A 股 alpha 结论，也不代表论文 21 agent 已完整复现。
 
 ## 七层结构总览
 

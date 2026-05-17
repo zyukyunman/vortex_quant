@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import os
 import secrets
 from datetime import date, datetime
 from pathlib import Path
@@ -37,7 +38,7 @@ class ParquetDuckDBBackend:
     目录布局：
       {root}/
         {dataset}/{partition_key}={value}/data.parquet
-        authoritative/{profile}/{dataset}/...
+        authoritative/{profile}/{dataset}/...  # 发布视图，data.parquet 为源数据符号链接
         catalog.duckdb
     """
 
@@ -135,7 +136,7 @@ class ParquetDuckDBBackend:
 
         sql = (
             f"SELECT {col_clause} "
-            f"FROM read_parquet('{parquet_glob}', hive_partitioning=true) "
+            f"FROM read_parquet('{parquet_glob}', hive_partitioning=true, union_by_name=true) "
             f"WHERE {where_clause} "
         )
 
@@ -200,7 +201,7 @@ class ParquetDuckDBBackend:
 
         sql = (
             "DESCRIBE SELECT * "
-            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true)"
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true, union_by_name=true)"
         )
         conn = duckdb.connect(database=":memory:", read_only=False)
         try:
@@ -226,7 +227,7 @@ class ParquetDuckDBBackend:
         where_clause, params = self._build_where_clause(filters)
         sql = (
             "SELECT COUNT(*) AS row_count "
-            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true) "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true, union_by_name=true) "
             f"WHERE {where_clause}"
         )
         conn = duckdb.connect(database=":memory:", read_only=False)
@@ -272,7 +273,7 @@ class ParquetDuckDBBackend:
         where_clause, params = self._build_where_clause(filters)
         sql = (
             f"SELECT {col_clause} "
-            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true) "
+            f"FROM read_parquet('{self.parquet_glob(dataset)}', hive_partitioning=true, union_by_name=true) "
             f"WHERE {where_clause}"
         )
 
@@ -300,7 +301,7 @@ class ParquetDuckDBBackend:
     def snapshot(self, profile: str, as_of: date) -> str:
         """发布快照到 authoritative 目录。
 
-        将当前数据复制到 authoritative/{profile}/ 下。
+        将当前数据以符号链接方式发布到 authoritative/{profile}/ 下。
         同 profile + as_of 可覆盖发布。
         返回 snapshot_id。
         """
@@ -316,8 +317,7 @@ class ParquetDuckDBBackend:
         for item in sorted(self._root.iterdir()):
             if item.is_dir() and item.name not in ("authoritative", "raw", "catalog.duckdb"):
                 dest = auth_dir / item.name
-                # 复制 Parquet 文件到 authoritative
-                self._copy_dataset(item, dest)
+                self._link_dataset(item, dest)
 
         logger.info(
             "快照已发布: snapshot_id=%s, profile=%s, as_of=%s",
@@ -330,15 +330,18 @@ class ParquetDuckDBBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _copy_dataset(src: Path, dest: Path) -> None:
-        """复制 dataset 目录中的所有 Parquet 文件。"""
-        import shutil
-
+    def _link_dataset(src: Path, dest: Path) -> None:
+        """用符号链接发布 dataset，避免 authoritative 再占一份完整数据空间。"""
         for parquet_file in src.rglob("data.parquet"):
             rel = parquet_file.relative_to(src)
             dest_file = dest / rel
             dest_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(parquet_file, dest_file)
+            if dest_file.exists() or dest_file.is_symlink():
+                dest_file.unlink()
+            link_target = Path(
+                os.path.relpath(parquet_file, start=dest_file.parent)
+            )
+            dest_file.symlink_to(link_target)
 
     def _dataset_files(self, dataset: str) -> list[Path]:
         dataset_dir = self.dataset_path(dataset)

@@ -20,6 +20,14 @@ obsidian_links:
 - 输出标准化的 `IC_1d / IC_5d / IC_20d`
 - 进一步用 5 日多空组合检验交易可用性
 - 根据 20d 或指定 horizon 的 IC / ICIR 生成因子权重
+- 接收 CogAlpha `generation_summary.json` / `research_cycle.json` 中的 `qualified`、`elite` 或明确有研究价值的 `rejected` 候选，做更严格的多周期实证
+
+当输入来自 CogAlpha 时，不要只看因子值和 IC，还必须保留：
+
+1. `semantic_status`：区分 `proxy`、`faithful_proxy`、`mutation_proxy`。
+2. `lineage` / `parent_templates`：判断是否是某个父模板的轻微重复。
+3. `rejection_reasons`：避免把已被 quality/fitness 标记的问题重新包装成新因子。
+4. `research_direction`：确认评测 horizon、universe 和用途是否匹配本轮研究目标。
 
 ## 标准评测流程
 

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 
 from vortex.trade.broker import CashSnapshot, OrderIntent, Position, Quote
+from vortex.trade.market_rules import min_order_shares, price_tick
 from vortex.trade.models import Lineage, OrderPlan, TargetPortfolio
 
 
@@ -29,7 +31,10 @@ def generate_order_plan(
 
     config = config or OrderPlanConfig()
     _validate_config(config)
-    current = {item.symbol: item.available_shares for item in positions}
+    # 差分以真实持仓 shares 为准，卖出上限再受 available_shares 约束。
+    # 否则冻结中的目标内仓位会被误判成“缺口”，在 QMT 执行前反向补买。
+    current = {item.symbol: item.shares for item in positions}
+    sellable = {item.symbol: item.available_shares for item in positions}
     target = {item.symbol: item.target_shares for item in portfolio.positions}
     symbols = sorted(set(current) | set(target))
     missing_quotes = [symbol for symbol in symbols if symbol not in quotes]
@@ -43,32 +48,35 @@ def generate_order_plan(
         if delta >= 0:
             continue
         quote = quotes[symbol]
-        shares = _round_lot(abs(delta), config.lot_size)
-        gross = shares * quote.execution_price
-        if shares > 0 and gross >= config.min_order_value:
+        reference_price = _sell_reference_price(symbol, quote, config)
+        shares = _round_lot(min(abs(delta), sellable.get(symbol, 0)), config.lot_size)
+        if shares > 0:
             orders.append(
                 OrderIntent(
                     symbol=symbol,
                     side="sell",
                     shares=shares,
                     price_type="limit",
-                    limit_price=round(quote.execution_price * (1 - config.sell_limit_bps / 10_000.0), 4),
+                    limit_price=reference_price,
                     reason="rebalance_sell",
                     strategy_version=portfolio.strategy_version,
                     run_id=portfolio.run_id,
                 )
             )
-            available_cash += gross
+            available_cash += shares * reference_price
 
     for symbol in symbols:
         delta = target.get(symbol, 0) - current.get(symbol, 0)
         if delta <= 0:
             continue
         quote = quotes[symbol]
+        reference_price = _buy_reference_price(symbol, quote, config)
         shares = _round_lot(delta, config.lot_size)
-        max_affordable = _round_lot(int(available_cash // quote.execution_price), config.lot_size)
+        if shares < min_order_shares(symbol, "buy"):
+            continue
+        max_affordable = _round_lot(int(available_cash // reference_price), config.lot_size)
         shares = min(shares, max_affordable)
-        gross = shares * quote.execution_price
+        gross = shares * reference_price
         if shares > 0 and gross >= config.min_order_value:
             orders.append(
                 OrderIntent(
@@ -76,7 +84,7 @@ def generate_order_plan(
                     side="buy",
                     shares=shares,
                     price_type="limit",
-                    limit_price=round(quote.execution_price * (1 + config.buy_limit_bps / 10_000.0), 4),
+                    limit_price=reference_price,
                     reason="rebalance_buy",
                     strategy_version=portfolio.strategy_version,
                     run_id=portfolio.run_id,
@@ -103,6 +111,27 @@ def generate_order_plan(
 
 def _round_lot(shares: int, lot_size: int) -> int:
     return int(shares // lot_size) * lot_size
+
+
+def _buy_reference_price(symbol: str, quote: Quote, config: OrderPlanConfig) -> float:
+    if quote.ask_price_1 is not None and quote.ask_price_1 > 0:
+        return quote.ask_price_1
+    raw = quote.execution_price * (1 + config.buy_limit_bps / 10_000.0)
+    return _round_price_to_tick(symbol, raw, side="buy")
+
+
+def _sell_reference_price(symbol: str, quote: Quote, config: OrderPlanConfig) -> float:
+    if quote.bid_price_1 is not None and quote.bid_price_1 > 0:
+        return quote.bid_price_1
+    raw = quote.execution_price * (1 - config.sell_limit_bps / 10_000.0)
+    return _round_price_to_tick(symbol, raw, side="sell")
+
+
+def _round_price_to_tick(symbol: str, price: float, *, side: str) -> float:
+    tick = price_tick(symbol)
+    scaled = price / tick
+    rounded = math.ceil(scaled) if side == "buy" else math.floor(scaled)
+    return round(max(tick, rounded * tick), 4)
 
 
 def _validate_config(config: OrderPlanConfig) -> None:

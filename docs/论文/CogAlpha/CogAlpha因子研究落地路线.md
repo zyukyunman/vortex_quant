@@ -54,12 +54,13 @@ Skill 层
 
 目标：把候选 alpha 从聊天文本变成可检查对象。
 
-建议模块：
+当前实现：
 
 ```text
 vortex/research/cogalpha/
   __init__.py
   schema.py
+  agent_catalog.py
   quality.py
 ```
 
@@ -67,39 +68,41 @@ vortex/research/cogalpha/
 
 - `AlphaCandidate`
 - `AgentSpec`
-- `GuidanceSpec`
 - `QualityCheckResult`
 - `LineageRecord`
+- `QualityIssue`
 
-Quality Gate 先做规则检查：
+Quality Gate 已做规则检查：
 
 1. schema 必填字段。
 2. 字段白名单。
 3. 算子白名单。
 4. 时间安全。
 5. NaN / inf / distinct / coverage。
-6. 经济逻辑元数据。
+6. agent 是否属于 21 个 CogAlpha agent。
 
-不做：
+仍不做：
 
 - 不执行任意 LLM Python。
 - 不允许网络、文件、环境变量访问。
 - 不做复杂自动修复。
+- 不自动解析公式生成因子值；候选表达仍是可审计元数据。
 
 验收：
 
-- 单元测试覆盖通过和失败候选。
-- 失败原因结构化。
-- 无 silent fallback。
+- `tests/test_research_cogalpha_schema.py` 与 `tests/test_research_cogalpha_quality.py` 覆盖通过和失败候选。
+- 失败原因以 `QualityIssue.code` 结构化输出。
+- 默认 fail-closed：危险 token、未来函数、未声明字段、低覆盖率、inf、低 distinct ratio 均拒绝。
 
 ## Phase 2：Fitness 扩展
 
 目标：从“能评测一个因子”升级为“能给一代候选排序和分级”。
 
-建议模块：
+当前实现模块：
 
 ```text
 vortex/research/cogalpha/fitness.py
+vortex/research/cogalpha/reports.py
 ```
 
 指标：
@@ -114,46 +117,159 @@ vortex/research/cogalpha/fitness.py
 - long-short。
 - group monotonicity。
 - factor correlation。
-- 可选 MI。
+- MI 暂未实现，保留到后续 Phase 2 增强。
 
 与现有代码关系：
 
 - 复用 `vortex/research/evaluation.py`。
 - 不破坏 `FactorEvaluationResult`。
-- 新增 CogAlpha 专用 `FitnessResult` 可以包装基础结果。
+- 新增 CogAlpha 专用 `FitnessStats` 与 `CogAlphaEvaluationResult` 包装基础结果。
 
 验收：
 
 1. 一批候选可输出 `qualified`、`elite`、`rejected`。
 2. rejected 原因可回写下一轮 prompt。
-3. 报告 JSON 可作为事实来源。
+3. 报告 JSON 使用 `vortex.cogalpha_generation_report.v1`，可作为事实来源。
+4. 现有 `vortex.research.evaluation` 行为不被破坏。
+
+当前边界：
+
+- fitness 输入仍是已计算好的 date × symbol 因子宽表。
+- `rank_cogalpha_candidates` 只负责一代候选排序、elite 标记和同代相关性过滤。
+- 还没有 prompt 生成、mutation/crossover 或 LLM provider。
+
+## Phase 2.5：Research 集成与可执行 Agent Recipe
+
+目标：解决 CogAlpha 旁路化问题，让 agent 真正接回现有 Research 主流程。
+
+当前实现模块：
+
+```text
+vortex/research/cogalpha/recipes.py
+vortex/research/cogalpha/adapters.py
+vortex/research/cogalpha/workflow.py
+```
+
+核心能力：
+
+1. `CogAlphaAgentRecipe`：把 agent 从角色卡升级为可执行研究单元。
+2. `formula_spec_from_recipe()`：recipe 生成安全 `FormulaSpec`。
+3. `candidate_from_recipe()`：recipe 生成 `AlphaCandidate`。
+4. `candidate_from_formula_spec()`：现有 `FormulaSpec` 反向包装成 CogAlpha candidate。
+5. `cogalpha_candidates_from_registered_specs()`：把现有 `registered_specs()` 纳入 CogAlpha 质量/适应度治理。
+6. `run_cogalpha_generation()`：串起 recipe、`compute_formula`、quality gate、fitness ranking 和 generation JSON。
+
+Phase 2.6 后当前可执行 baseline proxy recipe 已覆盖全部 21 个 agent catalog entry：
+
+| Agent | recipe |
+|---|---|
+| `AgentMarketCycle` | `market_cycle_relative_trend_60d` |
+| `AgentVolatilityRegime` | `volatility_regime_compression_20d` |
+| `AgentTailRisk` | `tail_risk_downside_vol_20d` |
+| `AgentCrashPredictor` | `crash_fragility_high_range_low_liquidity_20d` |
+| `AgentLiquidity` | `liquidity_range_impact` |
+| `AgentOrderImbalance` | `order_imbalance_close_strength_5d` |
+| `AgentPriceVolumeCoherence` | `price_volume_coherence_20d` |
+| `AgentVolumeStructure` | `volume_structure_surge_decay_20d` |
+| `AgentDailyTrend` | `daily_trend_20d` |
+| `AgentReversal` | `short_reversal_5d` |
+| `AgentRangeVol` | `range_vol_20d` |
+| `AgentLagResponse` | `lag_response_volume_leads_price_20d` |
+| `AgentVolAsymmetry` | `vol_asymmetry_downside_upside_20d` |
+| `AgentDrawdown` | `drawdown_recovery_position_60d` |
+| `AgentFractal` | `fractal_multiscale_consistency_20_60d` |
+| `AgentRegimeGating` | `regime_gated_trend_lowvol_60d` |
+| `AgentStability` | `stability_signal_smoothness_20d` |
+| `AgentComposite` | `composite_trend_reversal_liquidity` |
+| `AgentCreative` | `creative_soft_rank_range_liquidity` |
+| `AgentBarShape` | `bar_shape_close_location_5d` |
+| `AgentHerding` | `herding_amount_crowding_reversal_20d` |
+
+重要边界：
+
+- `planned_recipes()` 已为空；后续新增 agent 时必须配套 builder、quality/fitness 测试和文档。
+- recipe builder 仍是 Vortex 内置安全代码，不执行任意 LLM Python。
+- CogAlpha 仍不替代 `alpha101_registry.py`，而是给现有公式体系增加认知归因、质量门禁和 generation-level 报告。
+
+## Phase 2.6：全量可执行 Agent 与研究演示闭环
+
+目标：回答“CogAlpha 在 Vortex 里最小能做什么”，用本地可复现代码跑通 21 个 baseline proxy recipe 的生成、计算、门禁、适应度排序和 artifact 沉淀。这里的 21 个 recipe 是论文 agent 的可执行代理，不是论文 multi-agent LLM 推理系统的完整复现。
+
+入口：
+
+```python
+from vortex.research.cogalpha import build_demo_daily_inputs, run_cogalpha_demo, run_cogalpha_generation
+
+run_cogalpha_demo("workspace/cogalpha/latest")
+```
+
+产物：
+
+```text
+workspace/cogalpha/latest/generation_report.json
+workspace/cogalpha/latest/generation_summary.json
+```
+
+`generation_summary.json` 包含：
+
+1. `recipe_count`：本轮实际执行 recipe 数。
+2. `decision_counts`：`elite` / `qualified` / `rejected` / `invalid` 数量。
+3. `semantic_status_counts`：`proxy` / `faithful_proxy` / `mutation_proxy` 的数量。
+4. `top_candidates`：按 fitness score 排序的候选。
+5. `agent_results`：每个 agent 的 alpha_id、decision、score、fitness、rejection reasons、semantic_status、semantic_notes 和 parent_templates。
+
+这个 demo 使用 deterministic synthetic OHLCV panel，只证明工程闭环和 schema 稳定性，不作为真实 A 股 alpha 结论。迁移到真实数据时，只需把 `build_demo_daily_inputs()` 换成真实 `DailyFactorInputs`，继续调用 `run_cogalpha_generation()`。后续如果要“更像论文”，需要把 `semantic_status=proxy` 的 recipe 逐步升级为更忠实的 agent implementation，并接入 LLM guidance / mutation / crossover。
+
+## Phase 2.7：Agent 语义硬化
+
+目标：根据 review 结论，把最弱的 5 个 proxy 从“能跑”推进到“更贴近论文语义”：
+
+| Agent | 语义硬化结果 |
+|---|---|
+| `AgentMarketCycle` | 从简单 60 日相对趋势升级为市场趋势、上涨宽度和市场波动状态共同构造的 PIT-safe regime gate |
+| `AgentCrashPredictor` | 从普通 range/liquidity 风险分升级为波动短长比、波动扩张、下行 range、市场同步和流动性枯竭组合的 fragility risk filter |
+| `AgentFractal` | 从 20/60 日收益一致性升级为 path efficiency、variance-ratio proxy 和多 horizon gap 的粗糙度代理 |
+| `AgentHerding` | 从放量上涨反转升级为截面方向共识、个股与群体方向对齐和成交额拥挤的 herding pressure |
+| `AgentCreative` | 从普通非线性因子改成 deterministic mutation proxy，记录 `parent_templates`：`daily_trend_20d`、`short_reversal_5d`、`liquidity_range_impact` |
+
+边界：
+
+- 这些仍是 OHLCV 内代理，不是完整论文 LLM agent。
+- `faithful_proxy` 只表示“比 baseline proxy 更贴近论文语义”，不表示已完成论文复现。
+- 真实研究结论必须用真实 A 股 `DailyFactorInputs` 重新评估，不能引用 synthetic demo 的收益指标。
 
 ## Phase 3：Workspace 小 CogAlpha Runner
 
-目标：验证闭环，不污染核心仓库。
+目标：让 CogAlpha 从 demo 进入默认因子研究编排层；`factor-mining-research` 负责读取资料/档案并选择方向，CogAlpha 负责 agent/recipe、quality、fitness、lineage 和下一轮 evolution。
+
+Phase 3 的第一条默认方向：
+
+```text
+cogalpha_101_price_volume_defensive_evolution
+```
+
+它服务于 [[101因子全库研究路线]] 和 [[动量与101量价因子]]：围绕低波、反转、成交拥挤、静默流动性、路径质量和风险门控，自动生成 parent pool 和 mutation/crossover 队列。
 
 建议 workspace 结构：
 
 ```text
-workspace/cogalpha/
-  raw_candidates.jsonl
-  quality_review.jsonl
-  fitness_report.json
-  elite_pool.jsonl
-  rejected_pool.jsonl
-  generation_summary.md
+workspace/cogalpha/<research_direction>/latest/
+  generation_report.json
+  generation_summary.json
+  research_cycle.json
 ```
 
 输入：
 
-- 人工或 agent 生成的候选 JSONL。
-- 已准备好的宽表数据。
+- `CogAlphaResearchDirection`。
+- 已准备好的 `DailyFactorInputs` 宽表数据。
 - 评测 horizon 和 universe。
 
 输出：
 
 - 通过/失败候选。
 - fitness 排名。
+- parent pool。
 - 下一轮 mutation/crossover 建议。
 - 可归档的失败原因。
 

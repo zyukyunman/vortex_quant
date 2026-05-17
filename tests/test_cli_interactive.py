@@ -5,6 +5,7 @@ import argparse
 import io
 
 import pytest
+import yaml
 
 import vortex.cli as cli
 from vortex.config.profile.models import DataProfile
@@ -349,8 +350,9 @@ class TestInitCancellation:
         monkeypatch.setattr(cli, "_smoke_test_tushare", lambda _token: True)
         monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
 
-        # answers: step3 run_bootstrap=True, step4 schedule=False, step5 feishu=False, step6 agent=False
-        answers = iter([True, False, False, False])
+        # answers: minute opt-in=False, step3 run_bootstrap=True,
+        # step4 schedule=False, step5 feishu=False, step6 agent=False
+        answers = iter([False, True, False, False, False])
         monkeypatch.setattr(
             cli,
             "_prompt_yes_no",
@@ -368,6 +370,79 @@ class TestInitCancellation:
         assert root.exists()
         assert "default.yaml" in {p.name for p in (root / "profiles").iterdir()}
         assert "首次数据更新启动失败" in capsys.readouterr().out
+
+    def test_cmd_init_can_opt_in_stk_mins_to_default_profile(self, monkeypatch, tmp_path):
+        root = tmp_path / "workspace"
+
+        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+        monkeypatch.setattr(cli, "_check_tushare_token", lambda: None)
+        monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
+
+        # answers: minute opt-in=True, run_bootstrap=False,
+        # schedule=False, feishu=False, agent=False
+        answers = iter([True, False, False, False, False])
+        monkeypatch.setattr(
+            cli,
+            "_prompt_yes_no",
+            lambda *_args, **_kwargs: next(answers),
+        )
+
+        cli.cmd_init(argparse.Namespace(root=str(root), non_interactive=False))
+
+        profile = yaml.safe_load((root / "profiles" / "default.yaml").read_text())
+        assert "stk_mins" in profile["datasets"]
+
+    def test_cmd_init_keeps_stk_mins_out_without_opt_in(self, monkeypatch, tmp_path):
+        root = tmp_path / "workspace"
+
+        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+        monkeypatch.setattr(cli, "_check_tushare_token", lambda: None)
+        monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
+
+        answers = iter([False, False, False, False, False])
+        monkeypatch.setattr(
+            cli,
+            "_prompt_yes_no",
+            lambda *_args, **_kwargs: next(answers),
+        )
+
+        cli.cmd_init(argparse.Namespace(root=str(root), non_interactive=False))
+
+        profile = yaml.safe_load((root / "profiles" / "default.yaml").read_text())
+        assert "datasets" not in profile
+
+    def test_cmd_init_can_select_stk_mins_for_initial_bootstrap(self, monkeypatch, tmp_path):
+        root = tmp_path / "workspace"
+        captured: dict[str, object] = {}
+
+        monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+        monkeypatch.setattr(cli, "_check_tushare_token", lambda: "token")
+        monkeypatch.setattr(cli, "_smoke_test_tushare", lambda _token: True)
+        monkeypatch.setattr(cli, "_prompt", lambda *_args, **_kwargs: "20170101")
+
+        # answers: minute opt-in=True, run_bootstrap=True,
+        # schedule=False, feishu=False, agent=False
+        answers = iter([True, True, False, False, False])
+        monkeypatch.setattr(
+            cli,
+            "_prompt_yes_no",
+            lambda *_args, **_kwargs: next(answers),
+        )
+
+        def _select(_message, options, _defaults):
+            assert "stk_mins" in options
+            return ["stk_mins"]
+
+        monkeypatch.setattr(cli, "_prompt_multi_select", _select)
+        monkeypatch.setattr(
+            cli,
+            "_run_initial_bootstrap",
+            lambda _root, _profile_name, datasets: captured.update({"datasets": datasets}),
+        )
+
+        cli.cmd_init(argparse.Namespace(root=str(root), non_interactive=False))
+
+        assert captured["datasets"] == ["stk_mins"]
 
 
 class TestInitialBootstrapLaunch:

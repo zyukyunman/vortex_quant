@@ -2,7 +2,7 @@
 tags: [vortex, vortex/architecture, vortex/trade-domain]
 aliases: [Mac虚拟机QMT实盘桥接方案, QMT桥接方案, MiniQMT实盘接入方案]
 created: 2026-05-02
-updated: 2026-05-02
+updated: 2026-05-12
 ---
 
 # Mac 虚拟机 QMT 实盘桥接方案
@@ -51,7 +51,7 @@ Mac ↔ Windows：HTTP / WebSocket / RPyC 远程调用
 
 ```text
 Mac 主机
-  vortex strategy earnings-forecast shadow-plan
+  vortex strategy earnings-forecast shadow-plan --preset baseline_top110_large
   目标持仓、订单草案、风控、报告
   ↓
 BridgeAdapter
@@ -504,6 +504,14 @@ tests/test_trade_qmt_bridge.py
 
 第一版 `QmtBridgeAdapter` 必须默认只读。只有配置显式开启模拟盘交易时，才允许调用 `submit_order()`。
 
+当前联调已确认的 QMT / qmt-bridge 数字委托状态码口径是：
+
+- `54 -> cancelled`
+- `56 -> filled`
+- `57 -> rejected`
+
+这些状态已在 `vortex/trade/qmt_bridge.py` 中做统一归一；未知状态码保持原值回传，避免在 fail-closed 流程里误判成“安全可继续”。
+
 ## 10. Shadow / 模拟盘每日报告模板
 
 每个交易日必须输出一份机器可读 JSON 和一份人可读 Markdown/HTML。报告不是展示收益曲线，而是验证真实执行。
@@ -567,10 +575,10 @@ tests/test_trade_qmt_bridge.py
 
 本节是当前最重要的执行清单。只要 bridge 核心读接口稳定，交易日就按下面顺序做，不再被 `/api/download/*` 分散注意力。
 
-对于**模拟账户**，这里不要求先单独经历一个“只看不下”的独立 shadow 阶段，而是把 shadow 语义折叠成**盘前 dry-run**：
+对于**模拟账户**，当前正式执行口径已经调整为：
 
-1. 开盘前先生成目标持仓、订单草案和账户快照；
-2. 随后直接进入**最小规模模拟盘委托验证**；
+1. **交易日 08:10 后**先拉数、跑策略、冻结 `trade_date=today` 的目标组合；
+2. **当天开盘前/开盘附近**再消费冻结组合下单；
 3. 收盘后立即做对账和执行归因。
 
 也就是说，当前推荐路径不是：
@@ -582,32 +590,71 @@ tests/test_trade_qmt_bridge.py
 而是：
 
 ```text
-盘前 dry-run → 当天模拟盘最小下单 → 收盘后对账
+交易日开盘前 prepare-next-session → 当天 qmt rebalance → 收盘后对账
 ```
 
-这样既保留了 shadow 的“下单前预演”价值，又不会把模拟账户推进节奏拖慢。
+这样做的原因是：
 
-### 12.1 开盘前（08:45-09:20）
+1. 业绩预告策略本身就按 `delay_days=1` 建模；
+2. A 股现货当天买入不能当天卖出，真实物理约束是 T+1；
+3. 但 orchestration 层不需要再硬编码“额外的 T+1 调度契约”；执行层只消费冻结好的 `TargetPortfolio`，避免临场重算 alpha 漂移。
+
+数据更新职责需要和交易编排拆开：晚间常规拉数由 `vortex server` 按 data profile 的 `schedule` 自动提交 `data update`，当前默认是每天 18:00；`earnings-forecast auto-run` 只负责交易日盘前读取最新可见快照、冻结目标组合并在执行窗口消费 pending task。若 data 服务未运行，应恢复 `vortex server start`，而不是把策略服务当成临时补数触发器。盘前若发现策略关键分区缺失，只允许对 `forecast / bars / valuation / stk_limit / suspend_d / stock_st / fina_indicator / express` 做定向补数；补后仍缺 `stock_st`、涨跌停、停牌、市值或日线数据时必须 fail-closed。
+
+当前服务健康监控使用 `tool/live_service_monitor.py` 每 5 分钟检查一次 `vortex server`、最近 data update、策略 auto-run 和 QMT 相关状态，并写入：
+
+```text
+~/Documents/vortex_workspace/state/logs/live-service-health.log
+~/Documents/vortex_workspace/state/logs/live-service-health.jsonl
+~/Documents/vortex_workspace/state/live-service-health-latest.json
+```
+
+### 12.1 T 日准备阶段（08:10 以后）
 
 | 步骤 | 动作 | 通过标准 | 失败处理 |
 |---|---|---|---|
 | 1 | 确认 Windows VM、QMT/MiniQMT、bridge 进程都在线 | `health=ok`，QMT 已登录 | fail-closed，当日不下单 |
-| 2 | 运行 `vortex strategy earnings-forecast live-handoff` | 生成目标持仓、交易变化、账户快照 | 作为盘前 dry-run；通过后可进入最小模拟盘验证 |
+| 2 | 运行 `vortex strategy earnings-forecast prepare-next-session --preset baseline_top110_large` | 写出 `trade_date=today` 的冻结组合与 pending task；候选池按上一交易日 `valuation.total_mv` 只保留 A 股总市值前 50%；`stock_st` 日度名单、财务 ST 风险和名称含 ST 任一命中都剔除 | 任一关键数据缺失则 fail-closed |
 | 3 | 运行 `vortex trade status` | 现金、持仓、委托、成交可读 | fail-closed |
 | 4 | 运行 `vortex trade quote` 拉目标股票行情 | 目标股票报价可读，缺失数量可解释 | 缺失则降级为人工检查 |
-| 5 | 对照订单草案检查风控 | 涨跌停、停牌、ST、整手、现金约束全部明确 | 任一不明则 fail-closed |
+| 5 | 检查冻结产物 | `TargetPortfolio`、pending task、handoff JSON 全部落盘 | 任一缺失则不进入当日执行 |
 
-### 12.2 开盘阶段（09:20-09:35）
+冻结产物必须携带策略诊断，至少包含 `target_diagnostics.selection_funnel` 和 `target_diagnostics.market_gate`。前者用于解释目标持仓为什么少于 TopN，后者用于解释指数下行时为什么应空仓或不新增。候选漏斗的读取顺序是：
 
-重点不是“能不能发单”，而是验证开盘成交假设是否成立。
+```text
+raw_signal_count
+positive_signal_count
+after_liquidity_count
+after_st_filter_count
+after_market_cap_top50_count
+after_open_block_count
+after_quality_block_count
+after_permission_count
+executable_candidate_count
+selected_position_count
+```
+
+如果 `after_market_cap_top50_count` 已经少于目标 TopN，说明 A 股总市值前 50% 和前置风险门禁之后合格候选不足；如果 `after_permission_count` 或 `executable_candidate_count` 才开始明显减少，问题更可能来自账户板块权限、整手、科创板最低 200 股或最低订单金额。不要再只用旧的 `eligible_signal_count_below_topn` 聚合字段判断原因。
+
+### 12.2 当日执行阶段（09:20-09:35）
+
+重点不是“重新算今天该买什么”，而是验证**冻结组合 → 实际委托 → 成交回报**是否成立。
 
 | 检查项 | 要回答的问题 | 记录字段 |
 |---|---|---|
+| 差分调仓 | 当前真实持仓与冻结目标组合差多少 | `current_weight`、`target_weight`、`trade_delta` |
+| 先卖后买 | 非目标仓位、超配仓位是否先卖 | `action`、`side` |
 | 开盘涨停 | 买入标的是否开盘即封板、理论上买不到 | `is_limit_up`、是否跳过 |
+| 开盘跌停 | 卖出标的是否跌停、理论上卖不掉 | `is_limit_down`、是否跳过 |
+| ST 清理 | 已持有 ST 是否只卖出、不再新增买入 | `st_flags`、`side`、`blocking_reasons` |
+| 市场权限 | 主板、创业板、科创板、北交所是否允许交易 | `market_board`、`skipped_permission_symbols` |
+| 最小申报 | 科创板是否按 200 股最低买入申报处理 | `min_order_shares`、`skipped_market_rule_symbols` |
 | 高开幅度 | `open / prev_close - 1` 是否超过 3%、5%、8% 阈值 | `gap_pct` |
 | 集合竞价量 | 目标股数相对开盘可成交量是否过大 | `auction_volume_ratio` |
 | 部分成交 | 若流动性不足，是否部分成交 | `filled_shares`、`remaining_shares` |
 | 实际滑点 | 实际成交价相对计划开盘价偏离多少 | `slippage_bps` |
+
+> 今天测试买出来的仓位不需要写“测试仓特判清仓”。只要它们不在当天冻结目标组合里，通用差分调仓会自然把它们卖掉。
 
 ### 12.3 委托生命周期验证（09:30-15:00）
 
@@ -639,12 +686,41 @@ tests/test_trade_qmt_bridge.py
 | 未成交 | 哪些目标仓位未达成，原因是什么 |
 | 收益归因 | `open→close`、`close→next open`、成本、滑点、未成交、现金拖累 |
 
+对账后应记录账户子账本策略净值快照。净值台账不属于业绩预告策略专属逻辑，而是 [[交易域设计说明书]] 的通用账户绑定能力；当前默认一个 QMT 账户只运行一个自动策略，但账户里可能有超过策略名义本金的闲置现金。首条快照会锁定 `external_cash_offset = account_total_asset - initial_equity`，后续用 `strategy_equity = account_total_asset - external_cash_offset` 作为策略权益曲线事实来源。`earnings-forecast auto-run` 在成功执行 QMT 调仓后会自动写入当日快照；下面的命令用于手工补记或独立巡检。
+
+```bash
+vortex trade nav snapshot \
+  --root ~/Documents/vortex_workspace \
+  --strategy-name earnings_forecast_auto \
+  --strategy-version baseline_top110_large \
+  --initial-equity 1000000 \
+  --benchmark 000852.SH \
+  --qmt-bridge-url http://<windows-ip>:8000 \
+  --qmt-bridge-token <token> \
+  --qmt-account-id <account_id>
+
+vortex trade nav status \
+  --root ~/Documents/vortex_workspace \
+  --strategy-name earnings_forecast_auto \
+  --strategy-version baseline_top110_large \
+  --qmt-account-id <account_id>
+```
+
+台账会写入：
+
+```text
+~/Documents/vortex_workspace/state/nav/<run_id>.json
+~/Documents/vortex_workspace/trade/nav/<run_id>.csv
+```
+
+服务暂停几秒或几分钟后重启，默认继续使用同一个 `run_id` 和首条快照锁定的外部资金偏移；只有显式 `--reset`、更换账户、重设初始资金或指定新 `run_id` 时才开启新净值曲线。若停机期间有人手工改仓、动用了子账本之外的资金，第一版仍按子账本净值继续统计，但巡检结论应标记“外部持仓漂移”或“疑似现金流”，后续再用现金流账本修正。
+
 ### 12.5 升级门槛
 
 按 [qmt-execution-readiness skill](../../.github/skills/qmt-execution-readiness/SKILL.md) 的口径，当前建议分级如下：
 
-1. **当前状态：已具备盘前 dry-run 能力**
-   - 已能生成目标持仓与账户快照
+1. **当前状态：已具备交易日开盘前冻结 + 当天执行的代码链路**
+   - 已能生成目标持仓、冻结组合与 pending task
    - 已能读取资金、持仓、委托、成交和行情
 2. **对模拟账户的升级到可模拟盘条件**
    - 交易日完成最小委托生命周期验证
@@ -656,5 +732,6 @@ tests/test_trade_qmt_bridge.py
 ## 13. 下一步
 
 1. 按本 Runbook 在交易日先完成 **盘前 dry-run + 模拟盘最小委托生命周期验证**，不要再把 `/api/download/*` 纳入主线。
-2. 把交易日报告落到 `execution_report` / `reconcile_report` 体系，沉淀到 [[用户手册]] 和交易域工件里。
-3. 对业绩预告策略补齐开盘折损、滑点和未成交归因后，再判断是否从 `可 shadow` 升到 `可模拟盘`。
+2. 每日巡检同时输出候选漏斗、市场门控、执行回报和账户净值，避免只看“是否下单”。
+3. 把交易日报告落到 `execution_report` / `reconcile_report` / `trade/nav` 体系，沉淀到 [[用户手册]] 和交易域工件里。
+4. 对业绩预告策略补齐开盘折损、滑点、未成交归因和净值超额后，再判断是否从 `可 shadow` 升到 `可模拟盘`。

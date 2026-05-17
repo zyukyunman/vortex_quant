@@ -44,6 +44,8 @@ class Quote:
     symbol: str
     open_price: float
     last_price: float | None = None
+    ask_price_1: float | None = None
+    bid_price_1: float | None = None
     volume: int | None = None
     amount: float | None = None
     is_suspended: bool = False

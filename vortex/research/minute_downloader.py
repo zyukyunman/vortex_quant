@@ -1,14 +1,14 @@
-"""可恢复的 Tushare 分钟数据下载 runner。
+"""Research-only minute cache helpers kept for historical artifacts.
 
-该模块服务于因子研究，不走正式 data pipeline 发布流程；它把 `stk_mins`
-按 symbol 逐个缓存到 research workspace，并用 manifest 记录完整性。
+生产级 `stk_mins` 下载必须通过正式 data bootstrap 入口，由
+`vortex.data.minute_symbol_cache` 在 pipeline 内部按 symbol-year 管理。
+本模块仅保留历史研究测试和旧 artifact 迁移所需的纯函数。
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import os
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -338,37 +338,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    config = MinuteDownloadConfig(
-        root=args.root.expanduser(),
-        output_root=args.output_root.expanduser(),
-        year=args.year,
-        universe=args.universe,
-        universe_mode=args.universe_mode,
-        top_n=args.top_n,
-        symbols_file=args.symbols_file.expanduser() if args.symbols_file else None,
-        max_symbols=args.max_symbols,
-        start_date=_parse_cli_date(args.start_date) if args.start_date else None,
-        end_date=_parse_cli_date(args.end_date) if args.end_date else None,
-        resume_dirs=_parse_paths(args.resume_dir),
-        manifest_path=args.manifest_path.expanduser() if args.manifest_path else None,
-    )
-    result = run_minute_download(config)
+    build_arg_parser().parse_args(argv)
     print(
-        json.dumps(
-            {
-                "manifest_path": str(result.manifest_path),
-                "cache_dir": str(result.cache_dir),
-                "target_count": len(result.target_symbols),
-                "downloaded_rows": result.downloaded_rows,
-                "result_count": len(result.results),
-                "pid": os.getpid(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        "research minute_downloader CLI 已停用；请通过正式 data bootstrap 配置启用 stk_mins。",
     )
-    return 0
+    return 2
 
 
 if __name__ == "__main__":

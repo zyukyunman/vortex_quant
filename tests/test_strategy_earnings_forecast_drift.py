@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from vortex.research.goal_review import ExperimentQuality
+from vortex.research.event_signals import build_forecast_surprise_signal
 from vortex.research.market_state import MarketStateConfig
 from vortex.strategy.earnings_forecast_drift import (
     EarningsForecastDriftConfig,
@@ -94,6 +95,29 @@ def test_earnings_forecast_drift_runs_full_alpha_review():
     assert result.annual_returns.iloc[0] > 0
     assert result.segments[0].name == "all"
     assert result.to_dict()["candidate_review"]["worth_owning"]
+
+
+def test_forecast_surprise_signal_does_not_rank_negative_events_long():
+    dates = pd.Index(pd.date_range("2024-01-02", periods=5, freq="B").strftime("%Y%m%d"))
+    forecast = pd.DataFrame(
+        {
+            "ann_date": [dates[0], dates[0]],
+            "symbol": ["A", "B"],
+            "type": ["预减", "首亏"],
+            "p_change_min": [-80.0, -120.0],
+            "p_change_max": [-40.0, -90.0],
+        }
+    )
+
+    signal = build_forecast_surprise_signal(
+        forecast,
+        target_index=dates,
+        target_columns=pd.Index(["A", "B"]),
+        delay_days=1,
+        hold_days=3,
+    )
+
+    assert signal.dropna(how="all").empty
 
 
 def test_earnings_forecast_drift_default_uses_v3_fast_gate():

@@ -276,6 +276,94 @@ def test_cmd_trade_paper_rebalance_writes_artifacts_and_json_summary(tmp_path: P
     assert inspect["fill_count"] == 1
 
 
+def test_cmd_trade_qmt_rebalance_outputs_json_summary(tmp_path: Path, monkeypatch, capsys) -> None:
+    portfolio = build_target_portfolio(
+        pd.DataFrame([{"symbol": "000001.SZ", "target_weight": 0.5, "reference_price": 10.0}]),
+        trade_date="20260501",
+        strategy_version="earnings_v3",
+        run_id="run_1",
+        snapshot_id="snap_1",
+        config=TargetPortfolioBuildConfig(notional=100_000),
+    )
+    target_path = tmp_path / "target_portfolio.json"
+    st_flags_path = tmp_path / "st_flags.json"
+    write_json(target_path, portfolio)
+    write_json(st_flags_path, {"000001.SZ": False})
+
+    class _FakeAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def health(self):
+            return trade_module.BrokerHealth(ok=True, mode="qmt_bridge", message="ok")
+
+        def get_cash(self):
+            return trade_module.CashSnapshot(
+                available_cash=100_000.0,
+                frozen_cash=0.0,
+                total_asset=100_000.0,
+                market_value=0.0,
+            )
+
+        def get_positions(self):
+            return []
+
+        def get_quotes(self, symbols):
+            return {
+                symbol: Quote(symbol=symbol, open_price=10.0, last_price=10.0, volume=100_000)
+                for symbol in symbols
+            }
+
+        def submit_order(self, intent):
+            return trade_module.OrderRecord(
+                order_id="order_1",
+                intent=intent,
+                status="open",
+                filled_shares=0,
+                remaining_shares=intent.shares,
+                avg_fill_price=None,
+                message="submitted",
+                created_at="2026-05-01 09:30:00",
+            )
+
+        def get_orders(self):
+            return []
+
+        def get_fills(self):
+            return []
+
+    monkeypatch.setattr(trade_module, "QmtBridgeAdapter", _FakeAdapter)
+    monkeypatch.setattr("vortex.trade.execution.QmtBridgeAdapter", _FakeAdapter)
+
+    cli.cmd_trade(
+        argparse.Namespace(
+            trade_action="qmt",
+            trade_qmt_action="rebalance",
+            root=str(tmp_path),
+            target_portfolio=str(target_path),
+            qmt_bridge_url="http://127.0.0.1:8000",
+            qmt_bridge_token="secret",
+            qmt_account_id="99034443",
+            st_flags=str(st_flags_path),
+            st_as_of=None,
+            allow_missing_st_data=False,
+            buy_limit_bps=30.0,
+            sell_limit_bps=30.0,
+            min_order_value=3_000.0,
+            max_order_count=80,
+            max_single_order_value=100_000.0,
+            max_daily_order_value=1_000_000.0,
+            disable_trading=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["risk_passed"] is True
+    assert payload["order_count"] == 1
+    assert Path(payload["execution_report_path"]).exists()
+
+
 def test_cmd_trade_reconcile_writes_report_for_latest_execution(tmp_path: Path, capsys) -> None:
     portfolio = build_target_portfolio(
         pd.DataFrame([{"symbol": "000001.SZ", "target_weight": 0.5, "reference_price": 10.0}]),

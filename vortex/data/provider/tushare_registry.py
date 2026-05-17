@@ -569,6 +569,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "1A",
         "fetch_mode": "trade_day_all",
         "partition_by": "date",
+        # `daily` 是收盘后数据。盘前/盘中出现 source_empty 只代表“当天分区尚未发布”，
+        # 不能像历史永久空分区那样复用，否则会把当天收盘后的 bars 永久跳过去。
+        "reuse_source_empty_coverage": False,
         "default_enabled": True,
         "quality_check": True,
     },
@@ -1158,6 +1161,9 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "3B",
         "fetch_mode": "minute_range",
         "partition_by": "date",
+        "bootstrap_layout": "symbol_year",
+        "bootstrap_opt_in": True,
+        "bootstrap_warning": "高成本分钟数据集：需要 stock_minutes 权限，按 symbol-year 可恢复下载，体量很大。",
         "freq": "1min",
         "single_request_row_limit": 8000,
         "date_field_priority": ("date",),
@@ -1365,6 +1371,16 @@ def filter_tushare_datasets_by_update_frequency(
         dataset
         for dataset in datasets
         if get_tushare_dataset_update_frequency(dataset) in allowed
+    ]
+
+
+def get_optional_tushare_bootstrap_datasets() -> list[str]:
+    """Datasets shown as explicit opt-in choices during workspace initialization."""
+
+    return [
+        name
+        for name, meta in TUSHARE_DATASET_REGISTRY.items()
+        if bool(meta.get("bootstrap_opt_in", False))
     ]
 
 

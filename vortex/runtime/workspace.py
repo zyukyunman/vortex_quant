@@ -28,6 +28,10 @@ class Workspace:
         return self.root / "data"
 
     @property
+    def logs_dir(self) -> Path:
+        return self.state_dir / "logs"
+
+    @property
     def research_dir(self) -> Path:
         return self.root / "research"
 
@@ -58,6 +62,7 @@ class Workspace:
     def _all_dirs(self) -> list[Path]:
         return [
             self.state_dir,
+            self.logs_dir,
             self.data_dir,
             self.research_dir,
             self.strategy_dir,

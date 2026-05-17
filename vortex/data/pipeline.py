@@ -21,6 +21,12 @@ from vortex.config.profile.models import DataProfile
 from vortex.data.calendar import DataCalendar
 from vortex.data.derived import DerivedMetricCalculator
 from vortex.data.manifest import SyncManifest
+from vortex.data.minute_symbol_cache import (
+    MinuteSymbolYearConfig,
+    discover_legacy_minute_cache_dirs,
+    select_active_symbols_from_bars,
+    sync_minute_symbol_year_cache,
+)
 from vortex.data.pit.aligner import PitAligner
 from vortex.data.pit.report import PitReport
 from vortex.data.provider.tushare_registry import TUSHARE_UPDATE_FREQUENCY_ORDER
@@ -34,6 +40,7 @@ from vortex.shared.ids import generate_run_id
 from vortex.shared.logging import get_logger
 
 logger = get_logger(__name__)
+_CN_STOCK_DAILY_VISIBLE_AFTER = datetime.strptime("18:00", "%H:%M").time()
 
 # DataProfile 即为当前阶段的 ResolvedProfile
 # 完整的 profile 合并解析将在 config 域后续迭代中实现
@@ -245,6 +252,7 @@ class DataPipeline:
         *,
         run_id: str | None = None,
         action: str = "bootstrap",
+        current: datetime | None = None,
     ) -> RunReport:
         """全量初始化：history_start → 最新交易日。
 
@@ -268,8 +276,14 @@ class DataPipeline:
                 message=f"{action}：准备交易日历与标的列表",
                 force=True,
             )
+            market = "cn_stock"
             start = self._parse_date(profile.history_start)
-            end = date.today()
+            end = self._resolve_effective_sync_end(
+                market=market,
+                start=start,
+                end=date.today(),
+                current=current,
+            )
 
             report = self._run_sync(
                 run_id=run_id,
@@ -324,6 +338,7 @@ class DataPipeline:
         *,
         run_id: str | None = None,
         action: str = "update",
+        current: datetime | None = None,
     ) -> RunReport:
         """增量更新：上次 as_of + 1 → 最新交易日。
 
@@ -341,6 +356,7 @@ class DataPipeline:
                 message=f"{action}：计算增量范围",
                 force=True,
             )
+            market = "cn_stock"
             # 查找最近一次成功同步的结束日期（含 bootstrap 和 update）
             latest = self._manifest.get_latest_run(profile.name)
             if latest and latest.get("status") == "success" and latest.get("as_of_end"):
@@ -350,11 +366,23 @@ class DataPipeline:
                 # 无成功历史，退化为从 history_start 开始
                 start = self._parse_date(profile.history_start)
 
-            end = date.today()
+            end = self._resolve_effective_sync_end(
+                market=market,
+                start=start,
+                end=date.today(),
+                current=current,
+            )
 
             if start > end:
-                logger.info("无需更新：数据已是最新")
-                self._manifest.update_status(run_id, "success", total_rows=0)
+                logger.info("无需更新：最新可见数据已同步（visible_end=%s）", end.isoformat())
+                self._manifest.update_status(
+                    run_id,
+                    "success",
+                    total_rows=0,
+                    as_of_start=end.isoformat(),
+                    as_of_end=end.isoformat(),
+                    quality_status="skipped",
+                )
                 self._emit_progress(
                     current_stage="finished",
                     total_stages=5,
@@ -364,7 +392,7 @@ class DataPipeline:
                     current_chunk=0,
                     total_chunks=0,
                     written_rows=0,
-                    message="无需更新：数据已是最新",
+                    message=f"无需更新：最新可见数据已同步（visible_end={end.isoformat()}）",
                     force=True,
                 )
                 return RunReport(
@@ -947,6 +975,18 @@ class DataPipeline:
             dataset_index,
             total_datasets,
         )
+        if str(meta.get("bootstrap_layout") or "") == "symbol_year":
+            return self._sync_symbol_year_minute_dataset(
+                dataset=dataset,
+                market=market,
+                start=start,
+                end=end,
+                action=action,
+                fallback_symbols=symbols,
+                dataset_index=dataset_index,
+                total_datasets=total_datasets,
+                total_rows=total_rows,
+            )
         self._log_fetch_plan(dataset, fetch_plan)
         if (
             fetch_plan.skip_reason is None
@@ -1169,6 +1209,91 @@ class DataPipeline:
             pit_report=current_pit,
             quality_candidate=quality_candidate,
         )
+
+    def _sync_symbol_year_minute_dataset(
+        self,
+        *,
+        dataset: str,
+        market: str,
+        start: date,
+        end: date,
+        action: str,
+        fallback_symbols: list[str],
+        dataset_index: int,
+        total_datasets: int,
+        total_rows: int,
+    ) -> DatasetSyncOutcome:
+        """Bootstrap large minute datasets without a single full-market frame."""
+
+        if action not in {"bootstrap", "backfill", "repair"}:
+            logger.info("dataset=%s: %s 暂不处理 symbol-year 分钟布局", dataset, action)
+            return DatasetSyncOutcome()
+
+        root = getattr(self._storage, "root", None)
+        if root is None:
+            raise DataError(
+                code="DATA_PIPELINE_UNSUPPORTED_STORAGE",
+                message=f"dataset={dataset} 的 symbol-year 分钟布局需要可解析 root 的存储后端",
+            )
+        workspace_root = Path(root).parent
+        years = range(start.year, end.year + 1)
+        total_written = 0
+        for year in years:
+            year_start = max(start, date(year, 1, 1))
+            year_end = min(end, date(year, 12, 31))
+            symbols = select_active_symbols_from_bars(workspace_root, year, fallback_symbols)
+            if not symbols:
+                logger.warning("dataset=%s year=%s 无可用 symbol，跳过", dataset, year)
+                continue
+            source_dirs = discover_legacy_minute_cache_dirs(workspace_root, year)
+            config = MinuteSymbolYearConfig(
+                root=workspace_root,
+                dataset=dataset,
+                year=year,
+                universe="all_active",
+                symbols=symbols,
+                start_date=year_start,
+                end_date=year_end,
+                source_cache_dirs=source_dirs,
+            )
+            self._emit_progress(
+                current_stage="fetch",
+                total_stages=5,
+                completed_stages=1,
+                current_dataset=dataset,
+                total_datasets=total_datasets,
+                completed_datasets=dataset_index - 1,
+                current_chunk=0,
+                total_chunks=len(symbols),
+                written_rows=total_rows + total_written,
+                message=f"{dataset} {year}：开始 symbol-year bootstrap",
+                force=True,
+            )
+            result = sync_minute_symbol_year_cache(
+                self._provider,
+                config,
+                market=market,
+                progress_callback=self._make_dataset_progress_callback(
+                    stage="fetch",
+                    stage_index=1,
+                    dataset=dataset,
+                    dataset_index=dataset_index,
+                    total_datasets=total_datasets,
+                    written_rows=total_rows + total_written,
+                ),
+                cancel_check=self._cancel_check,
+            )
+            total_written += result.rows_written
+            logger.info(
+                "dataset=%s year=%s symbol-year 完成: target=%d rows=%d manifest=%s",
+                dataset,
+                year,
+                len(result.target_symbols),
+                result.rows_written,
+                result.manifest_path,
+            )
+
+        return DatasetSyncOutcome(rows_written=total_written)
 
     def _plan_dataset_fetch(
         self,
@@ -1442,6 +1567,58 @@ class DataPipeline:
             return bool(self._storage.list_partitions(dataset))
         existing = self._storage.read(dataset)
         return not existing.empty
+
+    def _resolve_effective_sync_end(
+        self,
+        *,
+        market: str,
+        start: date,
+        end: date,
+        current: datetime | None = None,
+    ) -> date:
+        """按“最新可见数据”口径裁切本轮同步结束日。
+
+        盘前/盘中运行时，A 股 `daily` / `daily_basic` 这一类日级数据通常还没有
+        当天完整分区。若仍把 `end=today` 写进增量水位，会导致：
+        1. 质量门禁把“今天尚未发布”的日线误判成缺失；
+        2. 成功 run 把 as_of_end 提前推进到 today，后续再也不会补抓今天收盘后的日线。
+
+        因此当前先采用最小可见性口径：
+        - 仅对 `cn_stock` 生效；
+        - 若今天是交易日且当前时间早于 `_CN_STOCK_DAILY_VISIBLE_AFTER`，
+          则把本轮 `end` 回退到最近一个已完成交易日。
+        """
+
+        current_dt = current or datetime.now()
+        candidate_end = min(end, current_dt.date())
+        if market != "cn_stock":
+            return candidate_end
+        if candidate_end != current_dt.date():
+            return candidate_end
+        if current_dt.time() >= _CN_STOCK_DAILY_VISIBLE_AFTER:
+            return candidate_end
+
+        calendar_start = min(start, candidate_end) - timedelta(days=31)
+        if self._calendar is not None:
+            trading_days = self._calendar.load_or_fetch(market, calendar_start, candidate_end)
+        else:
+            trading_days = self._provider.fetch_calendar(market, calendar_start, candidate_end)
+        if candidate_end not in trading_days:
+            return candidate_end
+
+        completed_days = [day for day in trading_days if day < candidate_end]
+        if not completed_days:
+            return candidate_end
+
+        visible_end = completed_days[-1]
+        logger.info(
+            "盘中/盘前数据更新回退到最近已完成交易日: market=%s, requested_end=%s, visible_end=%s, cutoff=%s",
+            market,
+            candidate_end.isoformat(),
+            visible_end.isoformat(),
+            _CN_STOCK_DAILY_VISIBLE_AFTER.strftime("%H:%M"),
+        )
+        return visible_end
 
     def _existing_partition_values(self, dataset: str, partition_key: str) -> set[str]:
         values: set[str] = set()

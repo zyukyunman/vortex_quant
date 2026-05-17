@@ -16,6 +16,7 @@ from vortex.research.goal_review import (
     StrategyGoalInput,
     review_strategy_goal,
 )
+from vortex.strategy.evaluation_protocol import compute_strategy_protocol_metrics
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,15 @@ class BacktestMetrics:
     calmar: float
     turnover: float
     total_return: float
+    sortino: float = 0.0
+    cvar_5pct: float = 0.0
+    worst_5d_return: float = 0.0
+    worst_20d_return: float = 0.0
+    max_drawdown_duration_days: int = 0
+    max_drawdown_recovery_days: int | None = None
+    max_drawdown_recovered: bool = False
+    positive_month_rate: float = 0.0
+    annual_win_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -182,6 +192,7 @@ def _compute_metrics(
     sharpe = float((returns.mean() / ret_std) * (252 ** 0.5)) if ret_std > 0 else 0.0
     calmar = annual_return / abs(max_drawdown) if max_drawdown < 0 else 0.0
     turnover = turnover_sum / max(rebalance_count, 1)
+    protocol = compute_strategy_protocol_metrics(equity_curve, returns)
     return BacktestMetrics(
         annual_return=annual_return,
         max_drawdown=max_drawdown,
@@ -189,6 +200,7 @@ def _compute_metrics(
         calmar=calmar,
         turnover=float(turnover),
         total_return=total_return,
+        **protocol.__dict__,
     )
 
 
