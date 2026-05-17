@@ -40,7 +40,8 @@ obsidian_links:
 | 策略 | 业绩预告公告后漂移 |
 | 策略内核 | `earnings_forecast_drift` |
 | 资金规模 | 100 万级先行 |
-| 持仓上限 | Top30 |
+| 默认 preset | `stable_100w` |
+| 持仓上限 | Top50（上限，不强制买满） |
 | 仓位模式 | `capped_with_cash` |
 | 单票上限 | 5% |
 | 事件延迟 | 公告后第 1 个可交易日，`delay_days=1` |
@@ -48,7 +49,7 @@ obsidian_links:
 | 成本压力 | 20 bps 基础成本；执行层另计佣金、印花税、滑点 |
 | 交易节奏 | 开盘前生成计划，开盘附近执行 |
 
-1000 万以上只能作为容量探索，不是当前实盘版本。若测试 1000 万以上，优先 Top80；5000 万和 1 亿当前证据不支持。
+`baseline_top110_large` 保留为研究 reference、大容量回滚和对照版本；`tail_risk_soft_q10_p25` 仅允许显式 shadow/challenge。1000 万以上只能作为容量探索，不是当前 100 万实盘默认版本，必须另跑容量复核。
 
 ---
 
@@ -110,7 +111,7 @@ obsidian_links:
 
 ```bash
 vortex trade status \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --qmt-bridge-url http://<windows-ip>:8000 \
   --qmt-bridge-token <token> \
   --qmt-account-id <account_id> \
@@ -121,7 +122,7 @@ vortex trade status \
 
 ```bash
 vortex trade quote \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --symbols 000001.SZ,600000.SH \
   --qmt-bridge-url http://<windows-ip>:8000 \
   --qmt-bridge-token <token> \
@@ -132,14 +133,15 @@ vortex trade quote \
 
 ```bash
 vortex strategy earnings-forecast live-handoff \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --start 20250101 \
   --as-of YYYYMMDD \
+  --preset stable_100w \
   --qmt-bridge-url http://<windows-ip>:8000 \
   --qmt-bridge-token <token> \
   --qmt-account-id <account_id> \
-  --output-dir /Users/zyukyunman/Documents/vortex_workspace/strategy/handoff \
-  --artifact-dir /Users/zyukyunman/Documents/vortex_workspace/strategy/artifacts \
+  --output-dir ../vortex_workspace/strategy/handoff \
+  --artifact-dir ../vortex_workspace/strategy/artifacts \
   --label 业绩预告漂移策略实盘交接 \
   --format json
 ```
@@ -170,11 +172,12 @@ vortex strategy earnings-forecast live-handoff \
 
 ```bash
 vortex strategy earnings-forecast shadow-plan \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --start 20250101 \
   --as-of YYYYMMDD \
-  --output-dir /Users/zyukyunman/Documents/vortex_workspace/strategy/shadow \
-  --artifact-dir /Users/zyukyunman/Documents/vortex_workspace/strategy/artifacts \
+  --preset stable_100w \
+  --output-dir ../vortex_workspace/strategy/shadow \
+  --artifact-dir ../vortex_workspace/strategy/artifacts \
   --label 业绩预告漂移策略shadow跟踪
 ```
 

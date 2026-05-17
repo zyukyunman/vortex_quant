@@ -1182,7 +1182,11 @@ def _build_overlay_signal(
         return base_signal
     if variant.factor_template is None:
         raise ValueError(f"variant requires factor_template: {variant.name}")
-    factor = factors[variant.factor_template].reindex(index=base_signal.index, columns=base_signal.columns)
+    factor = _visible_overlay_factor(
+        factors[variant.factor_template],
+        index=base_signal.index,
+        columns=base_signal.columns,
+    )
     if variant.overlay_type == "candidate_rerank":
         return build_fused_candidate_signal(
             base_signal,
@@ -1200,7 +1204,8 @@ def _build_overlay_signal(
             base_signal,
             {
                 variant.factor_template: factor,
-                variant.secondary_factor_template: factors[variant.secondary_factor_template].reindex(
+                variant.secondary_factor_template: _visible_overlay_factor(
+                    factors[variant.secondary_factor_template],
                     index=base_signal.index,
                     columns=base_signal.columns,
                 ),
@@ -1216,18 +1221,27 @@ def _build_overlay_signal(
         )
     if variant.overlay_type == "bottom_filter":
         percentile = factor.rank(axis=1, pct=True)
-        return base_signal.where(percentile >= variant.filter_quantile)
+        return base_signal.where(percentile.isna() | (percentile >= variant.filter_quantile))
     if variant.overlay_type == "soft_penalty":
         percentile = factor.rank(axis=1, pct=True)
-        penalty_mask = percentile < variant.filter_quantile
+        penalty_mask = percentile.notna() & (percentile < variant.filter_quantile)
         return base_signal.where(~penalty_mask, base_signal * (1.0 - variant.penalty_strength))
     if variant.overlay_type == "soft_penalty_ramp":
         percentile = factor.rank(axis=1, pct=True)
-        active = percentile < variant.filter_quantile
+        active = percentile.notna() & (percentile < variant.filter_quantile)
         scaled = (percentile / variant.filter_quantile).clip(lower=0.0, upper=1.0)
         multiplier = 1.0 - variant.penalty_strength * (1.0 - scaled)
         return base_signal.where(~active, base_signal * multiplier)
     raise ValueError(f"unknown overlay_type: {variant.overlay_type}")
+
+
+def _visible_overlay_factor(
+    factor: pd.DataFrame,
+    *,
+    index: pd.Index,
+    columns: pd.Index,
+) -> pd.DataFrame:
+    return factor.reindex(index=index, columns=columns).shift(1)
 
 
 def _build_minute_target_price_buy_limits(

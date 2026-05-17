@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import html
 import csv
+import hashlib
 import json
 import os
 import re
+import signal
+import shutil
+import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -20,6 +26,7 @@ from vortex.notification.channel.feishu import LARK_API_BASE, FeishuChannel, Fei
 from vortex.notification.models import NotificationMessage
 from vortex.research.cogalpha import run_cogalpha_company_demo_cycle
 from vortex.runtime.workspace import Workspace
+from vortex.trade.live_gate import validate_live_trading_permission
 
 LARK_ENV_KEYS = (
     "LARK_APP_ID",
@@ -47,6 +54,15 @@ QMT_ENV_KEYS = (
     "QMT_BRIDGE_TRADING_ACCOUNT_ID",
 )
 
+XUEQIU_ENV_KEYS = (
+    "XUEQIU_CUBE_SYMBOL",
+    "XUEQIU_MARKET",
+    "XUEQIU_COOKIE",
+    "XUEQIU_COOKIE_FILE",
+    "XUEQIU_SUBMIT",
+    "XUEQIU_NOTIFICATION_PROFILE",
+)
+
 TUSHARE_ENV_KEYS = (
     "TUSHARE_TOKEN",
     "TUSHARE_POINTS",
@@ -62,7 +78,8 @@ MODEL_ENV_KEYS = (
 AUTO_RUN_STATUS_FILE = "status.json"
 DEFAULT_AUTO_PREPARE_TIME = "08:10"
 DEFAULT_AUTO_EXECUTE_TIME = "09:25"
-DEFAULT_AUTO_PRESET = "baseline_top110_large"
+DEFAULT_AUTO_PRESET = "stable_100w"
+DEFAULT_AUTO_LABEL = "业绩预告漂移策略自动编排"
 _STOCK_NAME_CACHE: dict[str, dict[str, str]] = {}
 
 
@@ -75,7 +92,7 @@ class ControlConsoleServer(ThreadingHTTPServer):
         self.workspace.initialize()
         self.jobs: dict[str, dict[str, Any]] = {}
         self.jobs_lock = threading.Lock()
-        self.runtime_state: dict[str, Any] = {"qmt_health": None}
+        self.runtime_state: dict[str, Any] = {"qmt_health": None, "xueqiu_auth": None}
         self.runtime_state_lock = threading.Lock()
         _load_workspace_env(self.workspace.root)
 
@@ -131,6 +148,10 @@ class ControlConsoleHandler(BaseHTTPRequestHandler):
                 response = _save_notification_provider(self.server.workspace.root, payload)
             elif path == "/api/config/qmt":
                 response = _save_qmt_config(self.server.workspace.root, payload)
+            elif path == "/api/config/xueqiu":
+                response = _save_xueqiu_config(self.server.workspace.root, payload)
+            elif path == "/api/xueqiu/import-cookie":
+                response = _import_xueqiu_cookie_from_browser(self.server.workspace.root, payload)
             elif path == "/api/config/trading":
                 response = _save_trading_config(self.server.workspace.root, payload)
             elif path == "/api/lark/test":
@@ -141,6 +162,25 @@ class ControlConsoleHandler(BaseHTTPRequestHandler):
                     kind="qmt.health_check",
                     name="QMT 只读健康检查",
                     action=lambda: _run_qmt_health_check(self.server),
+                )
+            elif path == "/api/xueqiu/auth-check":
+                response = _submit_console_job(
+                    self.server,
+                    kind="xueqiu.auth_check",
+                    name="雪球组合认证检查",
+                    action=lambda: _run_xueqiu_auth_check(self.server),
+                )
+            elif path == "/api/data/server-start":
+                response = _start_data_server(self.server.workspace.root)
+            elif path == "/api/data/update-now":
+                response = _submit_console_job(
+                    self.server,
+                    kind="data.update_now",
+                    name="数据立即更新",
+                    action=lambda: _submit_data_update_now(
+                        self.server.workspace.root,
+                        payload,
+                    ),
                 )
             elif path == "/api/research/cogalpha-cycle":
                 response = _submit_console_job(
@@ -172,6 +212,13 @@ class ControlConsoleHandler(BaseHTTPRequestHandler):
                         payload,
                     ),
                 )
+            elif path == "/api/strategy/earnings-forecast/auto-loop-start":
+                response = _start_earnings_forecast_auto_loop_from_payload(
+                    self.server.workspace.root,
+                    payload,
+                )
+            elif path == "/api/strategy/earnings-forecast/auto-loop-stop":
+                response = _stop_earnings_forecast_auto_loop(self.server.workspace.root)
             else:
                 self._send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -373,13 +420,20 @@ def _status_payload(server: ControlConsoleServer) -> dict[str, Any]:
         if not os.environ.get(key, "").strip()
     ]
     qmt_config = _qmt_config_from_sources(root)
+    xueqiu_config = _xueqiu_config_from_sources(root)
     with server.runtime_state_lock:
         qmt_config["health"] = server.runtime_state.get("qmt_health")
+        xueqiu_config["auth"] = server.runtime_state.get("xueqiu_auth")
     recent_runs = _list_run_manifests(root)
     strategy_tasks = _list_strategy_tasks(root)
     strategies = _strategy_catalog(root)
     trading_config = _trading_config_summary(root, strategies, qmt_config)
-    active_strategy = _active_strategy_summary(root, strategy_tasks, qmt_config.get("health"))
+    active_strategy = _active_strategy_summary(
+        root,
+        strategy_tasks,
+        qmt_config.get("health"),
+        xueqiu_config,
+    )
     data_service = _data_service_summary(root)
     active_jobs = [
         job
@@ -402,6 +456,7 @@ def _status_payload(server: ControlConsoleServer) -> dict[str, Any]:
             "env": feishu_env,
         },
         "qmt": qmt_config,
+        "xueqiu": xueqiu_config,
         "tushare": {
             "configured": bool(os.environ.get("TUSHARE_TOKEN", "").strip()),
             "permissions": os.environ.get("TUSHARE_EXTRA_PERMISSIONS", "").strip(),
@@ -414,6 +469,7 @@ def _status_payload(server: ControlConsoleServer) -> dict[str, Any]:
         },
         "actions": {
             "can_test_lark": not lark_missing,
+            "can_check_xueqiu_auth": bool(xueqiu_config.get("configured")),
             "can_run_demo_research": True,
             "strategy_prepare_requires": [
                 "start",
@@ -427,6 +483,7 @@ def _status_payload(server: ControlConsoleServer) -> dict[str, Any]:
             "recent_research_run_count": len(recent_runs),
             "pending_strategy_task_count": len(strategy_tasks),
             "strategy_count": len(strategies),
+            "xueqiu_configured": bool(xueqiu_config.get("configured")),
         },
         "active_jobs": active_jobs,
         "recent_runs": recent_runs[:5],
@@ -510,6 +567,78 @@ def _save_qmt_config(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _save_xueqiu_config(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    cube_symbol = _required_text(payload, "cube_symbol")
+    market = str(payload.get("market") or "cn").strip().lower()
+    if market not in {"cn", "us", "hk"}:
+        raise ValueError("market 必须是 cn/us/hk")
+    values = {
+        "XUEQIU_CUBE_SYMBOL": cube_symbol,
+        "XUEQIU_MARKET": market,
+        "XUEQIU_SUBMIT": "1" if bool(payload.get("submit_enabled", False)) else "0",
+    }
+    cookie = _optional_text(payload.get("cookie"))
+    cookie_file = _optional_text(payload.get("cookie_file"))
+    notification_profile = _optional_text(payload.get("notification_profile"))
+    if cookie is not None:
+        values["XUEQIU_COOKIE"] = cookie
+    if cookie_file is not None:
+        values["XUEQIU_COOKIE_FILE"] = cookie_file
+    if notification_profile is not None:
+        values["XUEQIU_NOTIFICATION_PROFILE"] = notification_profile
+    _merge_env_file(root / ".env", values)
+    os.environ.update(values)
+    return {
+        "status": "saved",
+        "env_file": str(root / ".env"),
+        "xueqiu": _xueqiu_config_from_sources(root),
+    }
+
+
+def _import_xueqiu_cookie_from_browser(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    extracted = _extract_xueqiu_cookie_from_browsers()
+    if extracted.get("status") != "found":
+        return {
+            "status": "not_found",
+            "cookie": {
+                "status": extracted.get("status"),
+                "message": extracted.get("message") or "没有在本机浏览器里发现可用的雪球 Cookie。",
+                "checked_sources": extracted.get("checked_sources") or [],
+            },
+            "xueqiu": _xueqiu_config_from_sources(root),
+        }
+
+    cube_symbol = (
+        _optional_text(payload.get("cube_symbol"))
+        or _optional_text(os.environ.get("XUEQIU_CUBE_SYMBOL"))
+        or _optional_text((_latest_xueqiu_sync_summary(root) or {}).get("cube_symbol"))
+    )
+    market = _optional_text(payload.get("market")) or _optional_text(os.environ.get("XUEQIU_MARKET")) or "cn"
+    if market not in {"cn", "us", "hk"}:
+        raise ValueError("market 必须是 cn/us/hk")
+    values = {
+        "XUEQIU_COOKIE": str(extracted["cookie"]),
+        "XUEQIU_MARKET": market,
+    }
+    if cube_symbol:
+        values["XUEQIU_CUBE_SYMBOL"] = cube_symbol
+    if not _optional_text(os.environ.get("XUEQIU_SUBMIT")):
+        values["XUEQIU_SUBMIT"] = "0"
+    _merge_env_file(root / ".env", values)
+    os.environ.update(values)
+    return {
+        "status": "imported",
+        "env_file": str(root / ".env"),
+        "cookie": {
+            "masked": _masked(str(extracted["cookie"])),
+            "source": extracted.get("source"),
+            "cookie_count": extracted.get("cookie_count"),
+            "names": extracted.get("names") or [],
+        },
+        "xueqiu": _xueqiu_config_from_sources(root),
+    }
+
+
 def _qmt_config_from_sources(root: Path) -> dict[str, Any]:
     env_url = _qmt_bridge_url_from_env()
     env_account = _qmt_account_from_env()
@@ -541,6 +670,406 @@ def _qmt_config_from_sources(root: Path) -> dict[str, Any]:
         "persisted": bool(env_url and env_account),
         "env": {key: _masked(os.environ.get(key, "")) for key in QMT_ENV_KEYS},
     }
+
+
+def _xueqiu_config_from_sources(root: Path) -> dict[str, Any]:
+    latest_sync = _latest_xueqiu_sync_summary(root)
+    env_cube = _optional_text(os.environ.get("XUEQIU_CUBE_SYMBOL"))
+    cube_symbol = env_cube or _optional_text(latest_sync.get("cube_symbol")) or ""
+    market = _optional_text(os.environ.get("XUEQIU_MARKET")) or "cn"
+    cookie = _optional_text(os.environ.get("XUEQIU_COOKIE"))
+    cookie_file = _optional_text(os.environ.get("XUEQIU_COOKIE_FILE"))
+    missing: list[str] = []
+    if not cube_symbol:
+        missing.append("XUEQIU_CUBE_SYMBOL")
+    if not cookie and not cookie_file:
+        missing.append("XUEQIU_COOKIE_OR_FILE")
+    return {
+        "configured": not missing,
+        "missing": missing,
+        "cube_symbol": cube_symbol,
+        "market": market,
+        "cookie_configured": bool(cookie or cookie_file),
+        "cookie_file": cookie_file or "",
+        "submit_enabled": _env_bool("XUEQIU_SUBMIT", False),
+        "notification_profile": _optional_text(os.environ.get("XUEQIU_NOTIFICATION_PROFILE")) or "",
+        "source": "workspace_env" if env_cube else (latest_sync.get("report_path") or "not_found"),
+        "persisted": bool(env_cube),
+        "latest_sync": latest_sync,
+        "env": {key: _masked(os.environ.get(key, "")) for key in XUEQIU_ENV_KEYS},
+    }
+
+
+def _run_xueqiu_auth_check(server: ControlConsoleServer) -> dict[str, Any]:
+    root = server.workspace.root
+    _load_workspace_env(root)
+    xueqiu_config = _xueqiu_config_from_sources(root)
+    result = _probe_xueqiu_auth(xueqiu_config)
+    if not bool(result.get("authenticated")):
+        result["notification"] = _notify_xueqiu_auth_check_failure(root, result)
+    with server.runtime_state_lock:
+        server.runtime_state["xueqiu_auth"] = result
+    return result
+
+
+def _notify_xueqiu_auth_check_failure(root: Path, result: dict[str, Any]) -> dict[str, Any]:
+    from vortex.notification.service import NotificationService
+    from vortex.runtime.database import Database
+
+    workspace = Workspace(Path(root).expanduser())
+    db = Database(workspace.db_path)
+    db.initialize_tables()
+    provider = _notification_provider_from_env()
+    try:
+        message = NotificationMessage(
+            event_type="trade.xueqiu.auth_check_failed",
+            notification_type="trade_auth_check_failed",
+            severity="warning",
+            title="雪球组合认证检查失败",
+            summary=(
+                f"雪球组合 {result.get('cube_symbol') or '-'} 认证检查未通过："
+                f"{result.get('status') or 'unknown'}。{result.get('error') or ''}"
+            ),
+            impact="雪球组合旁路同步不可用；QMT 主执行链路不受影响。",
+            suggested_actions=(
+                "在设置页确认雪球组合 ID。",
+                "点击“从浏览器读取 Cookie”，或打开雪球登录页后重新读取。",
+                "重新点击认证检查。",
+            ),
+            detail={
+                "cube_symbol": result.get("cube_symbol"),
+                "status": result.get("status"),
+                "error_code": result.get("error_code"),
+                "provider": provider,
+            },
+        )
+        deliveries = NotificationService(db).notify(
+            message,
+            {"enabled": True, "level": "warning", "channel": provider},
+        )
+        return {
+            "status": "sent" if any(item.get("status") == "sent" for item in deliveries) else "recorded",
+            "provider": provider,
+            "deliveries": deliveries,
+        }
+    finally:
+        db.close()
+
+
+def _probe_xueqiu_auth(xueqiu_config: dict[str, Any]) -> dict[str, Any]:
+    from vortex.trade.xueqiu import XueqiuConfig, check_xueqiu_auth
+
+    cube_symbol = _optional_text(xueqiu_config.get("cube_symbol"))
+    if not cube_symbol:
+        return {
+            "status": "missing_config",
+            "authenticated": False,
+            "login_required": False,
+            "cube_symbol": "",
+            "checked_at": _now(),
+            "error": "缺少 XUEQIU_CUBE_SYMBOL",
+        }
+    cookie = _optional_text(os.environ.get("XUEQIU_COOKIE"))
+    cookie_file = _optional_text(os.environ.get("XUEQIU_COOKIE_FILE"))
+    if not cookie and not cookie_file:
+        return {
+            "status": "missing_cookie",
+            "authenticated": False,
+            "login_required": False,
+            "cube_symbol": cube_symbol,
+            "checked_at": _now(),
+            "error": "缺少 XUEQIU_COOKIE 或 XUEQIU_COOKIE_FILE",
+        }
+    return check_xueqiu_auth(
+        config=XueqiuConfig(
+            cube_symbol=cube_symbol,
+            market=str(xueqiu_config.get("market") or "cn"),
+            cookie=cookie,
+            cookie_file=cookie_file,
+        )
+    )
+
+
+def _extract_xueqiu_cookie_from_browsers() -> dict[str, Any]:
+    tab_result = _extract_xueqiu_cookie_from_browser_tabs()
+    if tab_result.get("status") == "found":
+        return tab_result
+
+    checked: list[str] = []
+    encrypted_seen = 0
+    for path in _browser_cookie_paths():
+        checked.append(str(path))
+        rows = _read_xueqiu_cookie_rows(path)
+        if not rows:
+            continue
+        cookies: list[tuple[str, str]] = []
+        for row in rows:
+            value = _optional_text(row.get("value"))
+            encrypted_value = row.get("encrypted_value")
+            if value is None and encrypted_value:
+                encrypted_seen += 1
+                value = _decrypt_browser_cookie(encrypted_value, str(row.get("host_key") or ""))
+            if value is None:
+                continue
+            name = _optional_text(row.get("name"))
+            if name is None:
+                continue
+            cookies.append((name, value))
+        if cookies:
+            unique: dict[str, str] = {}
+            for name, value in cookies:
+                unique[name] = value
+            return {
+                "status": "found",
+                "cookie": "; ".join(f"{name}={value}" for name, value in sorted(unique.items())),
+                "source": str(path),
+                "cookie_count": len(unique),
+                "names": sorted(unique),
+                "checked_sources": checked,
+            }
+    if encrypted_seen:
+        return {
+            "status": "encrypted_unreadable",
+            "message": "发现了雪球 Cookie 记录，但无法解密。可以先关闭 Chrome 后重试，或手工粘贴 Cookie。",
+            "checked_sources": checked,
+        }
+    if tab_result.get("status") in {"javascript_disabled", "empty_cookie"}:
+        return {
+            "status": tab_result.get("status"),
+            "message": tab_result.get("message"),
+            "checked_sources": [*(tab_result.get("checked_sources") or []), *checked],
+        }
+    return {
+        "status": "not_found",
+        "message": "没有在 Chrome/Codex 浏览器 Cookie 数据库中发现 xueqiu.com 记录，也没有发现可读取的 Chrome 雪球登录标签。",
+        "checked_sources": [*(tab_result.get("checked_sources") or []), *checked],
+    }
+
+
+def _extract_xueqiu_cookie_from_browser_tabs() -> dict[str, Any]:
+    osascript = shutil.which("osascript")
+    if not osascript:
+        return {"status": "unsupported", "message": "本机没有 osascript，无法读取当前 Chrome 标签。"}
+    script = r'''
+tell application "Google Chrome"
+  set output to ""
+  repeat with w in windows
+    repeat with t in tabs of w
+      set u to URL of t
+      if u contains "xueqiu.com" then
+        try
+          set cookieText to execute t javascript "document.cookie"
+          if cookieText is not "" then
+            return "FOUND	" & u & "	" & cookieText
+          end if
+          set output to output & "EMPTY	" & u & linefeed
+        on error errMsg number errNum
+          set output to output & "ERROR	" & u & "	" & errNum & "	" & errMsg & linefeed
+        end try
+      end if
+    end repeat
+  end repeat
+  if output is "" then return "NO_TABS"
+  return output
+end tell
+'''
+    process = subprocess.run(
+        [osascript],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    output = (process.stdout or "").strip()
+    error = (process.stderr or "").strip()
+    if process.returncode != 0 and not output:
+        return {
+            "status": "tab_read_failed",
+            "message": error or "读取 Chrome 雪球标签失败。",
+        }
+    if output == "NO_TABS":
+        return {"status": "no_tabs", "message": "当前 Chrome 没有打开 xueqiu.com 标签。"}
+    checked_sources: list[str] = []
+    errors: list[str] = []
+    empty_seen = False
+    for line in output.splitlines():
+        parts = line.split("\t")
+        if not parts:
+            continue
+        kind = parts[0]
+        if kind == "FOUND" and len(parts) >= 3:
+            url = parts[1]
+            cookie = parts[2]
+            names = _cookie_names(cookie)
+            return {
+                "status": "found",
+                "cookie": cookie,
+                "source": f"chrome_tab:{url}",
+                "cookie_count": len(names),
+                "names": names,
+                "checked_sources": [f"chrome_tab:{url}"],
+            }
+        if kind == "EMPTY" and len(parts) >= 2:
+            empty_seen = True
+            checked_sources.append(f"chrome_tab:{parts[1]}")
+        elif kind == "ERROR" and len(parts) >= 4:
+            checked_sources.append(f"chrome_tab:{parts[1]}")
+            errors.append(parts[3])
+    joined_errors = "\n".join(errors)
+    if "AppleScript" in joined_errors or "JavaScript" in joined_errors or "Apple 事件" in joined_errors:
+        return {
+            "status": "javascript_disabled",
+            "message": (
+                "Chrome 已打开雪球标签，但禁止通过 AppleScript 读取当前页面 Cookie。"
+                "请在 Chrome 菜单“查看 -> 开发者 -> 允许 Apple 事件中的 JavaScript”开启后重试。"
+            ),
+            "checked_sources": checked_sources,
+        }
+    if empty_seen:
+        return {
+            "status": "empty_cookie",
+            "message": "Chrome 雪球标签可访问，但当前页面没有可读取 Cookie；请确认已在该标签登录雪球后重试。",
+            "checked_sources": checked_sources,
+        }
+    return {
+        "status": "tab_read_failed",
+        "message": joined_errors or "读取 Chrome 雪球标签失败。",
+        "checked_sources": checked_sources,
+    }
+
+
+def _cookie_names(cookie: str) -> list[str]:
+    names: list[str] = []
+    for part in cookie.split(";"):
+        if "=" not in part:
+            continue
+        name = part.split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+
+def _browser_cookie_paths() -> list[Path]:
+    home = Path.home()
+    roots = [
+        home / "Library" / "Application Support" / "Google" / "Chrome",
+        home / "Library" / "Application Support" / "Chromium",
+        home / "Library" / "Application Support" / "Microsoft Edge",
+        home / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser",
+        home / "Library" / "Application Support" / "Codex",
+    ]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        candidates.extend(root.glob("*/Cookies"))
+        candidates.extend(root.glob("*/Network/Cookies"))
+        candidates.extend(root.glob("Partitions/*/Cookies"))
+        direct = root / "Cookies"
+        if direct.exists():
+            candidates.append(direct)
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        paths.append(path)
+    return paths
+
+
+def _read_xueqiu_cookie_rows(path: Path) -> list[dict[str, Any]]:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT host_key, name, value, encrypted_value, expires_utc
+            FROM cookies
+            WHERE host_key LIKE '%xueqiu.com%'
+            ORDER BY host_key, name
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - best effort close.
+                pass
+    return [dict(row) for row in rows]
+
+
+def _decrypt_browser_cookie(encrypted_value: Any, host_key: str) -> str | None:
+    raw = bytes(encrypted_value)
+    if not raw:
+        return None
+    if not raw.startswith((b"v10", b"v11")):
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    password = _chrome_safe_storage_password()
+    openssl = shutil.which("openssl")
+    if not password or not openssl:
+        return None
+    key = hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), b"saltysalt", 1003, dklen=16)
+    process = subprocess.run(
+        [
+            openssl,
+            "enc",
+            "-d",
+            "-aes-128-cbc",
+            "-K",
+            key.hex(),
+            "-iv",
+            (b" " * 16).hex(),
+            "-nopad",
+        ],
+        input=raw[3:],
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0 or not process.stdout:
+        return None
+    plaintext = _strip_pkcs7_padding(process.stdout)
+    host_hash = hashlib.sha256(host_key.encode("utf-8")).digest()
+    if plaintext.startswith(host_hash):
+        plaintext = plaintext[len(host_hash):]
+    try:
+        return plaintext.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _strip_pkcs7_padding(value: bytes) -> bytes:
+    if not value:
+        return value
+    padding = value[-1]
+    if 1 <= padding <= 16 and value.endswith(bytes([padding]) * padding):
+        return value[:-padding]
+    return value
+
+
+def _chrome_safe_storage_password() -> str | None:
+    for service in ("Chrome Safe Storage", "Chromium Safe Storage", "Microsoft Edge Safe Storage", "Brave Safe Storage"):
+        process = subprocess.run(
+            ["security", "find-generic-password", "-w", "-s", service],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        password = process.stdout.strip()
+        if process.returncode == 0 and password:
+            return password
+    return None
 
 
 def _active_strategy_id(strategies: list[dict[str, Any]]) -> str:
@@ -815,11 +1344,13 @@ def _active_strategy_summary(
     root: Path,
     strategy_tasks: list[dict[str, Any]],
     qmt_health: dict[str, Any] | None = None,
+    xueqiu_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     status_path = root / "state" / "strategy" / "earnings_forecast_auto" / AUTO_RUN_STATUS_FILE
     service_status = _read_json_file(status_path)
     latest_task = _latest_strategy_task_payload(strategy_tasks)
     target_summary = _target_portfolio_summary(root, latest_task)
+    xueqiu = _latest_xueqiu_sync_summary(root, latest_task)
     diagnostics = latest_task.get("target_diagnostics") if isinstance(latest_task.get("target_diagnostics"), dict) else {}
     quality = latest_task.get("quality_summary") if isinstance(latest_task.get("quality_summary"), dict) else {}
     execution = _latest_execution_summary(root, latest_task)
@@ -850,6 +1381,11 @@ def _active_strategy_summary(
         "target": target_summary,
         "rebalance": _planned_rebalance_summary(root, target_summary),
         "live_rebalance": _live_rebalance_summary(target_summary, qmt_health),
+        "xueqiu": {
+            **xueqiu,
+            "configured": bool((xueqiu_config or {}).get("configured")),
+            "auth": (xueqiu_config or {}).get("auth"),
+        },
         "execution": execution,
         "nav": nav,
         "quality": {
@@ -859,7 +1395,7 @@ def _active_strategy_summary(
             "review_symbols": quality.get("review_symbols") or [],
             "watch_symbols": quality.get("watch_symbols") or [],
         },
-        "workflow": _strategy_workflow_steps(latest_task, diagnostics, execution, service_status),
+        "workflow": _strategy_workflow_steps(latest_task, diagnostics, execution, service_status, xueqiu),
     }
 
 
@@ -878,19 +1414,31 @@ def _latest_strategy_task_payload(strategy_tasks: list[dict[str, Any]]) -> dict[
 def _auto_service_summary(payload: dict[str, Any], status_path: Path) -> dict[str, Any]:
     config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
     last_tick = payload.get("last_tick") if isinstance(payload.get("last_tick"), dict) else {}
+    pid = payload.get("pid")
+    pid_alive = _is_pid_alive(pid)
+    effective_status = payload.get("service_status") or "unknown"
+    if effective_status == "running" and not pid_alive:
+        effective_status = "stale_dead_pid"
     return {
         "status_path": str(status_path) if status_path.exists() else "",
         "service_status": payload.get("service_status") or "unknown",
+        "effective_service_status": effective_status,
         "loop_mode": payload.get("loop_mode") or "",
         "pid": payload.get("pid"),
+        "pid_alive": pid_alive,
         "started_at": payload.get("started_at"),
         "updated_at": payload.get("updated_at"),
         "last_tick_status": payload.get("last_tick_status"),
         "last_tick_at": payload.get("last_tick_at"),
         "last_error": payload.get("last_error"),
+        "preset_name": config.get("preset_name") or DEFAULT_AUTO_PRESET,
+        "profile_name": config.get("profile_name") or "",
         "prepare_time": config.get("prepare_time") or DEFAULT_AUTO_PREPARE_TIME,
         "execute_time": config.get("execute_time") or DEFAULT_AUTO_EXECUTE_TIME,
         "allow_trading": bool(config.get("allow_trading")),
+        "xueqiu_enabled": bool(config.get("xueqiu_enabled")),
+        "xueqiu_cube_symbol": config.get("xueqiu_cube_symbol") or "",
+        "xueqiu_submit": bool(config.get("xueqiu_submit")),
         "last_skipped": last_tick.get("skipped") or [],
     }
 
@@ -1204,6 +1752,114 @@ def _latest_execution_summary(root: Path, task_payload: dict[str, Any]) -> dict[
     }
 
 
+def _latest_xueqiu_sync_summary(root: Path, task_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    task = task_payload or {}
+    report_path_text = _optional_text(task.get("xueqiu_sync_report_path"))
+    report_path = Path(report_path_text) if report_path_text else _latest_file(root / "trade" / "xueqiu", "xueqiu_report.json")
+    report_source = "xueqiu_report"
+    if not report_path:
+        report_path = _latest_file(root / "trade" / "xueqiu", "xueqiu_browser_submit_report.json")
+        report_source = "browser_submit"
+    report = _read_json_file(report_path) if report_path and report_path.exists() else {}
+    changed_symbols = report.get("changed_symbols") if isinstance(report.get("changed_symbols"), list) else []
+    payload_path_text = _optional_text(report.get("payload_path"))
+    payload_path = Path(payload_path_text) if payload_path_text else (report_path.parent / "rebalance_payload.json" if report_path else None)
+    planned_holdings = _xueqiu_payload_holdings(payload_path)
+    changed_symbol_set = {str(item) for item in changed_symbols}
+    changed_holdings = [
+        item
+        for item in planned_holdings
+        if item.get("proactive") or str(item.get("symbol") or "") in changed_symbol_set
+    ]
+    status = (
+        _optional_text(task.get("xueqiu_sync_status"))
+        or _optional_text(report.get("status"))
+        or ("error" if task.get("xueqiu_sync_error") else "")
+    )
+    if not status:
+        return {
+            "status": "not_enabled",
+            "cube_symbol": _optional_text(task.get("xueqiu_cube_symbol")) or "",
+            "report_path": "",
+            "payload_path": "",
+            "changed_symbols": [],
+            "changed_count": 0,
+            "planned_holdings": [],
+            "changed_holdings": [],
+            "planned_holding_count": 0,
+        }
+    return {
+        "status": status,
+        "source": report_source,
+        "sync_id": report.get("sync_id") or "",
+        "cube_symbol": _optional_text(task.get("xueqiu_cube_symbol")) or _optional_text(report.get("cube_symbol")) or "",
+        "submitted": bool(report.get("submitted")),
+        "trade_date": report.get("trade_date") or task.get("trade_date") or "",
+        "portfolio_id": report.get("portfolio_id") or "",
+        "strategy_version": report.get("strategy_version") or task.get("strategy_version") or "",
+        "target_position_count": report.get("target_position_count"),
+        "xueqiu_holding_count": report.get("xueqiu_holding_count"),
+        "cash_pct": report.get("cash_pct") if report.get("cash_pct") is not None else report.get("target_cash_pct"),
+        "weight_sum_pct": report.get("weight_sum_pct")
+        if report.get("weight_sum_pct") is not None
+        else report.get("target_weight_sum_pct"),
+        "changed_symbols": changed_symbols,
+        "changed_count": len(changed_symbols),
+        "payload_path": str(payload_path or ""),
+        "report_path": str(report_path or ""),
+        "created_at": report.get("created_at") or report.get("finished_at") or report.get("started_at") or _mtime_iso(report_path),
+        "error": task.get("xueqiu_sync_error") or report.get("error") or "",
+        "error_code": task.get("xueqiu_sync_error_code") or report.get("error_code") or "",
+        "login_required": bool(task.get("xueqiu_sync_login_required") or report.get("login_required")),
+        "notification": task.get("xueqiu_auth_notification") or {},
+        "planned_holdings": planned_holdings,
+        "changed_holdings": changed_holdings,
+        "planned_holding_count": len(planned_holdings),
+    }
+
+
+def _xueqiu_payload_holdings(payload_path: Path | None) -> list[dict[str, Any]]:
+    if payload_path is None or not payload_path.exists():
+        return []
+    payload = _read_json_file(payload_path)
+    raw_holdings = payload.get("holdings")
+    if isinstance(raw_holdings, str):
+        try:
+            parsed = json.loads(raw_holdings)
+        except json.JSONDecodeError:
+            return []
+    else:
+        parsed = raw_holdings
+    if not isinstance(parsed, list):
+        return []
+    return [_xueqiu_holding_view(item) for item in parsed if isinstance(item, dict)]
+
+
+def _xueqiu_holding_view(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": _optional_text(item.get("stock_symbol") or item.get("code")) or "",
+        "name": _optional_text(item.get("stock_name") or item.get("textname") or item.get("name")) or "",
+        "weight": _float_or_none(item.get("weight")),
+        "price": _float_or_none(item.get("price") or item.get("current")),
+        "cost_price": _first_positive_float(
+            item.get("cost_price"),
+            item.get("costPrice"),
+            item.get("avg_cost"),
+            item.get("avgCost"),
+            item.get("average_cost"),
+            item.get("averageCost"),
+            item.get("position_cost"),
+            item.get("positionCost"),
+            item.get("holding_cost"),
+            item.get("holdingCost"),
+            item.get("buy_price"),
+            item.get("buyPrice"),
+        ),
+        "proactive": bool(item.get("proactive")),
+        "segment": _optional_text(item.get("segment_name") or item.get("ind_name")) or "",
+    }
+
+
 def _strategy_nav_summary(root: Path) -> dict[str, Any]:
     binding_path = _latest_file(root / "state" / "nav", "*.json")
     if not binding_path:
@@ -1238,13 +1894,25 @@ def _strategy_nav_summary(root: Path) -> dict[str, Any]:
     }
 
 
+def _is_pid_alive(pid: object) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _strategy_workflow_steps(
     latest_task: dict[str, Any],
     diagnostics: dict[str, Any],
     execution: dict[str, Any],
     service_status: dict[str, Any],
+    xueqiu: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     freshness = _data_freshness_summary(diagnostics)
+    xueqiu_status = str((xueqiu or {}).get("status") or "not_enabled")
     return [
         {
             "name": "数据新鲜度门禁",
@@ -1272,6 +1940,13 @@ def _strategy_workflow_steps(
             "detail": f"订单 {execution.get('order_count') or 0}；成交 {execution.get('fill_count') or 0}",
         },
         {
+            "name": "雪球组合同步",
+            "status": xueqiu_status,
+            "detail": (xueqiu or {}).get("report_path")
+            or (xueqiu or {}).get("error")
+            or "未启用或尚无同步记录",
+        },
+        {
             "name": "净值快照",
             "status": "ok" if execution.get("risk_passed") else "waiting",
             "detail": str((service_status.get("last_tick") or {}).get("nav_snapshot") or "等待执行后记录"),
@@ -1283,29 +1958,83 @@ def _data_service_summary(root: Path) -> dict[str, Any]:
     payload = _read_json_file(root / "state" / "live-service-health-latest.json")
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     active_tasks = data.get("active_tasks") if isinstance(data.get("active_tasks"), list) else []
+    server = _vortex_server_status(root)
     scheduled_profiles = payload.get("scheduled_profiles") if isinstance(payload.get("scheduled_profiles"), list) else []
     log_path = _data_update_log_path(root, active_tasks)
     progress = _parse_data_update_log(log_path) if log_path else {}
     latest_run = dict(data.get("latest_run") or {})
-    if progress.get("status") in {"success", "failed"} and (
-        not latest_run.get("run_id") or latest_run.get("run_id") == progress.get("run_id")
-    ):
-        latest_run.update(
-            {
-                "run_id": progress.get("run_id") or latest_run.get("run_id"),
-                "status": progress.get("status"),
-                "finished_at": progress.get("finished_at") or latest_run.get("finished_at"),
-                "total_rows": progress.get("total_rows") or latest_run.get("total_rows"),
-            }
-        )
+    progress_is_final = progress.get("status") in {"success", "failed"}
+    progress_is_latest = bool(progress.get("run_id")) and (
+        not latest_run.get("run_id") or latest_run.get("run_id") != progress.get("run_id")
+    )
+    if progress_is_final and (progress_is_latest or latest_run.get("run_id") == progress.get("run_id")):
+        base_latest_run = {} if progress_is_latest else latest_run
+        latest_run = {
+            **base_latest_run,
+            "run_id": progress.get("run_id") or latest_run.get("run_id"),
+            "status": progress.get("status"),
+            "finished_at": progress.get("finished_at") or latest_run.get("finished_at"),
+            "total_rows": progress.get("total_rows") or latest_run.get("total_rows"),
+        }
+        if progress_is_latest:
+            latest_run.setdefault("profile", "default")
+            latest_run.setdefault("action", "update")
         active_tasks = [
             task
             for task in active_tasks
-            if not (isinstance(task, dict) and task.get("run_id") == progress.get("run_id"))
+            if not isinstance(task, dict) or task.get("run_id") not in {progress.get("run_id"), latest_run.get("run_id")}
         ]
+    elif progress_is_final:
+        progress_latest = {
+            "run_id": progress.get("run_id"),
+            "status": progress.get("status"),
+            "finished_at": progress.get("finished_at"),
+            "total_rows": progress.get("total_rows"),
+            "action": "update",
+        }
+        latest_run = progress_latest if progress_latest.get("run_id") else latest_run
+        active_tasks = [
+            task
+            for task in active_tasks
+            if not isinstance(task, dict) or task.get("run_id") != progress.get("run_id")
+        ]
+    latest_success_update = dict(data.get("latest_success_update") or {})
+    latest_completed_update = latest_success_update
+    if progress_is_final and progress.get("run_id"):
+        latest_completed_update = {
+            "run_id": progress.get("run_id"),
+            "status": progress.get("status"),
+            "finished_at": progress.get("finished_at"),
+            "total_rows": progress.get("total_rows"),
+            "snapshot_id": progress.get("snapshot_id"),
+        }
+        if progress.get("status") == "success":
+            latest_success_update = {
+                **latest_success_update,
+                **latest_completed_update,
+            }
+    active_tasks = [
+        task
+        for task in active_tasks
+        if not (isinstance(task, dict) and task.get("pid") and not _is_pid_alive(task.get("pid")))
+    ]
+    active_task_count = len(active_tasks)
+    running_tasks = int(server.get("running_tasks") or 0)
+    pending_tasks = int(server.get("pending_tasks") or 0)
+    current_task_reason = ""
+    if active_task_count == 0 and running_tasks == 0 and pending_tasks == 0:
+        if progress_is_final:
+            current_task_reason = "当前没有任务：最近一次数据更新已结束，等待下次调度或手动触发。"
+        elif server.get("pid_alive"):
+            current_task_reason = "当前没有任务：数据服务进程在线，但队列空闲。"
+        else:
+            current_task_reason = "当前没有任务：数据服务进程未运行。"
+    elif active_task_count == 0 and (running_tasks or pending_tasks):
+        current_task_reason = "任务队列有运行/等待记录，但健康文件尚未刷新。"
     return {
         "checked_at": payload.get("checked_at"),
         "status": payload.get("status") or "unknown",
+        "server": server,
         "alerts": payload.get("alerts") or [],
         "scheduled_profiles": [
             {
@@ -1316,23 +2045,51 @@ def _data_service_summary(root: Path) -> dict[str, Any]:
             if isinstance(profile, dict)
         ],
         "latest_run": latest_run,
-        "latest_success_update": data.get("latest_success_update") or {},
+        "latest_success_update": latest_success_update,
+        "latest_completed_update": latest_completed_update,
         "latest_snapshot": data.get("latest_snapshot") or {},
         "progress": progress,
         "active_tasks": active_tasks,
-        "active_task_count": len(active_tasks),
+        "active_task_count": active_task_count,
+        "current_task_reason": current_task_reason,
+    }
+
+
+def _vortex_server_status(root: Path) -> dict[str, Any]:
+    try:
+        from vortex.runtime.server import Server
+
+        server = Server(root)
+        server.workspace.ensure_initialized()
+        status = server.status()
+    except Exception as exc:  # noqa: BLE001 - status must remain renderable.
+        return {"pid": None, "pid_alive": False, "error": str(exc), "running_tasks": 0, "pending_tasks": 0}
+    return {
+        "pid": status.get("pid"),
+        "pid_alive": bool(status.get("pid_alive")),
+        "running_tasks": int(status.get("running_tasks") or 0),
+        "pending_tasks": int(status.get("pending_tasks") or 0),
+        "can_accept_task": bool(status.get("can_accept_task")),
+        "draining": bool(status.get("draining")),
+        "scheduled_profiles": status.get("scheduled_profiles") or [],
     }
 
 
 def _data_update_log_path(root: Path, active_tasks: list[Any]) -> Path | None:
+    candidates: list[Path] = []
     for task in active_tasks:
         if not isinstance(task, dict):
             continue
         log_path = _optional_text(task.get("log_path"))
         if log_path and Path(log_path).exists():
-            return Path(log_path)
+            candidates.append(Path(log_path))
     latest = _latest_file(root / "state" / "logs", "data-update-*.log")
-    return latest if latest and latest.exists() else None
+    if latest and latest.exists():
+        candidates.append(latest)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
 def _parse_data_update_log(path: Path | None) -> dict[str, Any]:
@@ -1472,7 +2229,7 @@ def _prepare_earnings_forecast_from_payload(root: Path, payload: dict[str, Any])
         qmt_bridge_url=_payload_text_or_env(payload, "qmt_bridge_url", "QMT_BRIDGE_URL", "QMT_BRIDGE_BASE_URL"),
         qmt_bridge_token=_payload_text_or_env_optional(payload, "qmt_bridge_token", "QMT_BRIDGE_TOKEN", "QMT_BRIDGE_API_KEY"),
         qmt_account_id=_payload_text_or_env_optional(payload, "qmt_account_id", "QMT_ACCOUNT_ID", "QMT_BRIDGE_TRADING_ACCOUNT_ID"),
-        preset_name=str(payload.get("preset") or "baseline_top110_large"),
+        preset_name=str(payload.get("preset") or DEFAULT_AUTO_PRESET),
         label=_optional_text(payload.get("label")),
         portfolio_notional=float(payload.get("portfolio_notional") or 1_000_000.0),
         min_position_value=float(payload.get("min_position_value") or 3_000.0),
@@ -1484,24 +2241,221 @@ def _prepare_earnings_forecast_from_payload(root: Path, payload: dict[str, Any])
 def _run_earnings_forecast_auto_once_from_payload(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     from vortex.strategy.earnings_forecast_live import run_earnings_forecast_auto_once
 
-    allow_trading = bool(payload.get("allow_trading", False))
-    if allow_trading and payload.get("confirm_live_trading") != "我确认允许执行交易":
-        raise ValueError("允许交易必须填写确认语：我确认允许执行交易")
+    qmt_account_id = _payload_text_or_env_optional(payload, "qmt_account_id", "QMT_ACCOUNT_ID", "QMT_BRIDGE_TRADING_ACCOUNT_ID")
+    allow_trading = _console_allow_trading(payload, qmt_account_id=qmt_account_id)
     return run_earnings_forecast_auto_once(
         root,
         start=_required_text(payload, "start"),
         profile_name=str(payload.get("profile") or "default"),
         qmt_bridge_url=_payload_text_or_env(payload, "qmt_bridge_url", "QMT_BRIDGE_URL", "QMT_BRIDGE_BASE_URL"),
         qmt_bridge_token=_payload_text_or_env_optional(payload, "qmt_bridge_token", "QMT_BRIDGE_TOKEN", "QMT_BRIDGE_API_KEY"),
-        qmt_account_id=_payload_text_or_env_optional(payload, "qmt_account_id", "QMT_ACCOUNT_ID", "QMT_BRIDGE_TRADING_ACCOUNT_ID"),
-        preset_name=str(payload.get("preset") or "baseline_top110_large"),
-        label=str(payload.get("label") or "auto_run"),
-        prepare_time=str(payload.get("prepare_time") or "08:10"),
-        execute_time=str(payload.get("execute_time") or "09:25"),
+        qmt_account_id=qmt_account_id,
+        preset_name=str(payload.get("preset") or DEFAULT_AUTO_PRESET),
+        label=str(payload.get("label") or DEFAULT_AUTO_LABEL),
+        prepare_time=str(payload.get("prepare_time") or DEFAULT_AUTO_PREPARE_TIME),
+        execute_time=str(payload.get("execute_time") or DEFAULT_AUTO_EXECUTE_TIME),
         allow_trading=allow_trading,
         nav_initial_equity=float(payload.get("nav_initial_equity") or 1_000_000.0),
         nav_benchmark=str(payload.get("nav_benchmark") or "000852.SH"),
+        **_xueqiu_kwargs_from_payload(payload),
     )
+
+
+def _submit_data_update_now(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    from vortex.cli import _submit_data_background_task
+
+    server_status = _vortex_server_status(root)
+    server_started: dict[str, Any] | None = None
+    if not server_status.get("pid_alive"):
+        server_started = _start_data_server(root)
+        time.sleep(0.4)
+    result = _submit_data_background_task(
+        root=root,
+        profile_name=str(payload.get("profile") or "default"),
+        action="update",
+        fmt="json",
+        emit_output=False,
+    )
+    return {
+        "status": "submitted",
+        "server_started": server_started,
+        "task": result,
+    }
+
+
+def _console_allow_trading(payload: dict[str, Any], *, qmt_account_id: str | None) -> bool:
+    return validate_live_trading_permission(
+        enable_trading=bool(payload.get("allow_trading", False)),
+        disable_trading=False,
+        account_id=qmt_account_id,
+        allowed_account_ids=payload.get("allowed_account_id") or payload.get("allowed_account_ids") or [],
+        confirmation=str(payload.get("confirm_trading") or payload.get("confirm_live_trading") or ""),
+        option_label="allow_trading",
+        allowed_account_label="allowed account",
+    )
+
+
+def _start_data_server(root: Path) -> dict[str, Any]:
+    _load_workspace_env(root)
+    server_status = _vortex_server_status(root)
+    if server_status.get("pid_alive"):
+        return {"status": "already_running", "pid": server_status.get("pid"), "server": server_status}
+    log_path = _background_log_path(root, "server-console-start")
+    command = [
+        sys.executable,
+        "-m",
+        "vortex",
+        "server",
+        "start",
+        "--root",
+        str(root),
+        "--foreground",
+    ]
+    process = _launch_console_background_process(command, log_path)
+    time.sleep(0.5)
+    if process.poll() is not None:
+        raise RuntimeError(f"数据服务启动失败：{_tail_text(log_path)}")
+    return {"status": "started", "pid": process.pid, "log_path": str(log_path)}
+
+
+def _start_earnings_forecast_auto_loop_from_payload(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    _load_workspace_env(root)
+    status_path = root / "state" / "strategy" / "earnings_forecast_auto" / AUTO_RUN_STATUS_FILE
+    service = _auto_service_summary(_read_json_file(status_path), status_path)
+    if service.get("effective_service_status") == "running" and service.get("pid_alive"):
+        return {"status": "already_running", "pid": service.get("pid"), "service": service}
+
+    qmt_account_id = _payload_text_or_env_optional(payload, "qmt_account_id", "QMT_ACCOUNT_ID", "QMT_BRIDGE_TRADING_ACCOUNT_ID")
+    allow_trading = _console_allow_trading(payload, qmt_account_id=qmt_account_id)
+
+    command = [
+        sys.executable,
+        "-m",
+        "vortex",
+        "strategy",
+        "earnings-forecast",
+        "auto-run",
+        "--root",
+        str(root),
+        "--start",
+        _required_text(payload, "start"),
+        "--profile",
+        str(payload.get("profile") or "default"),
+        "--qmt-bridge-url",
+        _payload_text_or_env(payload, "qmt_bridge_url", "QMT_BRIDGE_URL", "QMT_BRIDGE_BASE_URL"),
+        "--preset",
+        str(payload.get("preset") or DEFAULT_AUTO_PRESET),
+        "--label",
+        str(payload.get("label") or DEFAULT_AUTO_LABEL),
+        "--prepare-time",
+        str(payload.get("prepare_time") or DEFAULT_AUTO_PREPARE_TIME),
+        "--execute-time",
+        str(payload.get("execute_time") or DEFAULT_AUTO_EXECUTE_TIME),
+        "--poll-seconds",
+        str(int(payload.get("poll_seconds") or 60)),
+        "--nav-initial-equity",
+        str(float(payload.get("nav_initial_equity") or 1_000_000.0)),
+        "--nav-benchmark",
+        str(payload.get("nav_benchmark") or "000852.SH"),
+    ]
+    env_overrides: dict[str, str] = {}
+    qmt_bridge_token = _payload_text_or_env_optional(payload, "qmt_bridge_token", "QMT_BRIDGE_TOKEN", "QMT_BRIDGE_API_KEY")
+    if qmt_bridge_token:
+        env_overrides["QMT_BRIDGE_TOKEN"] = qmt_bridge_token
+    if qmt_account_id:
+        command.extend(["--qmt-account-id", qmt_account_id])
+    if allow_trading:
+        command.extend(["--enable-trading", "--allowed-account-id", qmt_account_id or "", "--confirm-trading", "CONFIRM_AUTO_TRADING"])
+    else:
+        command.append("--disable-trading")
+
+    xueqiu_kwargs = _xueqiu_kwargs_from_payload(payload)
+    if xueqiu_kwargs["xueqiu_enabled"]:
+        command.append("--enable-xueqiu")
+        if xueqiu_kwargs["xueqiu_cube_symbol"]:
+            command.extend(["--xueqiu-cube-symbol", str(xueqiu_kwargs["xueqiu_cube_symbol"])])
+        if xueqiu_kwargs["xueqiu_market"]:
+            command.extend(["--xueqiu-market", str(xueqiu_kwargs["xueqiu_market"])])
+        if xueqiu_kwargs["xueqiu_cookie"]:
+            env_overrides["XUEQIU_COOKIE"] = str(xueqiu_kwargs["xueqiu_cookie"])
+        if xueqiu_kwargs["xueqiu_cookie_file"]:
+            command.extend(["--xueqiu-cookie-file", str(xueqiu_kwargs["xueqiu_cookie_file"])])
+        if xueqiu_kwargs["xueqiu_submit"]:
+            command.append("--xueqiu-submit")
+        if xueqiu_kwargs["xueqiu_notification_profile"]:
+            command.extend(["--xueqiu-notification-profile", str(xueqiu_kwargs["xueqiu_notification_profile"])])
+        if not xueqiu_kwargs["xueqiu_notify_auth_error"]:
+            command.append("--no-xueqiu-auth-notify")
+
+    log_path = _background_log_path(root, "strategy-auto-loop-console-start")
+    process = _launch_console_background_process(command, log_path, env_overrides=env_overrides)
+    time.sleep(0.8)
+    if process.poll() is not None:
+        raise RuntimeError(f"策略自动服务启动失败：{_tail_text(log_path)}")
+    return {"status": "started", "pid": process.pid, "log_path": str(log_path), "allow_trading": allow_trading}
+
+
+def _stop_earnings_forecast_auto_loop(root: Path) -> dict[str, Any]:
+    status_path = root / "state" / "strategy" / "earnings_forecast_auto" / AUTO_RUN_STATUS_FILE
+    payload = _read_json_file(status_path)
+    pid = payload.get("pid")
+    pid_alive = _is_pid_alive(pid)
+    if pid and pid_alive:
+        os.kill(int(pid), signal.SIGTERM)
+        for _ in range(10):
+            time.sleep(0.2)
+            if not _is_pid_alive(pid):
+                break
+        if _is_pid_alive(pid):
+            os.kill(int(pid), signal.SIGKILL)
+            time.sleep(0.2)
+    updated = dict(payload)
+    updated["service_status"] = "stopped"
+    updated["updated_at"] = _now()
+    updated["last_error"] = None
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "status": "stopped" if pid and pid_alive else "already_stopped",
+        "pid": pid,
+        "status_path": str(status_path),
+    }
+
+
+def _background_log_path(root: Path, prefix: str) -> Path:
+    log_dir = root / "state" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / f"{prefix}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+
+def _launch_console_background_process(
+    command: list[str],
+    log_path: Path,
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.Popen:
+    repo_root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
+    with log_path.open("ab") as log_file:
+        return subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(repo_root),
+            env=env,
+        )
+
+
+def _tail_text(path: Path, *, limit: int = 2000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    return text[-limit:]
 
 
 def _runs_payload(root: Path) -> dict[str, Any]:
@@ -1860,11 +2814,8 @@ def _render_console_html_legacy(root: Path) -> str:
         </div>
         <div class="row">
           <div><label>Preset</label><select id="strategy_preset">
-            <option>baseline_top110_large</option>
             <option>stable_100w</option>
-            <option>aggressive_100w</option>
-            <option>liquidity_top80</option>
-            <option>liquidity_top90_1000w</option>
+            <option>baseline_top110_large</option>
           </select></div>
           <div><label>组合本金</label><input id="strategy_notional" value="1000000" /></div>
         </div>
@@ -2191,6 +3142,7 @@ def _render_console_html(root: Path) -> str:
       cursor: pointer;
     }
     button.secondary { background: #fff; color: var(--blue); }
+    button.danger { background: var(--red); border-color: var(--red); color: #fff; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
     .status { color: var(--muted); font-size: 13px; }
@@ -2380,11 +3332,38 @@ def _render_console_html(root: Path) -> str:
       color: var(--muted);
       font-weight: 700;
     }
+    .diagnostic-details .diagnostic-body {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .diagnostic-details:not([open]) .diagnostic-body {
+      display: none;
+    }
     .diagnostic-details table {
       margin-top: 8px;
     }
     .diagnostic-details th {
       min-width: 170px;
+    }
+    .xueqiu-holdings-grid {
+      grid-template-columns: repeat(2, minmax(430px, 1fr));
+    }
+    .xueqiu-table {
+      table-layout: fixed;
+    }
+    .xueqiu-table .col-stock { width: 34%; }
+    .xueqiu-table .col-weight { width: 16%; }
+    .xueqiu-table .col-cost { width: 28%; }
+    .xueqiu-table .col-status { width: 22%; }
+    .xueqiu-table th,
+    .xueqiu-table td {
+      padding: 10px 8px;
+      vertical-align: top;
+    }
+    .xueqiu-table .pill {
+      margin-bottom: 3px;
+      white-space: nowrap;
     }
     .compact-table { margin-top: 12px; }
     .stock-cell strong { display: block; font-size: 13px; }
@@ -2476,16 +3455,12 @@ def _render_console_html(root: Path) -> str:
         <h1>Vortex 工作台</h1>
         <div>工作区：__WORKSPACE_ROOT__</div>
       </div>
-      <div class="nav-group-label">日常监督</div>
-      <button class="nav active" data-page="trading"><span>05</span><span>交易台</span></button>
-      <button class="nav" data-page="data"><span>06</span><span>数据服务</span></button>
-      <button class="nav" data-page="settings"><span>07</span><span>设置 / 集成管理</span></button>
-      <button class="nav" data-page="output"><span>08</span><span>运行输出</span></button>
-      <div class="nav-group-label">研发 / Agent 入口</div>
-      <button class="nav" data-page="dashboard"><span>01</span><span>运营驾驶舱</span></button>
-      <button class="nav" data-page="runs"><span>02</span><span>运行中心</span></button>
-      <button class="nav" data-page="research"><span>03</span><span>因子研究实验室</span></button>
-      <button class="nav" data-page="strategy"><span>04</span><span>策略启动向导</span></button>
+      <div class="nav-group-label">实盘运营</div>
+      <button class="nav active" data-page="trading"><span>●</span><span>交易监控</span></button>
+      <button class="nav" data-page="strategy"><span>⚙</span><span>策略配置</span></button>
+      <button class="nav" data-page="xueqiu"><span>雪</span><span>雪球账户</span></button>
+      <button class="nav" data-page="data"><span>数</span><span>数据服务</span></button>
+      <button class="nav" data-page="settings"><span>基</span><span>基础设置</span></button>
     </aside>
 
     <div class="content">
@@ -2613,26 +3588,22 @@ def _render_console_html(root: Path) -> str:
         <section class="page" id="page-strategy">
           <div class="page-grid">
             <section>
-              <h3>业绩预告漂移策略启动向导</h3>
+              <h3>业绩预告漂移策略配置</h3>
               <div id="strategy_selected_state" class="status">读取策略目录中...</div>
               <ol class="step-list">
-                <li><strong>1. 选择策略</strong><span class="status">当前支持 baseline_top110_large 等 preset。</span></li>
-                <li><strong>2. 检查前置条件</strong><span class="status">确认回看起始日、基准日期和数据约束。</span></li>
-                <li><strong>3. 配置执行通道</strong><span class="status">QMT 配置来自设置页，也可临时覆盖。</span></li>
-                <li><strong>4. 生成任务</strong><span class="status">写入 pending QMT 任务，不下单。</span></li>
-                <li><strong>5. 自动编排</strong><span class="status">第一版只建议禁用交易运行。</span></li>
+                <li><strong>策略版本</strong><span class="status">100 万实盘使用 stable_100w；baseline_top110_large 只保留为回滚/对照。</span></li>
+                <li><strong>自动服务</strong><span class="status">08:10 生成目标，09:25 执行；是否真实下单由下面的 QMT 真实交易开关控制。</span></li>
+                <li><strong>同步账户</strong><span class="status">同一个目标组合可同步到 QMT 与雪球组合。</span></li>
+                <li><strong>回测/复核</strong><span class="status">后续在本页增加回测触发和指标展示，不再放到独立研发入口。</span></li>
               </ol>
               <div class="row">
                 <div><label>回看起始日</label><input id="strategy_start" placeholder="20170101" /></div>
-                <div><label>基准日期</label><input id="strategy_as_of" placeholder="20260516" /></div>
+                <div><label>手动基准日期，可留空</label><input id="strategy_as_of" placeholder="自动取最近可见交易日" /></div>
               </div>
               <div class="row">
                 <div><label>Preset</label><select id="strategy_preset">
-                  <option>baseline_top110_large</option>
                   <option>stable_100w</option>
-                  <option>aggressive_100w</option>
-                  <option>liquidity_top80</option>
-                  <option>liquidity_top90_1000w</option>
+                  <option>baseline_top110_large</option>
                 </select></div>
                 <div><label>组合本金</label><input id="strategy_notional" value="1000000" /></div>
               </div>
@@ -2642,17 +3613,74 @@ def _render_console_html(root: Path) -> str:
                 <div><label>QMT Token，可留空使用设置页</label><input id="qmt_bridge_token" type="password" /></div>
                 <div><label>账户 ID</label><input id="qmt_account_id" /></div>
               </div>
+              <div class="row">
+                <div><label>允许真实下单账户</label><input id="strategy_allowed_account_id" placeholder="99034443" /></div>
+                <div><label>交易确认</label><input disabled value="本机控制台自动传递 CONFIRM_AUTO_TRADING" /></div>
+              </div>
               <label><input id="allow_missing_precise_data" type="checkbox" style="width:auto" /> 允许缺少精确停牌/涨跌停数据</label>
+              <label><input id="strategy_allow_trading" type="checkbox" style="width:auto" /> 允许 QMT 真实下单（仅对白名单账户生效）</label>
+              <label><input id="strategy_enable_xueqiu" type="checkbox" style="width:auto" /> 自动编排时同步雪球组合</label>
               <div class="toolbar">
                 <button onclick="prepareStrategy()">生成策略任务（不下单）</button>
-                <button class="secondary" onclick="autoOnce(false)">自动编排一次（禁用交易）</button>
+                <button class="secondary" onclick="autoOnce()">立即执行一轮（按门禁配置）</button>
+                <button class="secondary" onclick="restartStrategyAutoLoop(this)">应用配置并重启</button>
+                <button class="danger" onclick="stopStrategyAutoLoop(this)">暂停自动服务</button>
               </div>
-              <div class="hint">策略跑起来的第一步是生成任务、看目标组合和 pending task。</div>
+              <div class="hint">页面保存的是当前服务配置入口；真正是否提交 QMT 委托，由“允许 QMT 真实下单”、账户白名单和后端 live gate 共同决定。</div>
             </section>
             <div class="stack">
               <section class="danger-zone">
-                <h3>交易门禁</h3>
-                <div class="status">默认禁用交易。下单动作需要额外确认，不通过普通启动按钮触发。</div>
+                <h3>当前自动服务</h3>
+                <div id="strategy_service_config_state" class="status">读取中...</div>
+                <div class="toolbar">
+                  <button class="secondary" onclick="checkQmtHealth()">QMT 只读检查</button>
+                  <button class="secondary" onclick="goPage('trading')">查看交易监控</button>
+                </div>
+              </section>
+              <section>
+                <h3>QMT Bridge</h3>
+                <div id="settings_qmt_state" class="status">读取中...</div>
+                <div id="settings_qmt_current" class="hint"></div>
+                <label>Bridge URL</label>
+                <input id="qmt_bridge_url_setting" placeholder="http://127.0.0.1:8000" />
+                <div class="row">
+                  <div><label>Token / API Key，可留空保持现值</label><input id="qmt_bridge_token_setting" type="password" /></div>
+                  <div><label>账户 ID</label><input id="qmt_account_id_setting" /></div>
+                </div>
+                <div class="toolbar">
+                  <button onclick="saveQmt()">保存 QMT</button>
+                  <button class="secondary" onclick="checkQmtHealth()">只读健康检查</button>
+                </div>
+              </section>
+              <section>
+                <h3>雪球组合</h3>
+                <div id="settings_xueqiu_state" class="status">读取中...</div>
+                <div id="settings_xueqiu_current" class="hint"></div>
+                <div class="row">
+                  <div><label>组合 ID</label><input id="xueqiu_cube_symbol_setting" placeholder="ZH3625640" /></div>
+                  <div><label>市场</label><select id="xueqiu_market_setting">
+                    <option value="cn">A 股 / cn</option>
+                    <option value="hk">港股 / hk</option>
+                    <option value="us">美股 / us</option>
+                  </select></div>
+                </div>
+                <details class="diagnostic-details">
+                  <summary>高级：手工 Cookie 覆盖</summary>
+                  <div class="diagnostic-body">
+                    <label>Cookie，可留空保持现值</label>
+                    <input id="xueqiu_cookie_setting" type="password" />
+                    <label>Cookie 文件路径，可选</label>
+                    <input id="xueqiu_cookie_file_setting" placeholder="/Users/.../xueqiu.cookie" />
+                  </div>
+                </details>
+                <label><input id="xueqiu_submit_setting" type="checkbox" style="width:auto" /> 允许真正提交雪球调仓；未勾选只生成 dry-run 审计产物</label>
+                <div id="settings_xueqiu_feedback" class="status refresh-feedback"></div>
+                <div class="toolbar">
+                  <button onclick="saveXueqiu()">保存雪球组合</button>
+                  <button class="secondary" onclick="importXueqiuCookie()">从浏览器读取 Cookie</button>
+                  <button class="secondary" onclick="checkXueqiuAuth()">认证检查</button>
+                  <button class="secondary" onclick="openXueqiuLogin()">打开雪球登录页</button>
+                </div>
               </section>
               <section>
                 <h3>最近策略任务</h3>
@@ -2681,14 +3709,21 @@ def _render_console_html(root: Path) -> str:
               <div class="ops-card">
                 <h4>当前绑定策略</h4>
                 <div id="trading_binding_state" class="status">读取中...</div>
+                <div id="trading_strategy_service_feedback" class="status refresh-feedback"></div>
                 <div class="toolbar">
-                  <button class="secondary" onclick="goPage('settings')">配置交易台</button>
+                  <button class="secondary" onclick="goPage('strategy')">配置策略</button>
+                  <button class="secondary" onclick="runAutoOnceFromTrading(this)">立即执行一轮</button>
+                  <button class="secondary" onclick="restartStrategyAutoLoop(this)">应用配置并重启</button>
+                  <button class="secondary" onclick="stopStrategyAutoLoop(this)">暂停自动服务</button>
                 </div>
               </div>
               <div class="ops-card">
                 <h4>数据服务</h4>
                 <div id="trading_data_state" class="status">读取中...</div>
+                <div id="trading_data_feedback" class="status refresh-feedback"></div>
                 <div class="toolbar">
+                  <button class="secondary" onclick="startDataServer('trading_data_feedback', this)">启动服务</button>
+                  <button class="secondary" onclick="updateDataNow('trading_data_feedback', this)">立即更新</button>
                   <button class="secondary" onclick="goPage('data')">查看详情</button>
                 </div>
               </div>
@@ -2784,6 +3819,73 @@ def _render_console_html(root: Path) -> str:
           </div>
         </section>
 
+        <section class="page" id="page-xueqiu">
+          <section class="priority-section">
+            <div class="section-title-row">
+              <div>
+                <h3>雪球组合账户</h3>
+                <div id="xueqiu_account_state" class="status">读取中...</div>
+                <div id="xueqiu_account_auth" class="hint"></div>
+              </div>
+              <div class="toolbar">
+                <button class="secondary" onclick="checkXueqiuAuth()">认证检查</button>
+                <button class="secondary" onclick="goPage('strategy')">配置雪球</button>
+              </div>
+            </div>
+            <div id="xueqiu_auth_feedback" class="status refresh-feedback"></div>
+            <div class="review-strip account-strip" id="xueqiu_account_metrics"></div>
+            <div id="xueqiu_sync_policy" class="status" style="margin-top:10px"></div>
+          </section>
+          <div class="page-grid xueqiu-holdings-grid">
+            <section>
+              <div class="section-title-row">
+                <div>
+                  <h3>当前雪球持仓</h3>
+                  <div id="xueqiu_current_meta" class="status">认证检查后读取当前组合持仓。</div>
+                </div>
+                <div class="toolbar">
+                  <button class="secondary" onclick="checkXueqiuAuth()">刷新持仓</button>
+                </div>
+              </div>
+              <table class="xueqiu-table">
+                <colgroup>
+                  <col class="col-stock" />
+                  <col class="col-weight" />
+                  <col class="col-cost" />
+                  <col class="col-status" />
+                </colgroup>
+                <thead><tr><th>股票</th><th>当前权重</th><th>成本价</th><th>状态</th></tr></thead>
+                <tbody id="xueqiu_current_holding_rows"><tr><td colspan="4">暂无雪球持仓</td></tr></tbody>
+              </table>
+            </section>
+            <section>
+              <div class="section-title-row">
+                <div>
+                  <h3>最近生成的雪球调仓计划</h3>
+                  <div id="xueqiu_rebalance_meta" class="status">读取最近一次雪球 dry-run / submit 产物。</div>
+                </div>
+              </div>
+              <table class="xueqiu-table">
+                <colgroup>
+                  <col class="col-stock" />
+                  <col class="col-weight" />
+                  <col class="col-cost" />
+                  <col class="col-status" />
+                </colgroup>
+                <thead><tr><th>股票</th><th>计划权重</th><th>成本价</th><th>动作</th></tr></thead>
+                <tbody id="xueqiu_rebalance_rows"><tr><td colspan="4">暂无调仓计划</td></tr></tbody>
+              </table>
+            </section>
+          </div>
+          <section style="margin-top:14px">
+            <h3>同步审计</h3>
+            <table>
+              <thead><tr><th>项目</th><th>状态</th><th>说明</th></tr></thead>
+              <tbody id="xueqiu_sync_rows"><tr><td colspan="3">暂无雪球同步记录</td></tr></tbody>
+            </table>
+          </section>
+        </section>
+
         <section class="page" id="page-data">
           <div class="page-grid">
             <div class="stack">
@@ -2794,6 +3896,8 @@ def _render_console_html(root: Path) -> str:
                     <div id="data_page_state" class="status">读取中...</div>
                   </div>
                   <div class="toolbar">
+                    <button class="secondary" onclick="startDataServer('data_refresh_feedback', this)">启动服务</button>
+                    <button class="secondary" onclick="updateDataNow('data_refresh_feedback', this)">立即更新</button>
                     <button class="secondary" onclick="refreshAll('data_refresh_feedback', this)">刷新服务与数据状态</button>
                   </div>
                 </div>
@@ -2818,19 +3922,6 @@ def _render_console_html(root: Path) -> str:
 
         <section class="page" id="page-settings">
           <div class="two-col">
-            <section>
-              <h3>交易台绑定策略</h3>
-              <div id="settings_trading_state" class="status">读取中...</div>
-              <div class="row">
-                <div><label>当前执行策略</label><select id="settings_active_strategy"></select></div>
-                <div><label>账户模式</label><input disabled value="单账户：同一时间只绑定一个交易策略" /></div>
-              </div>
-              <div class="toolbar">
-                <button onclick="saveTradingConfig()">保存交易台配置</button>
-                <button class="secondary" onclick="goPage('trading')">返回交易台</button>
-              </div>
-              <div class="hint">这里决定交易台展示和自动编排面向哪个策略。当前只有一个账户，因此策略不会在交易台里临时切换。</div>
-            </section>
             <section>
               <h3>移动通知通道</h3>
               <div class="row">
@@ -2863,22 +3954,6 @@ def _render_console_html(root: Path) -> str:
                 <button class="secondary" onclick="saveNotificationProvider()">切换通道</button>
                 <button onclick="saveLark()">保存 Lark</button>
                 <button class="secondary" onclick="testLark()">发送测试</button>
-              </div>
-            </section>
-
-            <section>
-              <h3>QMT Bridge</h3>
-              <div id="settings_qmt_state" class="status">读取中...</div>
-              <div id="settings_qmt_current" class="hint"></div>
-              <label>Bridge URL</label>
-              <input id="qmt_bridge_url_setting" placeholder="http://127.0.0.1:8000" />
-              <div class="row">
-                <div><label>Token / API Key，可留空保持现值</label><input id="qmt_bridge_token_setting" type="password" /></div>
-                <div><label>账户 ID</label><input id="qmt_account_id_setting" /></div>
-              </div>
-              <div class="toolbar">
-                <button onclick="saveQmt()">保存 QMT</button>
-                <button class="secondary" onclick="checkQmtHealth()">只读健康检查</button>
               </div>
             </section>
 
@@ -2921,13 +3996,11 @@ def _render_console_html(root: Path) -> str:
   <script>
     const out = document.getElementById('output');
     const pageMeta = {
-      dashboard: ['运营驾驶舱', '后台能力概览：系统健康、当前任务、最近研究和待处理策略任务。'],
-      runs: ['运行中心', '面向 Agent 和脚本的 job、研究 run、策略任务状态与产物。'],
-      research: ['因子研究实验室', '启动 CogAlpha 因子研究闭环，查看门禁和候选。'],
-      strategy: ['策略启动向导', '手动生成策略任务和目标组合；日常监督以交易台为准。'],
-      trading: ['交易台', '当前绑定策略的账户、换仓、门禁和选股过程。'],
+      strategy: ['策略配置', '配置当前实盘策略、preset、QMT 真实交易、雪球同步和回测入口。'],
+      trading: ['交易监控', '当前运行服务、账户、换仓、门禁和选股过程。'],
+      xueqiu: ['雪球账户', '雪球组合当前持仓、准备同步的调仓、净值和同步审计。'],
       data: ['数据服务', '查看自动数据抓取、调度、进度、快照和日志。'],
-      settings: ['设置 / 集成管理', '管理本机 Lark、QMT、交易台绑定策略、数据源和模型供应商配置。'],
+      settings: ['基础设置', '管理本机通知、数据源、模型供应商等基础集成。'],
       output: ['运行输出', '调试最近 API 返回、job 详情和错误消息。']
     };
     const state = {
@@ -2940,6 +4013,7 @@ def _render_console_html(root: Path) -> str:
       activeStrategy: null,
       dataService: null,
       tradingConfig: null,
+      xueqiu: null,
       selectedStrategyId: 'earnings_forecast_drift'
     };
 
@@ -2962,6 +4036,8 @@ def _render_console_html(root: Path) -> str:
         blocked: '阻断',
         ready: '就绪',
         running: '运行中',
+        idle: '空闲',
+        stopped: '未运行',
         queued: '排队中',
         pending: '待执行',
         done: '完成',
@@ -2974,6 +4050,16 @@ def _render_console_html(root: Path) -> str:
         missing_target: '缺目标组合',
         missing_qmt: '缺少 QMT',
         needs_probe: '待检查',
+        dry_run: '已生成预演',
+        live_trading: '真实交易',
+        submitted: '已提交',
+        skipped_existing: '沿用已有',
+        quote_ok_current_unavailable: '组合可访问',
+        login_required: '需重新登录',
+        missing_cookie: '缺 Cookie',
+        missing_config: '缺配置',
+        not_enabled: '未启用',
+        stale_dead_pid: '进程已退出',
         paper_ready: '模拟盘就绪',
         research_only: '仅研究',
         factor_research: '因子研究'
@@ -3027,6 +4113,51 @@ def _render_console_html(root: Path) -> str:
       const symbol = item?.symbol || '-';
       return `<td class="stock-cell"><strong>${esc(name || symbol)}</strong><span class="mono">${esc(symbol)}</span></td>`;
     }
+    function normalizeStockSymbol(symbol) {
+      const raw = String(symbol || '').trim().toUpperCase();
+      if (!raw) return '';
+      if (/^(SH|SZ|BJ)\d{6}$/.test(raw)) return `${raw.slice(2)}.${raw.slice(0, 2)}`;
+      if (/^\d{6}\.(SH|SZ|BJ)$/.test(raw)) return raw;
+      if (/^\d{6}$/.test(raw)) {
+        const prefix = raw.startsWith('6') ? 'SH' : raw.startsWith('8') || raw.startsWith('4') ? 'BJ' : 'SZ';
+        return `${raw}.${prefix}`;
+      }
+      return raw;
+    }
+    function xueqiuStockSymbol(symbol) {
+      const normalized = normalizeStockSymbol(symbol);
+      const matched = normalized.match(/^(\d{6})\.(SH|SZ|BJ)$/);
+      return matched ? `${matched[2]}${matched[1]}` : normalized;
+    }
+    function symbolKeys(symbol) {
+      const raw = String(symbol || '').trim().toUpperCase();
+      const normalized = normalizeStockSymbol(raw);
+      const xueqiu = xueqiuStockSymbol(normalized);
+      return Array.from(new Set([raw, normalized, xueqiu].filter(Boolean)));
+    }
+    function xueqiuCostValue(item) {
+      const candidates = [
+        item?.cost_price,
+        item?.costPrice,
+        item?.avg_cost,
+        item?.avgCost,
+        item?.average_cost,
+        item?.averageCost,
+        item?.position_cost,
+        item?.positionCost,
+        item?.holding_cost,
+        item?.holdingCost,
+        item?.buy_price,
+        item?.buyPrice
+      ];
+      const value = candidates.map(Number).find(num => Number.isFinite(num) && num > 0);
+      return value ?? null;
+    }
+    function costCell(item) {
+      const cost = xueqiuCostValue(item);
+      if (!cost) return '<td>未成交/未获取<br><span class="status">雪球未返回成本价</span></td>';
+      return `<td>${fmtNumber(cost, 2)}<br><span class="status">雪球成本</span></td>`;
+    }
     function sideLabel(side) {
       const value = String(side || '-');
       const label = value === 'buy' ? '买入' : value === 'sell' ? '卖出' : value;
@@ -3049,6 +4180,11 @@ def _render_console_html(root: Path) -> str:
       const el = document.getElementById(id);
       if (!el || el.dataset.dirty || value === undefined || value === null || value === '') return;
       el.value = value;
+    }
+    function setCheckedIfClean(id, value) {
+      const el = document.getElementById(id);
+      if (!el || el.dataset.dirty || value === undefined || value === null) return;
+      el.checked = Boolean(value);
     }
     function envTable(title, env, extraRows) {
       const rows = Object.entries(env || {}).filter(([, value]) => value !== '');
@@ -3116,6 +4252,7 @@ def _render_console_html(root: Path) -> str:
       state.activeStrategy = state.status?.active_strategy || null;
       state.dataService = state.status?.data_service || null;
       state.tradingConfig = state.status?.trading_config || null;
+      state.xueqiu = state.status?.xueqiu || null;
       if (!state.strategies.some(item => item.strategy_id === state.selectedStrategyId)) {
         state.selectedStrategyId = state.tradingConfig?.active_strategy_id || state.strategies[0]?.strategy_id || 'earnings_forecast_drift';
       }
@@ -3150,6 +4287,7 @@ def _render_console_html(root: Path) -> str:
       renderStrategyTasks('trading_strategy_rows', state.strategyTasks, 12, 'trading');
       renderDataPage(state.dataService || {});
       renderTradingDesk(state.status || {});
+      renderXueqiuAccount(state.status || {});
       renderSettings(state.status || {});
     }
     function renderOverview(data) {
@@ -3162,6 +4300,7 @@ def _render_console_html(root: Path) -> str:
         ['策略任务', overview.pending_strategy_task_count ?? 0],
         ['通知', `${provider} / ${data.lark?.configured || data.feishu_legacy?.configured ? '已配置' : '未配置'}`],
         ['QMT', data.qmt?.health?.ok ? '绿色' : (data.qmt?.configured ? '待检查' : '未配置')],
+        ['雪球', data.xueqiu?.auth?.authenticated ? '认证通过' : (data.xueqiu?.configured ? '待检查' : '未配置')],
         ['交易审查', review.state || '-']
       ];
       document.getElementById('dashboard_cards').innerHTML = cards
@@ -3196,6 +4335,16 @@ def _render_console_html(root: Path) -> str:
       const res = await fetch('/api/jobs/' + encodeURIComponent(jobId));
       show(await res.json());
       goPage('output');
+    }
+    async function waitForJobResult(jobId, maxAttempts = 30) {
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const res = await fetch('/api/jobs/' + encodeURIComponent(jobId));
+        const payload = await res.json();
+        const job = payload.job || payload;
+        if (job.status !== 'running' && job.status !== 'pending') return job;
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      return {status: 'timeout', job_id: jobId, error: {message: '任务仍在执行，请稍后刷新状态。'}};
     }
     function renderResearchRuns(tbodyId, runs, limit, verbose) {
       const body = document.getElementById(tbodyId);
@@ -3287,6 +4436,8 @@ def _render_console_html(root: Path) -> str:
     function dataServiceView(dataService) {
       const latestRun = dataService.latest_run || {};
       const latestSuccess = dataService.latest_success_update || {};
+      const latestCompleted = dataService.latest_completed_update || latestSuccess;
+      const server = dataService.server || {};
       const activeTask = (dataService.active_tasks || [])[0] || {};
       const progress = dataService.progress || {};
       const scheduleText = (dataService.scheduled_profiles || []).map(item => item.label || item.schedule).join('；') || '-';
@@ -3297,29 +4448,43 @@ def _render_console_html(root: Path) -> str:
           : '-';
       const activeText = activeTask.dataset
         ? `${activeTask.stage || '-'} ${activeTask.dataset}: ${activeTask.message || ''}`
-        : (progress.status === 'success' ? '无，最近更新已结束' : '-');
-      const status = progress.status || latestRun.status || dataService.status || 'unknown';
-      return {latestRun, latestSuccess, activeTask, progress, scheduleText, progressText, activeText, status};
+        : (dataService.current_task_reason || (progress.status === 'success' ? '无，最近更新已结束' : '-'));
+      const serverText = server.pid_alive
+        ? `运行中 PID ${server.pid || '-'}；队列：运行 ${server.running_tasks || 0} / 等待 ${server.pending_tasks || 0}`
+        : '未运行；调度不会自动触发';
+      const status = progress.status === 'running'
+        ? 'running'
+        : server.pid_alive
+          ? 'idle'
+          : 'stopped';
+      return {latestRun, latestSuccess, latestCompleted, server, activeTask, progress, scheduleText, progressText, activeText, serverText, status};
     }
     function renderDataPage(dataService) {
       const view = dataServiceView(dataService);
       const stateEl = document.getElementById('data_page_state');
       if (!stateEl) return;
       stateEl.innerHTML =
-        `${pill(view.status)} 最新运行：${esc(view.latestRun.run_id || '-')}；` +
-        `最新成功快照：${esc(view.latestSuccess.snapshot_id || '-')} / ${esc(view.latestSuccess.as_of_end || '-')}`;
+        `${pill(view.status)} 服务：${esc(view.serverText)}；` +
+        `最近完成：${esc(view.latestCompleted.run_id || view.latestRun.run_id || '-')} / ${esc(view.latestCompleted.status || view.latestRun.status || '-')}`;
       document.getElementById('data_page_metrics').innerHTML = [
+        ['服务进程', view.serverText],
+        ['任务队列', `运行 ${view.server.running_tasks || 0} / 等待 ${view.server.pending_tasks || 0}`],
         ['调度', view.scheduleText],
         ['更新进度', view.progressText],
         ['当前任务', view.activeText],
+        ['最近完成更新', `${view.latestCompleted.run_id || '-'} / ${view.latestCompleted.finished_at || '-'}`],
+        ['最新发布快照', `${dataService.latest_snapshot?.snapshot_id || view.latestSuccess.snapshot_id || '-'} / ${dataService.latest_snapshot?.as_of || view.latestSuccess.as_of_end || '-'}`],
         ['日志', basename(view.progress.log_path || view.activeTask.log_path || '-')]
       ].map(([label, value], index) => `<div class="review-item ${index === 1 ? 'is-primary' : ''}"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join('');
       document.getElementById('data_service_state').innerHTML =
         envTable('数据服务明细', {}, [
+          ['服务进程', view.serverText],
+          ['任务队列', `running=${view.server.running_tasks || 0}, pending=${view.server.pending_tasks || 0}, can_accept=${view.server.can_accept_task ? 'yes' : 'no'}`],
           ['检查时间', dataService.checked_at || '-'],
           ['服务状态', dataService.status || '-'],
           ['最新运行', `${view.latestRun.run_id || '-'} / ${view.latestRun.status || '-'}`],
-          ['最新成功快照', `${view.latestSuccess.snapshot_id || '-'} / ${view.latestSuccess.as_of_end || '-'}`],
+          ['最近完成更新', `${view.latestCompleted.run_id || '-'} / ${view.latestCompleted.status || '-'} / ${view.latestCompleted.finished_at || '-'}`],
+          ['最新成功快照', `${dataService.latest_snapshot?.snapshot_id || view.latestSuccess.snapshot_id || '-'} / ${dataService.latest_snapshot?.as_of || view.latestSuccess.as_of_end || '-'}`],
           ['数据更新进度', view.progressText],
           ['当前任务', view.activeText],
           ['日志', view.progress.log_path || view.activeTask.log_path || '-']
@@ -3347,6 +4512,9 @@ def _render_console_html(root: Path) -> str:
       const tradingConfig = data.trading_config || state.tradingConfig || {};
       const selectedStrategyId = tradingConfig.active_strategy_id || state.selectedStrategyId;
       const selected = active.name ? active : (state.strategies.find(item => item.strategy_id === selectedStrategyId) || state.strategies[0] || {});
+      const runningPreset = active.service?.preset_name || active.current?.strategy_version || selected.status || '-';
+      const latestTargetVersion = active.target?.strategy_version || active.current?.strategy_version || '-';
+      const latestTargetDate = active.target?.trade_date || active.current?.trade_date || '-';
       const stateLabel = {
         missing_qmt: '缺少 QMT 配置',
         needs_probe: '待做只读检查',
@@ -3355,7 +4523,8 @@ def _render_console_html(root: Path) -> str:
       }[review.state] || '暂无审查状态';
       document.getElementById('trading_binding_state').innerHTML =
         `${pill(selected.current?.status || selected.status || 'paper_ready')} ${esc(selected.name || tradingConfig.active_strategy_name || '-')}<br>` +
-        `<span class="status">账户：${esc(tradingConfig.account_id || qmt.account_id || '-')}；版本：${esc(active.current?.strategy_version || selected.status || '-')}；单账户绑定。</span>`;
+        `<span class="status">账户：${esc(tradingConfig.account_id || qmt.account_id || '-')}；当前运行版本：${esc(runningPreset)}；最近目标：${esc(latestTargetVersion)} / ${esc(latestTargetDate)}；单账户绑定。</span><br>` +
+        `<span class="status">策略自动服务：${esc(statusLabel(active.service?.effective_service_status || active.service?.service_status || 'unknown'))}；PID ${esc(active.service?.pid || '-')}；最近 tick ${esc(active.service?.last_tick_at || '-')}</span>`;
       document.getElementById('trading_review_state').innerHTML =
         `${pill(review.state === 'ready' ? 'success' : review.state === 'blocked' ? 'failed' : 'warn')} ${esc(stateLabel)}`;
       document.getElementById('trading_review_metrics').innerHTML = [
@@ -3369,11 +4538,22 @@ def _render_console_html(root: Path) -> str:
         .join('');
       document.getElementById('strategy_selected_state').innerHTML =
         `当前选中：${esc(selected.name || '业绩预告漂移策略')}；` +
-        `运行版本：${esc(active.current?.strategy_version || selected.status || 'paper_ready')}；` +
+        `运行版本：${esc(runningPreset)}；最近目标：${esc(latestTargetVersion)} / ${esc(latestTargetDate)}；` +
         `入口：${esc(selected.live_entry || '当前向导只支持业绩预告策略')}`;
+      const strategyServiceConfig = document.getElementById('strategy_service_config_state');
+      if (strategyServiceConfig) {
+        strategyServiceConfig.innerHTML =
+          `${pill(active.service?.allow_trading ? 'live_trading' : 'dry_run')} ` +
+          `服务：${esc(statusLabel(active.service?.effective_service_status || active.service?.service_status || 'unknown'))}；` +
+          `PID ${esc(active.service?.pid || '-')}；Preset ${esc(runningPreset)}；` +
+          `QMT ${active.service?.allow_trading ? '真实下单已开启' : '真实下单未开启'}；` +
+          `雪球 ${active.service?.xueqiu_enabled ? `同步 ${esc(active.service?.xueqiu_cube_symbol || '-')}` : '未启用'}`;
+      }
       setIfClean('strategy_start', '20170101');
       setIfClean('strategy_as_of', active.current?.as_of || '');
-      setIfClean('strategy_preset', active.current?.strategy_version || '');
+      setIfClean('strategy_preset', runningPreset);
+      setIfClean('strategy_allowed_account_id', tradingConfig.account_id || qmt.account_id || '');
+      setCheckedIfClean('strategy_allow_trading', Boolean(active.service?.allow_trading));
       renderActiveStrategyDetails(active, data.data_service || state.dataService || {}, qmt);
       renderQmtHealth(qmt);
     }
@@ -3404,8 +4584,8 @@ def _render_console_html(root: Path) -> str:
       const service = active.service || {};
       const dataView = dataServiceView(dataService);
       document.getElementById('trading_data_state').innerHTML =
-        `${pill(dataView.status)} ${esc(dataView.progressText)}<br>` +
-        `<span class="status">自动服务：${esc(service.service_status || '-')}；最近 tick：${esc(service.last_tick_at || '-')}；准备 ${esc(service.prepare_time || '-')} / 执行 ${esc(service.execute_time || '-')}</span>`;
+        `${pill(dataView.status)} ${esc(dataView.activeText)}<br>` +
+        `<span class="status">数据服务：${esc(dataView.serverText)}；最近完成：${esc(dataView.latestCompleted.run_id || '-')}；策略服务：${esc(statusLabel(service.effective_service_status || service.service_status || '-'))}</span>`;
       const nav = active.nav || {};
       const latest = nav.latest || {};
       const binding = nav.binding || {};
@@ -3498,10 +4678,124 @@ def _render_console_html(root: Path) -> str:
           </tr>`).join('')
         : '<tr><td colspan="4">暂无 QMT 持仓</td></tr>';
     }
+    function renderXueqiuAccount(data) {
+      const config = data.xueqiu || state.xueqiu || {};
+      const active = data.active_strategy || state.activeStrategy || {};
+      const sync = active.xueqiu || {};
+      const latest = sync?.status ? sync : (config.latest_sync || {});
+      const auth = config.auth || sync.auth || null;
+      const configured = Boolean(config.configured);
+      const authState = auth
+        ? `${auth.authenticated ? '认证通过' : auth.login_required ? '需要重新登录' : '认证失败'}；时间：${auth.checked_at || '-'}；持仓 ${auth.holding_count ?? '-'}`
+        : '尚未在本轮控制台启动后做认证检查。';
+      const compactStatus = auth?.authenticated ? 'success' : auth?.login_required ? 'login_required' : configured ? 'warn' : 'unconfigured';
+      const cubeName = auth?.cube_name || config.cube_name || '';
+      const currentCashPct = Number(auth?.current_cash_pct);
+      const hasCurrentCash = Number.isFinite(currentCashPct);
+      const currentStockPct = hasCurrentCash ? Math.max(0, 100 - currentCashPct) : null;
+      const hasPlan = Boolean(latest.status && latest.status !== 'not_enabled');
+      const currentRawHoldings = auth?.current_holdings || [];
+      const currentWeightBySymbol = new Map();
+      currentRawHoldings.forEach(item => {
+        const weight = Number(item?.weight);
+        if (!Number.isFinite(weight)) return;
+        symbolKeys(item?.symbol).forEach(key => currentWeightBySymbol.set(key, weight));
+      });
+      const targetPositions = active?.target?.positions || [];
+      const targetPlanHoldings = targetPositions.map(pos => {
+        const targetWeight = pos.target_weight !== undefined && pos.target_weight !== null ? Number(pos.target_weight) * 100 : null;
+        const currentWeight = symbolKeys(pos.symbol).map(key => currentWeightBySymbol.get(key)).find(value => Number.isFinite(value));
+        const changed = !(Number.isFinite(currentWeight) && Number.isFinite(targetWeight) && Math.abs(Number(currentWeight) - Number(targetWeight)) <= 0.01);
+        return {
+          symbol: xueqiuStockSymbol(pos.symbol),
+          name: pos.name || pos.symbol,
+          weight: targetWeight,
+          proactive: changed,
+          action_label: changed ? '需要同步' : '目标一致',
+          plan_source: 'active_target'
+        };
+      });
+      const fallbackPlanFromStrategy = !latest.planned_holdings?.length && !latest.changed_holdings?.length && targetPlanHoldings.length;
+      const displayPlanCount = fallbackPlanFromStrategy
+        ? targetPlanHoldings.length
+        : Number(latest.planned_holding_count ?? latest.target_position_count ?? 0);
+      document.getElementById('xueqiu_account_state').innerHTML =
+        `${pill(configured ? 'configured' : 'unconfigured')} 组合：${esc(config.cube_symbol || latest.cube_symbol || '-')}；` +
+        `${cubeName ? `名称：${esc(cubeName)}；` : ''}` +
+        `Cookie：${esc(config.cookie_configured ? '已配置' : '未配置')}；来源：${esc(config.source || '-')}`;
+      document.getElementById('xueqiu_account_auth').innerHTML =
+        `${pill(compactStatus)} ${esc(authState)}`;
+      document.getElementById('xueqiu_account_metrics').innerHTML = [
+        ['组合净值', auth?.net_value || '-'],
+        ['当前现金', hasCurrentCash ? `${fmtNumber(currentCashPct, 2)}%` : '-'],
+        ['当前股票仓位', currentStockPct !== null ? `${fmtNumber(currentStockPct, 2)}%` : '-'],
+        ['当前持仓', fmtNumber(auth?.holding_count ?? 0, 0)],
+        ['最近计划', hasPlan || fallbackPlanFromStrategy ? `${hasPlan ? statusLabel(latest.status) : '目标组合'} / ${fmtNumber(displayPlanCount, 0)} 支` : '暂无'],
+        ['提交模式', config.submit_enabled ? '允许提交' : 'dry-run']
+      ].map(([label, value]) => `<div class="review-item"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join('');
+      document.getElementById('xueqiu_sync_policy').innerHTML =
+        `同步节奏：交易台当前绑定策略生成目标组合后，启用雪球同步会立即生成雪球调仓；` +
+        `自动服务只在交易日准备阶段运行，当前自动服务为 ${esc(statusLabel(active.service?.effective_service_status || active.service?.service_status || 'unknown'))}，` +
+        `雪球自动同步开关为 ${esc(active.service?.xueqiu_enabled ? '已启用' : '未启用')}。当前提交模式为 ${esc(config.submit_enabled ? '允许真正提交' : 'dry-run 预演')}；` +
+        `QMT 下单仍由交易日执行窗口和门禁控制。`;
+      const currentHoldings = auth?.current_holdings || [];
+      document.getElementById('xueqiu_current_meta').innerHTML =
+        `认证检查：${esc(auth?.checked_at || '尚未检查')}；当前持仓 ${esc(auth?.holding_count ?? currentHoldings.length ?? 0)} 支；` +
+        `现金 ${hasCurrentCash ? `${fmtNumber(currentCashPct, 2)}%` : '-'}；组合净值：${esc(auth?.net_value || '-')}`;
+      document.getElementById('xueqiu_current_holding_rows').innerHTML = currentHoldings.length
+        ? currentHoldings.map(item => `<tr>
+            ${stockCell(item)}
+            <td>${item.weight !== undefined && item.weight !== null ? `${fmtNumber(item.weight, 2)}%` : '-'}</td>
+            ${costCell(item)}
+            <td>${item.proactive ? pill('pending') : pill('ok')} ${esc(item.proactive ? '雪球标记为调仓项' : '当前持仓')}</td>
+          </tr>`).join('')
+        : '<tr><td colspan="4">暂无雪球持仓；点击“认证检查”后读取当前组合。</td></tr>';
+      const plannedHoldings = (latest.changed_holdings?.length
+        ? latest.changed_holdings
+        : latest.planned_holdings?.length
+          ? latest.planned_holdings
+          : targetPlanHoldings
+      );
+      document.getElementById('xueqiu_rebalance_meta').innerHTML =
+        hasPlan && !fallbackPlanFromStrategy
+          ? `最近计划：${esc(latest.created_at || '-')}；目标交易日：${esc(latest.trade_date || '-')}；` +
+            `计划持仓 ${esc(latest.planned_holding_count ?? latest.target_position_count ?? 0)} 支；` +
+            `计划现金 ${latest.cash_pct !== undefined && latest.cash_pct !== null ? `${fmtNumber(latest.cash_pct, 2)}%` : '-'}；` +
+            `计划股票仓位 ${latest.weight_sum_pct !== undefined && latest.weight_sum_pct !== null ? `${fmtNumber(latest.weight_sum_pct, 2)}%` : '-'}`
+          : fallbackPlanFromStrategy
+            ? `当前显示交易台绑定策略的目标组合：${esc(active.current?.trade_date || active.target?.trade_date || '-')}；` +
+              `最近同步报告状态为 ${esc(latest.status || 'not_enabled')}，没有可展示调仓明细。`
+            : '暂无最近同步计划。交易台绑定策略生成目标组合并启用雪球同步后会出现；是否真正提交雪球取决于设置页的提交开关。';
+      document.getElementById('xueqiu_rebalance_rows').innerHTML = plannedHoldings.length
+        ? plannedHoldings.map(item => `<tr>
+            ${stockCell(item)}
+            <td>${item.weight !== undefined && item.weight !== null ? `${fmtNumber(item.weight, 2)}%` : '-'}</td>
+            ${costCell(item)}
+            <td>${item.proactive ? pill('pending') : pill('skipped_existing')} ${esc(item.action_label || (item.proactive ? '需要同步' : '目标不变'))}</td>
+          </tr>`).join('')
+        : '<tr><td colspan="4">暂无雪球调仓计划；交易台绑定策略生成目标组合并启用雪球同步后会出现。</td></tr>';
+      const rows = [
+        ['自动策略服务', active.service?.effective_service_status || active.service?.service_status || 'unknown', active.service?.pid_alive ? `PID ${active.service?.pid || '-'}` : `PID ${active.service?.pid || '-'} 未运行；需要重新启动自动服务`],
+        ['雪球自动同步', active.service?.xueqiu_enabled ? 'configured' : 'not_enabled', active.service?.xueqiu_enabled ? `组合 ${active.service?.xueqiu_cube_symbol || config.cube_symbol || '-'}` : '当前自动服务配置未启用雪球同步'],
+        ['认证状态', auth?.status || (configured ? 'needs_probe' : 'unconfigured'), auth?.error || authState],
+        ['最近同步', latest.status || 'not_enabled', latest.report_path || latest.error || '暂无同步记录'],
+      ];
+      if (Number(latest.changed_count || 0) > 0) {
+        rows.push(['计划变更', 'available', (latest.changed_symbols || []).join(', ') || '-']);
+      }
+      document.getElementById('xueqiu_sync_rows').innerHTML = rows.map(([name, status, detail]) => `
+        <tr>
+          <td>${esc(name)}</td>
+          <td>${pill(status)}</td>
+          <td class="mono">${esc(briefDetail(detail))}</td>
+        </tr>
+      `).join('');
+    }
     function renderSettings(data) {
       const lark = data.lark || {};
       const feishu = data.feishu_legacy || {};
       const qmt = data.qmt || {};
+      const xueqiu = data.xueqiu || {};
       const tushare = data.tushare || {};
       const models = data.models || {};
       const tradingConfig = data.trading_config || {};
@@ -3515,13 +4809,22 @@ def _render_console_html(root: Path) -> str:
       const qmtText = qmt.configured
         ? `已检测到 Bridge：${qmt.bridge_url || '-'}`
         : `未配置：${(qmt.missing || []).join(', ') || '未知'}`;
-      document.getElementById('settings_active_strategy').innerHTML = strategies.length
-        ? strategies.map(strategy => `<option value="${esc(strategy.strategy_id)}">${esc(strategy.name || strategy.strategy_id)}</option>`).join('')
-        : '<option value="">暂无可绑定策略</option>';
-      setIfClean('settings_active_strategy', tradingConfig.active_strategy_id || strategies[0]?.strategy_id || '');
-      document.getElementById('settings_trading_state').innerHTML =
-        `${pill(tradingConfig.active_strategy_id ? 'configured' : 'unconfigured')} 当前绑定：${esc(tradingConfig.active_strategy_name || '-')}；` +
-        `账户：${esc(tradingConfig.account_id || qmt.account_id || '-')}；来源：${esc(tradingConfig.source || '-')}`;
+      const xueqiuText = xueqiu.configured
+        ? `已检测到雪球组合：${xueqiu.cube_symbol || '-'}`
+        : `未配置：${(xueqiu.missing || []).join(', ') || '未知'}`;
+      const settingsActiveStrategy = document.getElementById('settings_active_strategy');
+      if (settingsActiveStrategy) {
+        settingsActiveStrategy.innerHTML = strategies.length
+          ? strategies.map(strategy => `<option value="${esc(strategy.strategy_id)}">${esc(strategy.name || strategy.strategy_id)}</option>`).join('')
+          : '<option value="">暂无可绑定策略</option>';
+        setIfClean('settings_active_strategy', tradingConfig.active_strategy_id || strategies[0]?.strategy_id || '');
+      }
+      const settingsTradingState = document.getElementById('settings_trading_state');
+      if (settingsTradingState) {
+        settingsTradingState.innerHTML =
+          `${pill(tradingConfig.active_strategy_id ? 'configured' : 'unconfigured')} 当前绑定：${esc(tradingConfig.active_strategy_name || '-')}；` +
+          `账户：${esc(tradingConfig.account_id || qmt.account_id || '-')}；来源：${esc(tradingConfig.source || '-')}`;
+      }
       document.getElementById('settings_lark_state').innerHTML =
         `${pill(activeConfigured ? 'configured' : 'unconfigured')} ${esc(larkText)}`;
       document.getElementById('settings_lark_current').innerHTML =
@@ -3538,6 +4841,17 @@ def _render_console_html(root: Path) -> str:
           ['Token / API Key', qmt.token_configured ? '已配置，同一个 Bridge 密钥' : '未配置'],
           ['来源', qmt.source || '-'],
           ['已写入 .env', qmt.persisted ? '是' : '否']
+        ]);
+      document.getElementById('settings_xueqiu_state').innerHTML =
+        `${pill(xueqiu.configured ? 'configured' : 'unconfigured')} ${esc(xueqiuText)}`;
+      document.getElementById('settings_xueqiu_current').innerHTML =
+        envDetails('当前雪球组合变量（脱敏）', xueqiu.env, [
+          ['组合 ID', xueqiu.cube_symbol || '-'],
+          ['市场', xueqiu.market || '-'],
+          ['Cookie', xueqiu.cookie_configured ? '已配置' : '未配置'],
+          ['提交模式', xueqiu.submit_enabled ? '允许提交' : 'dry-run'],
+          ['最近同步', `${xueqiu.latest_sync?.status || '-'} / ${basename(xueqiu.latest_sync?.report_path || '')}`],
+          ['来源', xueqiu.source || '-']
         ]);
       document.getElementById('settings_tushare_state').innerHTML =
         `${pill(tushare.configured ? 'configured' : 'unconfigured')} ${esc(tushare.configured ? 'Tushare Token 已检测到。' : '未检测到 Tushare Token。')}`;
@@ -3556,6 +4870,11 @@ def _render_console_html(root: Path) -> str:
       setIfClean('qmt_account_id_setting', qmt.account_id || '');
       setIfClean('qmt_bridge_url', qmt.bridge_url || '');
       setIfClean('qmt_account_id', qmt.account_id || '');
+      setIfClean('xueqiu_cube_symbol_setting', xueqiu.cube_symbol || '');
+      setIfClean('xueqiu_market_setting', xueqiu.market || 'cn');
+      setIfClean('xueqiu_cookie_file_setting', xueqiu.cookie_file || '');
+      setCheckedIfClean('xueqiu_submit_setting', xueqiu.submit_enabled || false);
+      setCheckedIfClean('strategy_enable_xueqiu', xueqiu.configured || false);
     }
     function showRun(runId) {
       const run = state.researchRuns.find(item => item.run_id === runId);
@@ -3608,13 +4927,130 @@ def _render_console_html(root: Path) -> str:
         await refreshAll();
       } catch (e) { show(e); }
     }
-    async function checkQmtHealth() {
+    async function saveXueqiu() {
       try {
-        const result = await api('/api/qmt/health', {});
+        show(await api('/api/config/xueqiu', {
+          cube_symbol: document.getElementById('xueqiu_cube_symbol_setting').value,
+          market: document.getElementById('xueqiu_market_setting').value,
+          cookie: document.getElementById('xueqiu_cookie_setting').value,
+          cookie_file: document.getElementById('xueqiu_cookie_file_setting').value,
+          submit_enabled: document.getElementById('xueqiu_submit_setting').checked
+        }));
+        document.getElementById('xueqiu_cookie_setting').value = '';
+        await refreshAll();
+      } catch (e) { show(e); }
+    }
+    async function importXueqiuCookie() {
+      const feedback = document.getElementById('settings_xueqiu_feedback');
+      try {
+        if (feedback) feedback.textContent = `正在读取浏览器 Cookie... ${nowLabel()}`;
+        const result = await api('/api/xueqiu/import-cookie', {
+          cube_symbol: document.getElementById('xueqiu_cube_symbol_setting').value,
+          market: document.getElementById('xueqiu_market_setting').value
+        });
         show(result);
         await refreshAll();
-        goPage('trading');
+        if (feedback) {
+          feedback.textContent = result.status === 'imported'
+            ? `已读取并保存 Cookie ${nowLabel()}；来源：${result.cookie?.source || '-'}。`
+            : `未读取到 Cookie：${result.cookie?.message || '请先登录雪球后重试。'}`;
+        }
+      } catch (e) {
+        if (feedback) feedback.textContent = `读取失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      }
+    }
+    function openXueqiuLogin() {
+      window.open('https://xueqiu.com/', '_blank', 'noopener,noreferrer');
+    }
+    async function runQmtHealthCheck(options = {}) {
+      const result = await api('/api/qmt/health', {});
+      const jobId = result.job?.job_id;
+      const job = jobId ? await waitForJobResult(jobId) : result;
+      if (!options.silent) show(job);
+      if (options.refresh !== false) await refreshAll();
+      if (options.navigate) goPage('trading');
+      return job;
+    }
+    async function checkQmtHealth() {
+      try {
+        await runQmtHealthCheck({navigate: true});
       } catch (e) { show(e); }
+    }
+    async function startDataServer(feedbackId, button = null) {
+      const feedback = feedbackId ? document.getElementById(feedbackId) : null;
+      const oldText = button ? button.textContent : '';
+      try {
+        if (feedback) feedback.textContent = `正在启动数据服务... ${nowLabel()}`;
+        if (button) {
+          button.disabled = true;
+          button.textContent = '启动中...';
+        }
+        const result = await api('/api/data/server-start', {});
+        show(result);
+        await refreshAll();
+        if (feedback) feedback.textContent = result.status === 'already_running'
+          ? `数据服务已在运行，PID ${result.pid || '-'}。`
+          : `数据服务已启动，PID ${result.pid || '-'}。`;
+      } catch (e) {
+        if (feedback) feedback.textContent = `数据服务启动失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = oldText || '启动服务';
+        }
+      }
+    }
+    async function updateDataNow(feedbackId, button = null) {
+      const feedback = feedbackId ? document.getElementById(feedbackId) : null;
+      const oldText = button ? button.textContent : '';
+      try {
+        if (feedback) feedback.textContent = `正在提交数据更新... ${nowLabel()}`;
+        if (button) {
+          button.disabled = true;
+          button.textContent = '提交中...';
+        }
+        const result = await api('/api/data/update-now', {profile: 'default'});
+        show(result);
+        const jobId = result.job?.job_id;
+        const job = jobId ? await waitForJobResult(jobId) : result;
+        if (job.result) show(job.result);
+        await refreshAll();
+        if (feedback) feedback.textContent = `数据更新任务已提交 ${nowLabel()}；任务状态：${job.status || result.status || '-'}`;
+      } catch (e) {
+        if (feedback) feedback.textContent = `数据更新提交失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = oldText || '立即更新';
+        }
+      }
+    }
+    async function checkXueqiuAuth() {
+      const feedback = document.getElementById('settings_xueqiu_feedback');
+      const accountFeedback = document.getElementById('xueqiu_auth_feedback');
+      const setFeedback = (text) => {
+        if (feedback) feedback.textContent = text;
+        if (accountFeedback) accountFeedback.textContent = text;
+      };
+      try {
+        setFeedback(`正在检查雪球认证... ${nowLabel()}`);
+        const result = await api('/api/xueqiu/auth-check', {});
+        const jobId = result.job?.job_id;
+        const job = jobId ? await waitForJobResult(jobId) : result;
+        show(job);
+        const auth = job.result || {};
+        await refreshAll();
+        const notice = auth.notification?.status ? `；通知：${auth.notification.status}` : '';
+        setFeedback(auth.authenticated
+          ? `认证通过 ${nowLabel()}；组合：${auth.cube_symbol || '-'}。`
+          : `认证未通过 ${nowLabel()}：${auth.error || auth.status || job.error?.message || '未知错误'}${notice}`);
+      } catch (e) {
+        setFeedback(`认证检查失败：${e.message || e.error || '未知错误'}`);
+        show(e);
+      }
     }
     async function testLark() {
       try { show(await api('/api/lark/test', {text: 'Vortex 控制台测试消息'})); }
@@ -3637,6 +5073,10 @@ def _render_console_html(root: Path) -> str:
       } catch (e) { show(e); }
     }
     function strategyPayload() {
+      const xueqiu = state.status?.xueqiu || {};
+      const allowTrading = Boolean(document.getElementById('strategy_allow_trading')?.checked);
+      const qmtAccountId = document.getElementById('qmt_account_id').value;
+      const allowedAccountId = document.getElementById('strategy_allowed_account_id')?.value || qmtAccountId;
       return {
         start: document.getElementById('strategy_start').value,
         as_of: document.getElementById('strategy_as_of').value,
@@ -3644,8 +5084,15 @@ def _render_console_html(root: Path) -> str:
         portfolio_notional: Number(document.getElementById('strategy_notional').value || 1000000),
         qmt_bridge_url: document.getElementById('qmt_bridge_url').value,
         qmt_bridge_token: document.getElementById('qmt_bridge_token').value,
-        qmt_account_id: document.getElementById('qmt_account_id').value,
-        allow_missing_precise_data: document.getElementById('allow_missing_precise_data').checked
+        qmt_account_id: qmtAccountId,
+        allow_trading: allowTrading,
+        allowed_account_id: allowedAccountId,
+        confirm_trading: allowTrading ? 'CONFIRM_AUTO_TRADING' : '',
+        allow_missing_precise_data: document.getElementById('allow_missing_precise_data').checked,
+        enable_xueqiu: document.getElementById('strategy_enable_xueqiu').checked,
+        xueqiu_cube_symbol: xueqiu.cube_symbol || '',
+        xueqiu_market: xueqiu.market || 'cn',
+        xueqiu_submit: Boolean(xueqiu.submit_enabled)
       };
     }
     async function prepareStrategy(nextPage = 'runs', feedbackId = null, button = null) {
@@ -3674,15 +5121,111 @@ def _render_console_html(root: Path) -> str:
         }
       }
     }
-    async function autoOnce(allowTrading) {
+    async function autoOnce(allowTrading = null, options = {}) {
+      const feedback = options.feedbackId ? document.getElementById(options.feedbackId) : null;
+      const button = options.button || null;
+      const oldText = button ? button.textContent : '';
       try {
+        if (feedback) feedback.textContent = `正在提交策略自动编排... ${nowLabel()}`;
+        if (button) {
+          button.disabled = true;
+          button.textContent = '提交中...';
+        }
         const body = strategyPayload();
-        body.allow_trading = Boolean(allowTrading);
+        if (allowTrading !== null) body.allow_trading = Boolean(allowTrading);
         const result = await api('/api/strategy/earnings-forecast/auto-once', body);
         show(result);
+        const jobId = result.job?.job_id;
+        const job = jobId ? await waitForJobResult(jobId, 120) : result;
+        if (job.result) show(job.result);
         await refreshAll();
-        goPage('runs');
-      } catch (e) { show(e); }
+        if (feedback) feedback.textContent = `策略执行一轮已完成 ${nowLabel()}；状态：${job.status || result.status || '-'}`;
+        if (!options.stay) goPage('runs');
+      } catch (e) {
+        if (feedback) feedback.textContent = `策略执行失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = oldText || '立即执行一轮';
+        }
+      }
+    }
+    function runAutoOnceFromTrading(button) {
+      return autoOnce(null, {feedbackId: 'trading_strategy_service_feedback', button, stay: true});
+    }
+    async function startStrategyAutoLoop(button = null) {
+      const feedback = document.getElementById('trading_strategy_service_feedback');
+      const oldText = button ? button.textContent : '';
+      try {
+        if (feedback) feedback.textContent = `正在启动策略自动服务... ${nowLabel()}`;
+        if (button) {
+          button.disabled = true;
+          button.textContent = '启动中...';
+        }
+        const body = strategyPayload();
+        const result = await api('/api/strategy/earnings-forecast/auto-loop-start', body);
+        show(result);
+        await refreshAll();
+        if (feedback) feedback.textContent = result.status === 'already_running'
+          ? `策略自动服务已在运行，PID ${result.pid || '-'}。`
+          : `策略自动服务已启动，PID ${result.pid || '-'}；QMT 真实下单：${body.allow_trading ? '开启' : '关闭'}。`;
+      } catch (e) {
+        if (feedback) feedback.textContent = `策略自动服务启动失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = oldText || '启动/重启自动服务';
+        }
+      }
+    }
+    async function stopStrategyAutoLoop(button = null) {
+      const feedback = document.getElementById('trading_strategy_service_feedback') || document.getElementById('strategy_service_config_state');
+      const oldText = button ? button.textContent : '';
+      try {
+        if (feedback) feedback.textContent = `正在暂停策略自动服务... ${nowLabel()}`;
+        if (button) {
+          button.disabled = true;
+          button.textContent = '暂停中...';
+        }
+        const result = await api('/api/strategy/earnings-forecast/auto-loop-stop', {});
+        show(result);
+        await refreshAll();
+        if (feedback) feedback.textContent = `策略自动服务已暂停，PID ${result.pid || '-'}。`;
+      } catch (e) {
+        if (feedback) feedback.textContent = `策略自动服务暂停失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = oldText || '暂停自动服务';
+        }
+      }
+    }
+    async function restartStrategyAutoLoop(button = null) {
+      const feedback = document.getElementById('strategy_service_config_state') || document.getElementById('trading_strategy_service_feedback');
+      const oldText = button ? button.textContent : '';
+      try {
+        if (feedback) feedback.textContent = `正在应用配置并重启自动服务... ${nowLabel()}`;
+        if (button) {
+          button.disabled = true;
+          button.textContent = '重启中...';
+        }
+        await api('/api/strategy/earnings-forecast/auto-loop-stop', {});
+        const result = await api('/api/strategy/earnings-forecast/auto-loop-start', strategyPayload());
+        show(result);
+        await refreshAll();
+        if (feedback) feedback.textContent = `策略自动服务已重启，PID ${result.pid || '-'}。`;
+      } catch (e) {
+        if (feedback) feedback.textContent = `策略自动服务重启失败：${e.message || e.error || '未知错误'}`;
+        show(e);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = oldText || '应用配置并重启';
+        }
+      }
     }
 
     document.querySelectorAll('.nav').forEach(btn => {
@@ -3759,6 +5302,14 @@ def _float_or_none(value: object) -> float | None:
         return None
 
 
+def _first_positive_float(*values: object) -> float | None:
+    for value in values:
+        parsed = _float_or_none(value)
+        if parsed is not None and parsed > 0:
+            return parsed
+    return None
+
+
 def _max_drawdown(net_values: list[float]) -> float | None:
     if not net_values:
         return None
@@ -3808,6 +5359,34 @@ def _payload_text_or_env_optional(payload: dict[str, Any], key: str, *env_keys: 
     return None
 
 
+def _xueqiu_kwargs_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "xueqiu_enabled": _bool_payload(payload, "enable_xueqiu", False),
+        "xueqiu_cube_symbol": _payload_text_or_env_optional(payload, "xueqiu_cube_symbol", "XUEQIU_CUBE_SYMBOL"),
+        "xueqiu_cookie": _payload_text_or_env_optional(payload, "xueqiu_cookie", "XUEQIU_COOKIE"),
+        "xueqiu_cookie_file": _payload_text_or_env_optional(payload, "xueqiu_cookie_file", "XUEQIU_COOKIE_FILE"),
+        "xueqiu_market": _optional_text(payload.get("xueqiu_market"))
+        or _optional_text(os.environ.get("XUEQIU_MARKET"))
+        or "cn",
+        "xueqiu_submit": _bool_payload(payload, "xueqiu_submit", _env_bool("XUEQIU_SUBMIT", False)),
+        "xueqiu_notification_profile": _payload_text_or_env_optional(
+            payload,
+            "xueqiu_notification_profile",
+            "XUEQIU_NOTIFICATION_PROFILE",
+        ),
+        "xueqiu_notify_auth_error": not _bool_payload(payload, "no_xueqiu_auth_notify", False),
+    }
+
+
+def _bool_payload(payload: dict[str, Any], key: str, default: bool = False) -> bool:
+    if key not in payload:
+        return default
+    value = payload.get(key)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def _qmt_bridge_url_from_env() -> str:
     return _optional_text(os.environ.get("QMT_BRIDGE_URL")) or _optional_text(
         os.environ.get("QMT_BRIDGE_BASE_URL")
@@ -3847,6 +5426,13 @@ def _int_payload(payload: dict[str, Any], key: str, default: int) -> int:
     if parsed <= 0:
         raise ValueError(f"{key} 必须大于 0")
     return parsed
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    value = _optional_text(os.environ.get(key))
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _masked(value: str) -> str:

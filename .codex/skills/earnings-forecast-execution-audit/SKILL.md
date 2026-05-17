@@ -40,7 +40,7 @@ python3 - <<'PY'
 import json
 from pathlib import Path
 
-root = Path("/Users/zyukyunman/Documents/vortex_workspace")
+root = Path("../vortex_workspace")
 for rel in [
     "state/strategy/earnings_forecast_auto/status.json",
     "state/live-service-health-latest.json",
@@ -65,7 +65,7 @@ PY
 
 ```bash
 uv run vortex data status \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --format json
 ```
 
@@ -80,7 +80,7 @@ uv run vortex data status \
 
 ```bash
 TODAY=YYYYMMDD
-ROOT=/Users/zyukyunman/Documents/vortex_workspace
+ROOT=../vortex_workspace
 
 find "$ROOT/trade/targets/$TODAY" -maxdepth 1 -type f -print | sort
 find "$ROOT/state/trade" -maxdepth 5 -type f \
@@ -158,7 +158,7 @@ find "$ROOT/trade/executions" -maxdepth 2 -type f \
 
 ```bash
 uv run vortex trade inspect \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --exec-id <exec_id> \
   --format json
 ```
@@ -240,7 +240,7 @@ PY
 
 ```bash
 uv run vortex trade nav status \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --strategy-name earnings_forecast_auto \
   --strategy-version baseline_top110_large \
   --qmt-account-id <account_id> \
@@ -251,7 +251,7 @@ uv run vortex trade nav status \
 
 ```bash
 uv run vortex trade nav snapshot \
-  --root /Users/zyukyunman/Documents/vortex_workspace \
+  --root ../vortex_workspace \
   --strategy-name earnings_forecast_auto \
   --strategy-version baseline_top110_large \
   --initial-equity 1000000 \

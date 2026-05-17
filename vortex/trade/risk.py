@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from vortex.trade.broker import BrokerHealth, CashSnapshot, OrderIntent, Quote
@@ -43,7 +44,19 @@ def run_pre_trade_risk_check(
         if quote is None:
             _append(results, "quote_available", False, "critical", "missing quote", order.symbol)
             continue
-        order_value = order.shares * quote.execution_price
+        execution_price = quote.execution_price
+        quote_price_available = math.isfinite(execution_price) and execution_price > 0
+        _append(
+            results,
+            "quote_price_available",
+            quote_price_available,
+            "critical",
+            "missing quote price",
+            order.symbol,
+        )
+        if not quote_price_available:
+            continue
+        order_value = order.shares * execution_price
         total_value += order_value
         _append(
             results,
@@ -53,23 +66,55 @@ def run_pre_trade_risk_check(
             "single order value too large",
             order.symbol,
         )
-        _append(results, "not_suspended", not quote.is_suspended, "critical", "symbol suspended", order.symbol)
-        _append(
-            results,
-            "limit_up_buy",
-            not (order.side == "buy" and quote.is_limit_up),
-            "critical",
-            "limit-up buy blocked",
-            order.symbol,
-        )
-        _append(
-            results,
-            "limit_down_sell",
-            not (order.side == "sell" and quote.is_limit_down),
-            "critical",
-            "limit-down sell blocked",
-            order.symbol,
-        )
+        if quote.is_suspended is None:
+            _append(
+                results,
+                "suspension_status_available",
+                False,
+                "critical",
+                "missing suspension flag",
+                order.symbol,
+            )
+        else:
+            _append(results, "not_suspended", not quote.is_suspended, "critical", "symbol suspended", order.symbol)
+        if order.side == "buy":
+            if quote.is_limit_up is None:
+                _append(
+                    results,
+                    "limit_up_status_available",
+                    False,
+                    "critical",
+                    "missing limit-up flag",
+                    order.symbol,
+                )
+            else:
+                _append(
+                    results,
+                    "limit_up_buy",
+                    not quote.is_limit_up,
+                    "critical",
+                    "limit-up buy blocked",
+                    order.symbol,
+                )
+        if order.side == "sell":
+            if quote.is_limit_down is None:
+                _append(
+                    results,
+                    "limit_down_status_available",
+                    False,
+                    "critical",
+                    "missing limit-down flag",
+                    order.symbol,
+                )
+            else:
+                _append(
+                    results,
+                    "limit_down_sell",
+                    not quote.is_limit_down,
+                    "critical",
+                    "limit-down sell blocked",
+                    order.symbol,
+                )
         _append(
             results,
             "lot_size",

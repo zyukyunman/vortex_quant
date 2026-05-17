@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from vortex.data.provider.tushare import TushareProvider
@@ -33,8 +34,10 @@ from vortex.strategy.earnings_forecast_runner import (
     _build_version_signal_context,
     get_earnings_forecast_version_preset,
     load_earnings_forecast_inputs,
+    resolve_earnings_forecast_version_strategy,
     run_earnings_forecast_live_handoff,
 )
+from vortex.strategy.earnings_forecast_strategy_spec import build_earnings_forecast_strategy_signal
 from vortex.strategy.earnings_forecast_quality import (
     build_holding_quality_review,
     write_holding_quality_review,
@@ -57,10 +60,12 @@ from vortex.trade.target_portfolio import TargetPortfolioBuildConfig, build_targ
 DEFAULT_AUTO_PREPARE_TIME = "08:10"
 DEFAULT_AUTO_EXECUTE_TIME = "09:25"
 DEFAULT_AUTO_LABEL = "业绩预告漂移策略自动编排"
-DEFAULT_AUTO_PRESET = "baseline_top110_large"
-DEFAULT_AUTO_LIVE_TOP_N = 30
+DEFAULT_AUTO_PRESET = "stable_100w"
+DEFAULT_AUTO_LIVE_TOP_N = 50
 DEFAULT_AUTO_NAV_INITIAL_EQUITY = 1_000_000.0
 DEFAULT_AUTO_NAV_BENCHMARK = "000852.SH"
+LIVE_EXECUTION_PRESETS = ("stable_100w", "baseline_top110_large")
+SHADOW_ONLY_PRESETS = ("tail_risk_soft_q10_p25",)
 AUTO_RUN_STATUS_FILE = "status.json"
 AUTO_RUN_LOG_FILE = "strategy-earnings-forecast-auto-run.log"
 CRITICAL_LIVE_DATED_DATASETS = ("bars", "valuation", "stk_limit", "stock_st")
@@ -74,6 +79,33 @@ TARGETED_LIVE_REFRESH_DATASETS = (
     "fina_indicator",
     "express",
 )
+
+
+def validate_live_execution_preset(preset_name: str | None) -> str:
+    """Restrict QMT executable tasks to approved live presets."""
+
+    name = str(preset_name or DEFAULT_AUTO_PRESET)
+    if name in LIVE_EXECUTION_PRESETS:
+        return name
+    if name in SHADOW_ONLY_PRESETS:
+        raise ValueError(f"{name} 只允许用于 shadow/challenge，不能生成 QMT 待执行任务")
+    allowed = ", ".join(LIVE_EXECUTION_PRESETS)
+    raise ValueError(f"{name} 未进入实盘执行白名单；QMT 执行入口只允许: {allowed}")
+
+
+@dataclass(frozen=True)
+class LivePositionInertiaConfig:
+    """Centralized live position-drift retention settings."""
+
+    enabled: bool = True
+    short_return_window: int = 5
+    medium_return_window: int = 20
+    downside_vol_window: int = 20
+    short_return_weight: float = 0.4
+    medium_return_weight: float = 0.4
+    downside_vol_weight: float = 0.2
+    lot_size: int = 100
+    missing_retention: float = 0.0
 
 
 def _max_date_partition(storage: ParquetDuckDBBackend, dataset: str) -> str | None:
@@ -158,6 +190,9 @@ class EarningsForecastAutoObserver:
         loop_mode: str,
         nav_initial_equity: float = DEFAULT_AUTO_NAV_INITIAL_EQUITY,
         nav_benchmark: str = DEFAULT_AUTO_NAV_BENCHMARK,
+        xueqiu_enabled: bool = False,
+        xueqiu_cube_symbol: str | None = None,
+        xueqiu_submit: bool = False,
     ) -> None:
         self.workspace = Workspace(Path(root).expanduser())
         self.workspace.ensure_initialized()
@@ -186,6 +221,9 @@ class EarningsForecastAutoObserver:
                 "allow_trading": bool(allow_trading),
                 "nav_initial_equity": float(nav_initial_equity),
                 "nav_benchmark": nav_benchmark,
+                "xueqiu_enabled": bool(xueqiu_enabled),
+                "xueqiu_cube_symbol": xueqiu_cube_symbol or "",
+                "xueqiu_submit": bool(xueqiu_submit),
             },
             "last_tick_status": "starting",
             "last_tick_at": None,
@@ -339,8 +377,8 @@ def prepare_earnings_forecast_next_session(
 ) -> EarningsForecastPreparedArtifacts:
     """基于最新可见数据生成冻结组合与待执行任务。
 
-    orchestration 层不再把执行日硬编码成 T+1，而是优先把任务落到
-    `as_of` 对应的交易日；如果 `as_of` 本身不是交易日，再顺延到下一个交易日。
+    `as_of` 是信号可见日，执行日必须晚于信号日。默认落到 `as_of`
+    之后的下一个交易日，避免手动路径把当天收盘数据用于当天交易。
     这里不会下单。prepare 的职责只有两件事：
     1. 产出带 QMT 只读快照的 live handoff；
     2. 把目标权重冻结成 `TargetPortfolio`，并写入待执行任务。
@@ -356,6 +394,9 @@ def prepare_earnings_forecast_next_session(
     )
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_root.mkdir(parents=True, exist_ok=True)
+    preset_name = validate_live_execution_preset(preset_name)
+    requested_trade_date = execution_trade_date or resolve_execution_trade_date(workspace.root, as_of)
+    _validate_execution_trade_date_after_signal(signal_as_of=as_of, execution_trade_date=requested_trade_date)
 
     handoff = run_earnings_forecast_live_handoff(
         workspace.root,
@@ -372,7 +413,7 @@ def prepare_earnings_forecast_next_session(
         bridge_transport=bridge_transport,
     )
     handoff_date = str(handoff.summary["as_of"])
-    requested_trade_date = execution_trade_date or resolve_execution_trade_date(workspace.root, as_of)
+    _validate_execution_trade_date_after_signal(signal_as_of=handoff_date, execution_trade_date=requested_trade_date)
     trade_date = requested_trade_date
 
     target = pd.read_csv(handoff.target_path)
@@ -380,12 +421,15 @@ def prepare_earnings_forecast_next_session(
     if active.empty and (live_top_n is None or int(live_top_n) <= 0 or preset_name is None):
         raise ValueError("handoff 目标持仓为空，无法生成冻结组合")
 
+    current_positions = _current_position_shares_from_handoff(handoff.summary)
     target_candidates, target_diagnostics = _build_live_target_candidate_frame(
         workspace.root,
         start=start,
         as_of=handoff_date,
+        signal_trade_date=trade_date,
         preset_name=preset_name,
         fallback_active=active,
+        current_positions=current_positions,
         portfolio_notional=float(portfolio_notional),
         live_top_n=live_top_n,
         min_position_value=float(min_position_value),
@@ -400,10 +444,13 @@ def prepare_earnings_forecast_next_session(
 
     strategy_version = _strategy_version_from_handoff(handoff.summary)
     snapshot_id = Path(handoff.json_path).stem
+    portfolio_columns = ["symbol", "target_weight", "reference_price", "action"]
+    if "target_shares" in target_candidates.columns:
+        portfolio_columns.append("target_shares")
     portfolio = build_target_portfolio(
-        target_candidates.rename(columns={"weight": "target_weight"})[
-            ["symbol", "target_weight", "reference_price", "action"]
-        ].rename(columns={"action": "reason"}),
+        target_candidates.rename(columns={"weight": "target_weight"})[portfolio_columns].rename(
+            columns={"action": "reason"}
+        ),
         trade_date=trade_date,
         strategy_version=strategy_version,
         run_id=f"handoff_{handoff_date}",
@@ -437,7 +484,7 @@ def prepare_earnings_forecast_next_session(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "as_of": handoff_date,
-        "requested_as_of": execution_trade_date or as_of,
+        "requested_as_of": as_of,
         "trade_date": trade_date,
         "label": label,
         "preset": handoff.summary.get("preset"),
@@ -585,8 +632,10 @@ def _build_live_target_candidate_frame(
     *,
     start: str,
     as_of: str,
+    signal_trade_date: str | None = None,
     preset_name: str | None,
     fallback_active: pd.DataFrame,
+    current_positions: dict[str, int] | None,
     portfolio_notional: float,
     live_top_n: int | None,
     min_position_value: float,
@@ -610,6 +659,7 @@ def _build_live_target_candidate_frame(
             "skipped_quality_blocked_symbols": [],
             "skipped_st_symbols": [],
             "skipped_permission_symbols": [],
+            "strategy": None,
             "shortfall_reason": "" if len(frame) else "empty_handoff_target",
         }
 
@@ -621,23 +671,33 @@ def _build_live_target_candidate_frame(
         end=as_of,
         require_precise_data=True,
     )
-    preset = get_earnings_forecast_version_preset(preset_name)
+    target_signal_date = str(signal_trade_date or as_of)
+    signal_inputs = _inputs_with_signal_trade_date(inputs, target_signal_date)
+    strategy_spec = resolve_earnings_forecast_version_strategy(preset_name)
+    preset = get_earnings_forecast_version_preset(strategy_spec.base_preset_name)
     strategy_config = EarningsForecastDriftConfig(
         top_n=preset.top_n,
         position_mode=preset.position_mode,
         max_weight=preset.max_weight,
         transaction_cost_bps=preset.transaction_cost_bps,
     )
-    signal, market_gate, blocked_buy, _blocked_sell = _build_version_signal_context(inputs, preset=preset)
+    base_signal, market_gate, blocked_buy, _blocked_sell = _build_version_signal_context(signal_inputs, preset=preset)
+    signal = build_earnings_forecast_strategy_signal(
+        base_signal,
+        workspace=workspace,
+        start=start,
+        end=as_of,
+        spec=strategy_spec,
+    )
     selection_funnel = _build_selection_funnel_base(
-        inputs,
-        as_of=as_of,
+        signal_inputs,
+        as_of=target_signal_date,
         preset=preset,
         blocked_buy=blocked_buy,
     )
     market_observation = _market_gate_observation(inputs, as_of=as_of, config=strategy_config)
-    if as_of not in signal.index:
-        raise ValueError(f"信号矩阵缺少 {as_of}")
+    if target_signal_date not in signal.index:
+        raise ValueError(f"信号矩阵缺少 {target_signal_date}")
     all_signal_symbols = [str(symbol) for symbol in signal.columns.astype(str)]
     all_st_flags = load_trade_st_flags(root, as_of=as_of, symbols=all_signal_symbols)
     known_st_symbols = sorted(symbol for symbol, flagged in all_st_flags.items() if flagged)
@@ -661,12 +721,13 @@ def _build_live_target_candidate_frame(
             "skipped_quality_blocked_symbols": [],
             "skipped_st_symbols": known_st_symbols,
             "skipped_permission_symbols": known_permission_symbols,
+            "strategy": strategy_spec.diagnostics(),
             "shortfall_reason": "market_gate_off",
         }
 
-    day_signal = signal.loc[as_of].dropna().sort_values(ascending=False)
-    if blocked_buy is not None and as_of in blocked_buy.index:
-        blocked = blocked_buy.loc[as_of].reindex(day_signal.index).fillna(False).astype(bool)
+    day_signal = signal.loc[target_signal_date].dropna().sort_values(ascending=False)
+    if blocked_buy is not None and target_signal_date in blocked_buy.index:
+        blocked = blocked_buy.loc[target_signal_date].reindex(day_signal.index).fillna(False).astype(bool)
         day_signal = day_signal.loc[~blocked]
     eligible_count = int(len(day_signal))
     if day_signal.empty:
@@ -685,6 +746,7 @@ def _build_live_target_candidate_frame(
             "skipped_quality_blocked_symbols": [],
             "skipped_st_symbols": known_st_symbols,
             "skipped_permission_symbols": known_permission_symbols,
+            "strategy": strategy_spec.diagnostics(),
             "shortfall_reason": "no_positive_signal_candidates",
         }
 
@@ -765,17 +827,41 @@ def _build_live_target_candidate_frame(
             shortfall_reason = "market_permission_shortfall"
         elif len(selected) < desired_top_n:
             shortfall_reason = "execution_rule_shortfall"
+    selected_frame = pd.DataFrame(
+        selected,
+        columns=["symbol", "weight", "reference_price", "action", "signal_value", "market_board", "min_order_shares"],
+    )
+    inertia_diagnostics: dict[str, Any] = {"enabled": False, "reason": "no_current_positions"}
+    if current_positions:
+        momentum_retention = _live_momentum_retention_by_symbol(
+            root,
+            as_of=as_of,
+            symbols=selected_frame["symbol"].astype(str).tolist() if not selected_frame.empty else [],
+            config=LivePositionInertiaConfig(),
+        )
+        selected_frame, inertia_diagnostics = _apply_live_position_inertia_to_candidates(
+            selected_frame,
+            current_positions=current_positions,
+            momentum_retention=momentum_retention,
+            portfolio_notional=portfolio_notional,
+            config=LivePositionInertiaConfig(),
+        )
+
     diagnostics = {
         "mode": "live_topn_replacement",
+        "signal_as_of": str(as_of),
+        "signal_trade_date": target_signal_date,
         "desired_top_n": desired_top_n,
         "market_cap_top_pct": preset.market_cap_top_pct,
         "market_cap_field": preset.market_cap_field,
+        "strategy": strategy_spec.diagnostics(),
         "eligible_signal_count": eligible_count,
         "selection_funnel": selection_funnel,
         "market_gate": market_observation,
         "candidate_limit": candidate_limit,
-        "final_position_count": int(len(selected)),
+        "final_position_count": int(len(selected_frame)),
         "target_weight": target_weight,
+        "position_inertia": inertia_diagnostics,
         "data_freshness": freshness,
         "skipped_counts": {
             "unaffordable": len(skipped_unaffordable),
@@ -791,10 +877,222 @@ def _build_live_target_candidate_frame(
         "skipped_permission_symbols": sorted(skipped_permission_symbols),
         "shortfall_reason": shortfall_reason,
     }
-    return pd.DataFrame(
-        selected,
-        columns=["symbol", "weight", "reference_price", "action", "signal_value", "market_board", "min_order_shares"],
-    ), diagnostics
+    return selected_frame, diagnostics
+
+
+def _inputs_with_signal_trade_date(inputs: Any, signal_trade_date: str) -> Any:
+    """Project latest visible daily matrices onto a future trade-date signal row."""
+
+    trade_date = str(signal_trade_date)
+    if trade_date in inputs.open_prices.index:
+        return inputs
+    return dataclasses.replace(
+        inputs,
+        open_prices=_project_wide_frame_to_trade_date(inputs.open_prices, trade_date),
+        close_prices=_project_wide_frame_to_trade_date(inputs.close_prices, trade_date),
+        amount=_project_wide_frame_to_trade_date(inputs.amount, trade_date),
+        raw_open_prices=_project_wide_frame_to_trade_date(inputs.raw_open_prices, trade_date),
+    )
+
+
+def _project_wide_frame_to_trade_date(frame: pd.DataFrame, trade_date: str) -> pd.DataFrame:
+    if frame.empty or str(trade_date) in frame.index:
+        return frame
+    index_values = [str(item) for item in frame.index]
+    extended_index = pd.Index(sorted({*index_values, str(trade_date)}, key=lambda item: int(item)), dtype="object")
+    projected = frame.copy()
+    projected.index = projected.index.astype(str)
+    projected = projected.reindex(extended_index)
+    prior = projected.loc[projected.index < str(trade_date)].dropna(how="all")
+    if prior.empty:
+        return projected
+    projected.loc[str(trade_date)] = prior.iloc[-1]
+    return projected
+
+
+def _apply_live_position_inertia_to_candidates(
+    candidates: pd.DataFrame,
+    *,
+    current_positions: dict[str, int],
+    momentum_retention: dict[str, float],
+    portfolio_notional: float,
+    config: LivePositionInertiaConfig,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if candidates.empty or not config.enabled:
+        return candidates.copy(), {
+            "enabled": bool(config.enabled),
+            "adjusted_position_count": 0,
+            "retained_excess_shares": 0,
+            "trimmed_excess_shares": 0,
+        }
+    if portfolio_notional <= 0:
+        raise ValueError("portfolio_notional must be positive")
+    if config.lot_size <= 0:
+        raise ValueError("inertia lot_size must be positive")
+
+    rows = candidates.copy()
+    missing_momentum_count = 0
+    records: list[dict[str, Any]] = []
+
+    for row in rows.itertuples(index=False):
+        symbol = str(row.symbol)
+        price = float(row.reference_price)
+        base_weight = float(row.weight)
+        base_shares = _round_lot_down(portfolio_notional * base_weight / price, config.lot_size)
+        current_shares = max(0, int(current_positions.get(symbol, 0)))
+        retention_raw = momentum_retention.get(symbol)
+        if retention_raw is None or pd.isna(retention_raw):
+            missing_momentum_count += 1
+            retention = float(config.missing_retention)
+        else:
+            retention = float(retention_raw)
+        retention = float(np.clip(retention, 0.0, 1.0))
+
+        action = "base_target"
+        retained_excess = 0
+        if current_shares < base_shares:
+            action = "top_up"
+        elif current_shares > base_shares:
+            excess = current_shares - base_shares
+            retained_excess = min(excess, _round_lot_down(excess * retention, config.lot_size))
+            if retained_excess >= excess:
+                action = "retain_excess"
+            elif retained_excess > 0:
+                action = "partial_trim_excess"
+            else:
+                action = "trim_excess"
+
+        records.append(
+            {
+                "symbol": symbol,
+                "price": price,
+                "base_shares": int(base_shares),
+                "current_shares": int(current_shares),
+                "retained_excess": int(retained_excess),
+                "target_shares": int(base_shares + retained_excess),
+                "protected": bool(retained_excess > 0),
+                "inertia_action": action,
+                "momentum_retention": retention,
+            }
+        )
+
+    budget_limited = False
+    target_value = sum(float(item["target_shares"] * item["price"]) for item in records)
+    if target_value > portfolio_notional + 1e-9:
+        budget_limited = True
+        protected_value = sum(
+            float(item["target_shares"] * item["price"]) for item in records if bool(item["protected"])
+        )
+        unprotected = [item for item in records if not bool(item["protected"])]
+        unprotected_base_value = sum(float(item["base_shares"] * item["price"]) for item in unprotected)
+        if protected_value <= portfolio_notional and unprotected_base_value > 0:
+            scale = max(0.0, float((portfolio_notional - protected_value) / unprotected_base_value))
+            for item in unprotected:
+                scaled_shares = _round_lot_down(float(item["base_shares"]) * scale, config.lot_size)
+                item["target_shares"] = min(int(item["base_shares"]), int(scaled_shares))
+                if int(item["target_shares"]) < int(item["base_shares"]):
+                    item["inertia_action"] = "budget_limited_" + str(item["inertia_action"])
+        elif target_value > 0:
+            scale = max(0.0, float(portfolio_notional / target_value))
+            for item in records:
+                scaled_shares = _round_lot_down(float(item["target_shares"]) * scale, config.lot_size)
+                item["target_shares"] = int(scaled_shares)
+                if int(item["target_shares"]) < int(item["base_shares"] + item["retained_excess"]):
+                    item["inertia_action"] = "budget_limited_" + str(item["inertia_action"])
+
+    target_shares = [int(item["target_shares"]) for item in records]
+    adjusted_weights = [float(item["target_shares"] * item["price"] / portfolio_notional) for item in records]
+    inertia_actions = [str(item["inertia_action"]) for item in records]
+    retention_values = [float(item["momentum_retention"]) for item in records]
+    adjusted_count = sum(1 for item in records if int(item["current_shares"]) > int(item["base_shares"]))
+    retained_excess_total = sum(
+        max(0, min(int(item["target_shares"]) - int(item["base_shares"]), int(item["current_shares"]) - int(item["base_shares"])))
+        for item in records
+        if int(item["current_shares"]) > int(item["base_shares"])
+    )
+    trimmed_excess_total = sum(
+        max(0, int(item["current_shares"]) - int(item["target_shares"]))
+        for item in records
+        if int(item["current_shares"]) > int(item["base_shares"])
+    )
+
+    rows["target_shares"] = target_shares
+    rows["weight"] = adjusted_weights
+    rows["inertia_action"] = inertia_actions
+    rows["momentum_retention"] = retention_values
+    return rows, {
+        "enabled": True,
+        "current_position_count": int(sum(1 for shares in current_positions.values() if int(shares) > 0)),
+        "adjusted_position_count": adjusted_count,
+        "retained_excess_shares": int(retained_excess_total),
+        "trimmed_excess_shares": int(trimmed_excess_total),
+        "missing_momentum_count": missing_momentum_count,
+        "budget_limited": budget_limited,
+        "config": dataclasses.asdict(config),
+    }
+
+
+def _live_momentum_retention_by_symbol(
+    root: str | Path,
+    *,
+    as_of: str,
+    symbols: list[str],
+    config: LivePositionInertiaConfig,
+) -> dict[str, float]:
+    if not symbols:
+        return {}
+    workspace = Workspace(Path(root).expanduser())
+    storage = ParquetDuckDBBackend(workspace.data_dir)
+    bars = storage.read("bars", filters={"date": ("<=", int(as_of))}, columns=["date", "symbol", "close"])
+    bars = _filter_daily_frame(bars, start="19000101", end=as_of)
+    if bars.empty:
+        return {str(symbol): float(config.missing_retention) for symbol in symbols}
+    bars = bars.loc[bars["symbol"].astype(str).isin([str(symbol) for symbol in symbols])].copy()
+    if bars.empty:
+        return {str(symbol): float(config.missing_retention) for symbol in symbols}
+    bars["date"] = bars["date"].astype(str)
+    bars["symbol"] = bars["symbol"].astype(str)
+    bars["close"] = pd.to_numeric(bars["close"], errors="coerce")
+    close = bars.pivot_table(index="date", columns="symbol", values="close", aggfunc="last").sort_index()
+    close = close.loc[close.index <= str(as_of)]
+    if close.empty:
+        return {str(symbol): float(config.missing_retention) for symbol in symbols}
+
+    short_return = close / close.shift(config.short_return_window) - 1.0
+    medium_return = close / close.shift(config.medium_return_window) - 1.0
+    downside_vol = close.pct_change().clip(upper=0.0).rolling(
+        config.downside_vol_window,
+        min_periods=max(2, config.downside_vol_window // 2),
+    ).std()
+    latest_date = close.index.max()
+    short_pct = short_return.loc[latest_date].rank(pct=True)
+    medium_pct = medium_return.loc[latest_date].rank(pct=True)
+    downside_pct = downside_vol.loc[latest_date].rank(pct=True, ascending=False)
+    weight_sum = (
+        float(config.short_return_weight)
+        + float(config.medium_return_weight)
+        + float(config.downside_vol_weight)
+    )
+    if weight_sum <= 0:
+        return {str(symbol): float(config.missing_retention) for symbol in symbols}
+    score = (
+        short_pct * float(config.short_return_weight)
+        + medium_pct * float(config.medium_return_weight)
+        + downside_pct * float(config.downside_vol_weight)
+    ) / weight_sum
+    result: dict[str, float] = {}
+    for symbol in symbols:
+        value = score.get(str(symbol), np.nan)
+        result[str(symbol)] = (
+            float(np.clip(value, 0.0, 1.0))
+            if pd.notna(value)
+            else float(np.clip(config.missing_retention, 0.0, 1.0))
+        )
+    return result
+
+
+def _round_lot_down(raw_shares: float, lot_size: int) -> int:
+    return int(float(raw_shares) // int(lot_size)) * int(lot_size)
 
 
 def _fallback_target_candidates(root: str | Path, as_of: str, active: pd.DataFrame) -> pd.DataFrame:
@@ -887,7 +1185,7 @@ def execute_pending_qmt_task(
     qmt_bridge_token: str | None = None,
     qmt_account_id: str | None = None,
     allow_missing_st_data: bool = False,
-    allow_trading: bool = True,
+    allow_trading: bool = False,
     buy_limit_bps: float = 30.0,
     sell_limit_bps: float = 30.0,
     min_order_value: float = 3_000.0,
@@ -907,6 +1205,27 @@ def execute_pending_qmt_task(
     portfolio = target_portfolio_from_dict(
         read_json(Path(task_payload["target_portfolio_path"]).expanduser())
     )
+    try:
+        validate_live_execution_preset(str(task_payload.get("strategy_version") or portfolio.strategy_version))
+    except ValueError as exc:
+        reason = str(exc)
+        task_payload.update(
+            {
+                "status": "blocked",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "error": reason,
+            }
+        )
+        write_json(task_file, task_payload)
+        return {
+            "task_path": str(task_file),
+            "task_status": "blocked",
+            "exec_id": "",
+            "risk_passed": False,
+            "blocking_reasons": [reason],
+            "execution_report_path": "",
+            "execution_report_md_path": "",
+        }
 
     bridge_probe = QmtBridgeConfig(
         base_url=qmt_bridge_url,
@@ -925,11 +1244,33 @@ def execute_pending_qmt_task(
             *(item.symbol for item in portfolio.positions),
         }
     )
-    st_flags = load_trade_st_flags(
-        workspace.root,
-        as_of=str(task_payload.get("as_of") or portfolio.trade_date),
-        symbols=symbols,
-    )
+    try:
+        st_flags = load_trade_st_flags(
+            workspace.root,
+            as_of=str(portfolio.trade_date),
+            symbols=symbols,
+        )
+    except ValueError as exc:
+        if not allow_missing_st_data:
+            reason = str(exc)
+            task_payload.update(
+                {
+                    "status": "blocked",
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                    "error": reason,
+                }
+            )
+            write_json(task_file, task_payload)
+            return {
+                "task_path": str(task_file),
+                "task_status": "blocked",
+                "exec_id": "",
+                "risk_passed": False,
+                "blocking_reasons": [reason],
+                "execution_report_path": "",
+                "execution_report_md_path": "",
+            }
+        st_flags = None
 
     artifacts = run_qmt_rebalance(
         portfolio,
@@ -947,7 +1288,7 @@ def execute_pending_qmt_task(
             min_order_value=float(min_order_value),
         ),
         risk_config=PreTradeRiskConfig(
-            mode="qmt_sim",
+            mode="live" if allow_trading else "qmt_sim",
             allow_live=bool(allow_trading),
             require_st_data=not bool(allow_missing_st_data),
             max_order_count=int(max_order_count),
@@ -1023,6 +1364,183 @@ def _record_auto_nav_snapshot(
     )
 
 
+def _xueqiu_notification_profile_config(root: str | Path, profile_name: str | None) -> dict[str, Any]:
+    try:
+        from vortex.config.profile.resolver import ProfileResolver
+        from vortex.config.profile.store import ProfileStore
+
+        workspace = Workspace(Path(root).expanduser())
+        profile, _ = ProfileResolver(ProfileStore(workspace.profiles_dir)).resolve(
+            profile_name or "default",
+            "data",
+        )
+        config = getattr(profile, "notification", {})
+        if isinstance(config, dict):
+            return config
+    except Exception:  # noqa: BLE001 - notification must not break trading sidecars.
+        pass
+    fallback_channel = "lark" if os.getenv("LARK_APP_ID") else "feishu"
+    return {"enabled": True, "level": "warning", "channel": fallback_channel}
+
+
+def _notify_xueqiu_auth_required(
+    root: str | Path,
+    *,
+    profile_name: str | None,
+    task_path: str | Path,
+    cube_symbol: str,
+    error: BaseException,
+    source: str,
+) -> dict[str, Any]:
+    from vortex.notification.models import NotificationMessage
+    from vortex.notification.service import NotificationService
+    from vortex.runtime.database import Database
+    from vortex.trade.xueqiu import classify_xueqiu_exception
+
+    classified = classify_xueqiu_exception(error)
+    if not bool(classified["login_required"]):
+        return {"status": "skipped", "reason": "not_login_required"}
+
+    workspace = Workspace(Path(root).expanduser())
+    db = Database(workspace.db_path)
+    db.initialize_tables()
+    try:
+        message = NotificationMessage(
+            event_type="trade.xueqiu.auth_required",
+            notification_type="trade_auth_required",
+            severity="warning",
+            title="雪球组合登录失效",
+            summary=(
+                f"雪球组合 {cube_symbol} 同步失败，需要重新登录或完成人工验证。"
+                f"错误：{classified['error']}"
+            ),
+            impact="雪球组合展示仓位未确认同步；QMT 主执行链路不受影响。",
+            suggested_actions=(
+                "打开 Chrome 访问 https://xueqiu.com/ 并完成登录或验证。",
+                "登录后刷新本地 XUEQIU_COOKIE_FILE，或重新运行雪球同步/auto-run。",
+                "在工作台查看 pending task 的 xueqiu_sync_status 和 xueqiu_sync_error。",
+            ),
+            task_id=str(task_path),
+            detail={
+                "cube_symbol": cube_symbol,
+                "source": source,
+                "error_code": classified["error_code"],
+                "task_path": str(task_path),
+            },
+        )
+        deliveries = NotificationService(db).notify(
+            message,
+            _xueqiu_notification_profile_config(root, profile_name),
+        )
+        return {
+            "status": "sent" if any(item.get("status") == "sent" for item in deliveries) else "recorded",
+            "deliveries": deliveries,
+        }
+    finally:
+        db.close()
+
+
+def _sync_auto_xueqiu_task(
+    root: str | Path,
+    *,
+    task_path: str | Path,
+    cube_symbol: str,
+    cookie: str | None,
+    cookie_file: str | Path | None,
+    market: str,
+    submit: bool,
+    profile_name: str | None = None,
+    notify_auth_error: bool = True,
+    source: str = "auto-run",
+) -> dict[str, Any]:
+    from vortex.trade.xueqiu import XueqiuConfig, classify_xueqiu_exception, run_xueqiu_rebalance
+
+    workspace = Workspace(Path(root).expanduser())
+    workspace.ensure_initialized()
+    task_file = Path(task_path).expanduser()
+    task_payload = read_json(task_file)
+    portfolio = target_portfolio_from_dict(
+        read_json(Path(task_payload["target_portfolio_path"]).expanduser())
+    )
+    try:
+        artifacts = run_xueqiu_rebalance(
+            portfolio,
+            config=XueqiuConfig(
+                cube_symbol=cube_symbol,
+                market=market,
+                cookie=cookie,
+                cookie_file=cookie_file,
+                allow_submit=submit,
+            ),
+            output_root=workspace.root,
+        )
+    except Exception as exc:  # noqa: BLE001 - Xueqiu is a sidecar channel.
+        classified = classify_xueqiu_exception(exc)
+        notification: dict[str, Any] | None = None
+        if notify_auth_error and bool(classified["login_required"]):
+            try:
+                notification = _notify_xueqiu_auth_required(
+                    workspace.root,
+                    profile_name=profile_name,
+                    task_path=task_file,
+                    cube_symbol=cube_symbol,
+                    error=exc,
+                    source=source,
+                )
+            except Exception as notify_exc:  # noqa: BLE001 - record notification failure only.
+                notification = {"status": "error", "error": str(notify_exc)}
+        task_payload.update(
+            {
+                "xueqiu_sync_status": "error",
+                "xueqiu_sync_error": str(exc),
+                "xueqiu_sync_error_code": classified["error_code"],
+                "xueqiu_sync_login_required": bool(classified["login_required"]),
+                "xueqiu_cube_symbol": cube_symbol,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        if notification is not None:
+            task_payload["xueqiu_auth_notification"] = notification
+        write_json(task_file, task_payload)
+        result = {
+            "task_path": str(task_file),
+            "status": "error",
+            "submitted": False,
+            "error": str(exc),
+            "error_code": classified["error_code"],
+            "login_required": bool(classified["login_required"]),
+        }
+        if notification is not None:
+            result["notification"] = notification
+        return result
+
+    task_payload.update(
+        {
+            "xueqiu_sync_id": artifacts.sync_id,
+            "xueqiu_sync_status": artifacts.summary.get("status", ""),
+            "xueqiu_sync_report_path": str(artifacts.report_path),
+            "xueqiu_cube_symbol": cube_symbol,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    for stale_key in (
+        "xueqiu_sync_error",
+        "xueqiu_sync_error_code",
+        "xueqiu_sync_login_required",
+        "xueqiu_auth_notification",
+    ):
+        task_payload.pop(stale_key, None)
+    write_json(task_file, task_payload)
+    return {
+        "task_path": str(task_file),
+        "sync_id": artifacts.sync_id,
+        "status": artifacts.summary.get("status"),
+        "submitted": bool(artifacts.summary.get("submitted")),
+        "report_path": str(artifacts.report_path),
+        "payload_path": str(artifacts.payload_path),
+    }
+
+
 def run_earnings_forecast_auto_cycle_once(
     root: str | Path,
     *,
@@ -1036,9 +1554,17 @@ def run_earnings_forecast_auto_cycle_once(
     prepare_time: str = DEFAULT_AUTO_PREPARE_TIME,
     execute_time: str = DEFAULT_AUTO_EXECUTE_TIME,
     now: datetime | None = None,
-    allow_trading: bool = True,
+    allow_trading: bool = False,
     nav_initial_equity: float = DEFAULT_AUTO_NAV_INITIAL_EQUITY,
     nav_benchmark: str = DEFAULT_AUTO_NAV_BENCHMARK,
+    xueqiu_enabled: bool = False,
+    xueqiu_cube_symbol: str | None = None,
+    xueqiu_cookie: str | None = None,
+    xueqiu_cookie_file: str | Path | None = None,
+    xueqiu_market: str = "cn",
+    xueqiu_submit: bool = False,
+    xueqiu_notification_profile: str | None = None,
+    xueqiu_notify_auth_error: bool = True,
 ) -> dict[str, object]:
     """执行一次自动编排 tick。
 
@@ -1057,6 +1583,7 @@ def run_earnings_forecast_auto_cycle_once(
         "today": today,
         "prepared": None,
         "executed": [],
+        "xueqiu_synced": [],
         "nav_snapshot": None,
         "skipped": [],
     }
@@ -1100,8 +1627,59 @@ def run_earnings_forecast_auto_cycle_once(
                 preset_name=preset_name,
             )
             summary["prepared"] = prepared.summary
+            if xueqiu_enabled:
+                try:
+                    cast_xq = summary["xueqiu_synced"]
+                    assert isinstance(cast_xq, list)
+                    cast_xq.append(
+                        _sync_auto_xueqiu_task(
+                            workspace.root,
+                            task_path=prepared.task_path,
+                            cube_symbol=str(xueqiu_cube_symbol or ""),
+                            cookie=xueqiu_cookie,
+                            cookie_file=xueqiu_cookie_file,
+                            market=xueqiu_market,
+                            submit=bool(xueqiu_submit),
+                            profile_name=xueqiu_notification_profile or profile_name,
+                            notify_auth_error=bool(xueqiu_notify_auth_error),
+                            source="auto-run.prepare",
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - Xueqiu is a sidecar channel.
+                    cast_skipped = summary["skipped"]
+                    assert isinstance(cast_skipped, list)
+                    cast_skipped.append(f"xueqiu sync failed: {exc}")
+                    cast_xq = summary["xueqiu_synced"]
+                    assert isinstance(cast_xq, list)
+                    cast_xq.append({"status": "error", "message": str(exc)})
         else:
             summary["skipped"].append("trade-day plan already exists for today")
+            if xueqiu_enabled:
+                for task in existing:
+                    try:
+                        cast_xq = summary["xueqiu_synced"]
+                        assert isinstance(cast_xq, list)
+                        cast_xq.append(
+                            _sync_auto_xueqiu_task(
+                                workspace.root,
+                                task_path=str(task["_task_path"]),
+                                cube_symbol=str(xueqiu_cube_symbol or ""),
+                                cookie=xueqiu_cookie,
+                                cookie_file=xueqiu_cookie_file,
+                                market=xueqiu_market,
+                                submit=bool(xueqiu_submit),
+                                profile_name=xueqiu_notification_profile or profile_name,
+                                notify_auth_error=bool(xueqiu_notify_auth_error),
+                                source="auto-run.existing-task",
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 - Xueqiu is a sidecar channel.
+                        cast_skipped = summary["skipped"]
+                        assert isinstance(cast_skipped, list)
+                        cast_skipped.append(f"xueqiu sync failed: {exc}")
+                        cast_xq = summary["xueqiu_synced"]
+                        assert isinstance(cast_xq, list)
+                        cast_xq.append({"status": "error", "message": str(exc)})
     else:
         summary["skipped"].append("prepare window not reached")
 
@@ -1158,9 +1736,17 @@ def run_earnings_forecast_auto_once(
     label: str = DEFAULT_AUTO_LABEL,
     prepare_time: str = DEFAULT_AUTO_PREPARE_TIME,
     execute_time: str = DEFAULT_AUTO_EXECUTE_TIME,
-    allow_trading: bool = True,
+    allow_trading: bool = False,
     nav_initial_equity: float = DEFAULT_AUTO_NAV_INITIAL_EQUITY,
     nav_benchmark: str = DEFAULT_AUTO_NAV_BENCHMARK,
+    xueqiu_enabled: bool = False,
+    xueqiu_cube_symbol: str | None = None,
+    xueqiu_cookie: str | None = None,
+    xueqiu_cookie_file: str | Path | None = None,
+    xueqiu_market: str = "cn",
+    xueqiu_submit: bool = False,
+    xueqiu_notification_profile: str | None = None,
+    xueqiu_notify_auth_error: bool = True,
 ) -> dict[str, object]:
     """执行一轮 auto-run，并同步刷新状态文件与稳定日志。"""
 
@@ -1179,6 +1765,9 @@ def run_earnings_forecast_auto_once(
         loop_mode="once",
         nav_initial_equity=nav_initial_equity,
         nav_benchmark=nav_benchmark,
+        xueqiu_enabled=xueqiu_enabled,
+        xueqiu_cube_symbol=xueqiu_cube_symbol,
+        xueqiu_submit=xueqiu_submit,
     )
     try:
         payload = run_earnings_forecast_auto_cycle_once(
@@ -1195,6 +1784,14 @@ def run_earnings_forecast_auto_once(
             allow_trading=allow_trading,
             nav_initial_equity=nav_initial_equity,
             nav_benchmark=nav_benchmark,
+            xueqiu_enabled=xueqiu_enabled,
+            xueqiu_cube_symbol=xueqiu_cube_symbol,
+            xueqiu_cookie=xueqiu_cookie,
+            xueqiu_cookie_file=xueqiu_cookie_file,
+            xueqiu_market=xueqiu_market,
+            xueqiu_submit=xueqiu_submit,
+            xueqiu_notification_profile=xueqiu_notification_profile or profile_name,
+            xueqiu_notify_auth_error=xueqiu_notify_auth_error,
         )
     except Exception as exc:
         observer.record_tick_error(exc, keep_running=False)
@@ -1216,9 +1813,17 @@ def run_earnings_forecast_auto_loop(
     prepare_time: str = DEFAULT_AUTO_PREPARE_TIME,
     execute_time: str = DEFAULT_AUTO_EXECUTE_TIME,
     poll_seconds: int = 60,
-    allow_trading: bool = True,
+    allow_trading: bool = False,
     nav_initial_equity: float = DEFAULT_AUTO_NAV_INITIAL_EQUITY,
     nav_benchmark: str = DEFAULT_AUTO_NAV_BENCHMARK,
+    xueqiu_enabled: bool = False,
+    xueqiu_cube_symbol: str | None = None,
+    xueqiu_cookie: str | None = None,
+    xueqiu_cookie_file: str | Path | None = None,
+    xueqiu_market: str = "cn",
+    xueqiu_submit: bool = False,
+    xueqiu_notification_profile: str | None = None,
+    xueqiu_notify_auth_error: bool = True,
 ) -> None:
     """常驻循环执行自动编排。"""
 
@@ -1237,6 +1842,9 @@ def run_earnings_forecast_auto_loop(
         loop_mode="loop",
         nav_initial_equity=nav_initial_equity,
         nav_benchmark=nav_benchmark,
+        xueqiu_enabled=xueqiu_enabled,
+        xueqiu_cube_symbol=xueqiu_cube_symbol,
+        xueqiu_submit=xueqiu_submit,
     )
     try:
         while True:
@@ -1255,6 +1863,14 @@ def run_earnings_forecast_auto_loop(
                     allow_trading=allow_trading,
                     nav_initial_equity=nav_initial_equity,
                     nav_benchmark=nav_benchmark,
+                    xueqiu_enabled=xueqiu_enabled,
+                    xueqiu_cube_symbol=xueqiu_cube_symbol,
+                    xueqiu_cookie=xueqiu_cookie,
+                    xueqiu_cookie_file=xueqiu_cookie_file,
+                    xueqiu_market=xueqiu_market,
+                    xueqiu_submit=xueqiu_submit,
+                    xueqiu_notification_profile=xueqiu_notification_profile or profile_name,
+                    xueqiu_notify_auth_error=xueqiu_notify_auth_error,
                 )
             except Exception as exc:
                 observer.record_tick_error(exc, keep_running=True)
@@ -1403,13 +2019,18 @@ def resolve_next_trade_date(root: str | Path, as_of: str) -> str:
 def resolve_execution_trade_date(root: str | Path, as_of: str) -> str:
     """解析 prepare 对应的执行日。
 
-    交易日开盘前 prepare 默认生成当天执行计划；只有当 `as_of` 不是交易日时，
-    才顺延到下一个交易日，避免 orchestration 层再额外叠加一层硬编码 T+1。
+    `as_of` 是信号可见日，默认执行日必须是其后的下一个交易日。
     """
 
-    if is_trade_day(root, as_of):
-        return as_of
     return resolve_next_trade_date(root, as_of)
+
+
+def _validate_execution_trade_date_after_signal(*, signal_as_of: str, execution_trade_date: str) -> None:
+    if int(str(execution_trade_date)) <= int(str(signal_as_of)):
+        raise ValueError(
+            "execution_trade_date must be after signal as_of "
+            f"(signal_as_of={signal_as_of}, execution_trade_date={execution_trade_date})"
+        )
 
 
 def _resolve_latest_strategy_as_of(root: str | Path, trade_date: str) -> str:
@@ -1513,10 +2134,36 @@ def load_trade_st_flags(
 
 
 def _strategy_version_from_handoff(summary: dict[str, Any]) -> str:
+    strategy = summary.get("strategy")
+    if isinstance(strategy, dict) and strategy.get("name"):
+        return str(strategy["name"])
     preset = summary.get("preset")
     if isinstance(preset, dict) and preset.get("name"):
         return str(preset["name"])
     return "earnings_forecast_drift"
+
+
+def _current_position_shares_from_handoff(summary: dict[str, Any]) -> dict[str, int]:
+    bridge_snapshot = summary.get("bridge_snapshot")
+    if not isinstance(bridge_snapshot, dict):
+        return {}
+    raw_positions = bridge_snapshot.get("positions")
+    if not isinstance(raw_positions, list):
+        return {}
+    positions: dict[str, int] = {}
+    for raw in raw_positions:
+        if not isinstance(raw, dict):
+            continue
+        symbol = raw.get("symbol")
+        if not symbol:
+            continue
+        try:
+            shares = int(raw.get("shares") or 0)
+        except (TypeError, ValueError):
+            continue
+        if shares > 0:
+            positions[str(symbol)] = shares
+    return positions
 
 
 def _pending_task_dir(root: str | Path) -> Path:

@@ -18,7 +18,7 @@ updated: 2026-05-17
 | 研究 reference baseline | 可以在测试级通过后替代 | 候选已冻结，CPCV / 样本外 / 成本 / 容量均通过 |
 | 正式 preset / live 默认 | 不可以只凭回测替代 | 还需要 paper shadow、模拟盘或用户审批 |
 
-因此，`tail_risk_soft_q10_p25` 这类候选可以进入“替代研究 reference baseline 的候选评估”，但不能因为全样本回测好看就直接替换 `baseline_top110_large` 的正式 preset。2026-05-17 PIT 修正复跑后，该候选未通过 CPCV，默认仍应保持 `baseline_top110_large`。
+因此，`tail_risk_soft_q10_p25` 这类候选可以进入“替代研究 reference baseline 的候选评估”，但不能因为全样本回测好看就直接替换正式 preset。2026-05-17 PIT 修正复跑后，该候选未通过 CPCV；研究 reference 仍保持 `baseline_top110_large`。用户随后确认 100 万实盘默认采用资金量适配的 `stable_100w`，这属于 live preset 选择，不等同于替代研究 reference baseline。
 
 ## 四层评估
 
@@ -100,7 +100,8 @@ N=10, k=2 -> 45 个 train/test split，约 9 条组合路径
 ```text
 tail_risk_soft_q10_p25 -> explicit shadow/challenge only
 rerank_tail_risk_w010 -> paper shadow reference / parent lineage
-baseline_top110_large -> 继续作为正式 preset，直到 CPCV + paper shadow + 用户审批通过
+baseline_top110_large -> 继续作为研究 reference / 大容量回滚
+stable_100w -> 100 万 live 默认 preset
 ```
 
 ## 产物要求
