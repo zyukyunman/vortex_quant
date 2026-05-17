@@ -135,6 +135,100 @@ def test_run_qmt_rebalance_writes_artifacts_and_submits_orders(tmp_path, monkeyp
     assert len(artifacts.report.orders) == 1
 
 
+def test_run_qmt_rebalance_dry_run_does_not_call_submit_order(tmp_path, monkeypatch) -> None:
+    portfolio = build_target_portfolio(
+        pd.DataFrame([{"symbol": "000001.SZ", "target_weight": 0.5, "reference_price": 10.0}]),
+        trade_date="20260501",
+        strategy_version="earnings_v3",
+        run_id="run_1",
+        snapshot_id="snap_1",
+        config=TargetPortfolioBuildConfig(notional=100_000),
+    )
+    submitted: list[object] = []
+
+    class _FakeAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def health(self):
+            from vortex.trade import BrokerHealth
+
+            return BrokerHealth(ok=True, mode="qmt_bridge", message="ok")
+
+        def get_cash(self):
+            from vortex.trade import CashSnapshot
+
+            return CashSnapshot(available_cash=100_000.0, frozen_cash=0.0, total_asset=100_000.0, market_value=0.0)
+
+        def get_positions(self):
+            return []
+
+        def get_quotes(self, symbols):
+            return {symbol: Quote(symbol=symbol, open_price=10.0, volume=100_000) for symbol in symbols}
+
+        def submit_order(self, intent):
+            submitted.append(intent)
+            raise AssertionError("dry-run must not call submit_order")
+
+        def get_orders(self):
+            return []
+
+        def get_fills(self):
+            return []
+
+    monkeypatch.setattr("vortex.trade.execution.QmtBridgeAdapter", _FakeAdapter)
+
+    artifacts = run_qmt_rebalance(
+        portfolio,
+        bridge_config=QmtBridgeConfig(base_url="http://127.0.0.1:8000", account_id="99034443", allow_trading=False),
+        output_root=tmp_path,
+        st_flags={"000001.SZ": False},
+    )
+
+    assert artifacts.report.mode == "qmt_dry_run"
+    assert artifacts.report.risk_result.passed is True
+    assert artifacts.report.order_plan.orders
+    assert submitted == []
+
+
+def test_run_qmt_rebalance_writes_blocked_artifacts_when_health_fails(tmp_path, monkeypatch) -> None:
+    portfolio = build_target_portfolio(
+        pd.DataFrame([{"symbol": "000001.SZ", "target_weight": 0.5, "reference_price": 10.0}]),
+        trade_date="20260501",
+        strategy_version="earnings_v3",
+        run_id="run_1",
+        snapshot_id="snap_1",
+        config=TargetPortfolioBuildConfig(notional=100_000),
+    )
+
+    class _FakeAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def health(self):
+            from vortex.trade import BrokerHealth
+
+            return BrokerHealth(ok=False, mode="qmt_bridge", message="bridge down")
+
+    monkeypatch.setattr("vortex.trade.execution.QmtBridgeAdapter", _FakeAdapter)
+
+    artifacts = run_qmt_rebalance(
+        portfolio,
+        bridge_config=QmtBridgeConfig(base_url="http://127.0.0.1:8000", account_id="99034443", allow_trading=False),
+        output_root=tmp_path,
+        st_flags={"000001.SZ": False},
+    )
+
+    assert artifacts.order_intent_path.exists()
+    assert artifacts.order_plan_path.exists()
+    assert artifacts.risk_result_path.exists()
+    assert artifacts.execution_report_path.exists()
+    assert artifacts.execution_report_md_path.exists()
+    assert artifacts.report.risk_result.passed is False
+    assert "bridge health failed: bridge down" in artifacts.report.risk_result.blocking_reasons
+    assert artifacts.report.order_plan.orders == []
+
+
 def test_run_qmt_rebalance_diffs_against_real_positions_before_submitting(tmp_path, monkeypatch) -> None:
     portfolio = build_target_portfolio(
         pd.DataFrame([{"symbol": "000001.SZ", "target_weight": 1.0, "reference_price": 10.0}]),

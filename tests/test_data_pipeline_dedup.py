@@ -1214,6 +1214,93 @@ class TestGenericDatasetPipeline:
         assert provider.requested_ranges == [("20260630", "20261231")]
         assert provider.requested_partition_values == [["20260630", "20261231"]]
 
+    def test_repair_refreshes_recent_existing_mutable_quarter_partition(self, tmp_path):
+        class MutableQuarterProvider(GenericDatasetProvider):
+            def __init__(self) -> None:
+                self.requested_ranges: list[tuple[str, str]] = []
+                self.requested_partition_values: list[list[str] | None] = []
+
+            @property
+            def dataset_registry(self) -> dict[str, dict[str, object]]:
+                return {
+                    "forecast": {
+                        "api": "forecast",
+                        "description": "业绩预告",
+                        "phase": "2",
+                        "fetch_mode": "symbol_quarter_range",
+                        "partition_by": "report_date",
+                        "refresh_existing_recent_partitions": 1,
+                    },
+                }
+
+            def fetch_dataset(
+                self,
+                dataset: str,
+                market: str,
+                start: date,
+                end: date,
+                *,
+                symbols: list[str] | None = None,
+                trading_days: list[date] | None = None,
+                partition_values: list[str] | None = None,
+            ) -> pd.DataFrame:
+                assert dataset == "forecast"
+                self.requested_ranges.append((start.strftime("%Y%m%d"), end.strftime("%Y%m%d")))
+                self.requested_partition_values.append(partition_values)
+                return pd.DataFrame(
+                    {
+                        "symbol": ["688001.SH"],
+                        "ann_date": ["20260517"],
+                        "report_date": ["20260331"],
+                        "type": ["预增"],
+                        "p_change_min": [719.13],
+                        "p_change_max": [719.13],
+                    }
+                )
+
+        provider = MutableQuarterProvider()
+        storage = ParquetDuckDBBackend(tmp_path / "data")
+        storage.initialize()
+        storage.upsert(
+            "forecast",
+            pd.DataFrame(
+                {
+                    "symbol": ["600519.SH"],
+                    "ann_date": ["20260415"],
+                    "report_date": ["20260331"],
+                    "type": ["预增"],
+                    "p_change_min": [20.0],
+                    "p_change_max": [30.0],
+                }
+            ),
+            {"report_date": "20260331"},
+        )
+        manifest = SyncManifest(tmp_path / "manifest.db")
+        pipeline = DataPipeline(
+            provider=provider,
+            storage=storage,
+            quality_engine=QualityEngine(rules=[]),
+            manifest=manifest,
+        )
+        profile = DataProfile(
+            name="default",
+            datasets=["forecast"],
+            history_start="20260101",
+        )
+
+        report = pipeline.repair(
+            profile,
+            (date(2026, 1, 1), date(2026, 5, 17)),
+            action="repair",
+        )
+
+        forecast = storage.read("forecast")
+        assert report.status == "success"
+        assert provider.requested_ranges == [("20260331", "20260331")]
+        assert provider.requested_partition_values == [["20260331"]]
+        assert forecast["symbol"].tolist() == ["688001.SH"]
+        assert forecast["ann_date"].tolist() == ["20260517"]
+
     def test_bootstrap_skips_pit_blocked_quarter_on_same_as_of_resume(self, tmp_path):
         class PitBlockedQuarterProvider(GenericDatasetProvider):
             def __init__(self) -> None:

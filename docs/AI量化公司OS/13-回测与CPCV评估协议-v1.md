@@ -2,7 +2,7 @@
 tags: [vortex, vortex/strategy-domain, vortex/research-domain, vortex/ai-quant-os]
 aliases: [回测与CPCV评估协议, 策略替代评估协议, CPCV回测协议]
 created: 2026-05-16
-updated: 2026-05-16
+updated: 2026-05-17
 ---
 
 # 回测与 CPCV 评估协议
@@ -18,7 +18,7 @@ updated: 2026-05-16
 | 研究 reference baseline | 可以在测试级通过后替代 | 候选已冻结，CPCV / 样本外 / 成本 / 容量均通过 |
 | 正式 preset / live 默认 | 不可以只凭回测替代 | 还需要 paper shadow、模拟盘或用户审批 |
 
-因此，`tail_risk_soft_q10_p25` 可以进入“替代研究 reference baseline 的候选评估”，但不能因为全样本回测好看就直接替换 `baseline_top110_large` 的正式 preset。
+因此，`tail_risk_soft_q10_p25` 这类候选可以进入“替代研究 reference baseline 的候选评估”，但不能因为全样本回测好看就直接替换正式 preset。2026-05-17 PIT 修正复跑后，该候选未通过 CPCV；研究 reference 仍保持 `baseline_top110_large`。用户随后确认 100 万实盘默认采用资金量适配的 `stable_100w`，这属于 live preset 选择，不等同于替代研究 reference baseline。
 
 ## 四层评估
 
@@ -70,6 +70,20 @@ N=10, k=2 -> 45 个 train/test split，约 9 条组合路径
 2. 用户明确批准。
 3. 变更写入策略版本血统和回滚方案。
 
+## 实盘安全修复与 alpha 优化分离
+
+实盘安全修复不能被当作策略 alpha 晋升证据。以下变化即使会明显改变 shadow/live target，也不直接改变研究 reference baseline：
+
+| 变化 | 归属 | 是否需要 CPCV |
+|---|---|---|
+| 修复同日收盘数据用于同日交易 | PIT / 编排安全 | 需要用修正口径重跑候选 CPCV；旧结果作废 |
+| 手动 prepare 强制 `execution_trade_date > signal_as_of` | 实盘编排安全 | 不作为 alpha 候选，只需回归测试和目标产物审计 |
+| 执行日 ST 缺失 fail-closed | 交易风控 | 不作为 alpha 候选，只需交易风控测试 |
+| QMT health fail 写 blocked artifacts | 执行审计 | 不作为 alpha 候选，只需执行审计测试 |
+| 已持有赢家的惯性保留 | live sizing / 执行优化 | 应先做实盘偏差和成交层复核；若要沉淀为 base 策略规则，再补回测近似与 paper shadow |
+
+资金量相关的 TopN 选择也不能从单一全样本理论收益外推。`aggressive_100w`、`stable_100w`、`baseline_top110_large` 代表不同本金和执行约束：100 万、1000 万、1 亿应分别看整手、最低下单额、现金残留、市场权限和成交容量。一个 TopN 在理论 event backtest 中更高，不代表在对应资金量的 live/lot 执行中更优。
+
 ## 当前样例应用
 
 当前 `tail_risk_soft_q10_p25` 的状态：
@@ -77,16 +91,17 @@ N=10, k=2 -> 45 个 train/test split，约 9 条组合路径
 | 检查 | 状态 |
 |---|---|
 | L0 research spike | 通过；mutation grid 最优 |
-| L1 train/dev | 部分通过；但 mutation grid 本身属于搜索过程 |
-| L2 test/CPCV | 未完成；只有 robustness matrix，不等于 CPCV |
-| L3 execution | 通过初步执行复核；仍缺 paper shadow ledger |
+| L1 train/dev | 部分通过；但 mutation grid 本身属于搜索过程，且必须用 T-1 overlay 复验 |
+| L2 test/CPCV | 2026-05-17 PIT 修正后失败：`cpcv_fail_keep_baseline` |
+| L3 execution | 初步执行复核历史上通过，但在 L2 失败后不进入默认实盘链路 |
 
 当前结论：
 
 ```text
-tail_risk_soft_q10_p25 -> CPCV test queue
+tail_risk_soft_q10_p25 -> explicit shadow/challenge only
 rerank_tail_risk_w010 -> paper shadow reference / parent lineage
-baseline_top110_large -> 继续作为正式 preset，直到 CPCV + paper shadow + 用户审批通过
+baseline_top110_large -> 继续作为研究 reference / 大容量回滚
+stable_100w -> 100 万 live 默认 preset
 ```
 
 ## 产物要求

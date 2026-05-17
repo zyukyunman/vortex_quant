@@ -51,6 +51,11 @@ from vortex.strategy.earnings_forecast_drift import (
 )
 from vortex.strategy.event_backtest import EventBacktestConfig, run_event_signal_backtest
 from vortex.strategy.factor_fusion import CandidateFusionRecipe, FusionLeg, build_fused_candidate_signal
+from vortex.strategy.earnings_forecast_strategy_spec import (
+    EarningsForecastStrategySpec,
+    build_earnings_forecast_strategy_signal,
+    resolve_earnings_forecast_strategy_spec,
+)
 from vortex.strategy.opening_liquidity import (
     OpeningLiquidityConfig,
     analyze_opening_ask1_capacity,
@@ -67,6 +72,7 @@ DEFAULT_LIVE_HANDOFF_LABEL = "业绩预告漂移策略实盘交接"
 DEFAULT_OPENING_LIQUIDITY_LABEL = "业绩预告漂移策略开盘卖一容量复核"
 DEFAULT_AUCTION_EXECUTION_LABEL = "业绩预告漂移策略开盘竞价可靠性回测"
 DEFAULT_VERSION_REVIEW_LABEL = "业绩预告策略版本复核"
+DEFAULT_LIVE_PRESET = "stable_100w"
 
 
 @dataclass(frozen=True)
@@ -220,6 +226,15 @@ def get_earnings_forecast_version_preset(name: str) -> EarningsForecastVersionPr
         allowed = ", ".join(sorted(EARNINGS_FORECAST_VERSION_PRESETS))
         raise KeyError(f"未知业绩预告策略版本 preset: {name}；可选: {allowed}")
     return EARNINGS_FORECAST_VERSION_PRESETS[name]
+
+
+def resolve_earnings_forecast_version_strategy(name: str) -> EarningsForecastStrategySpec:
+    """Resolve a public live/shadow strategy version into base preset plus overlay."""
+
+    return resolve_earnings_forecast_strategy_spec(
+        name,
+        base_preset_names=EARNINGS_FORECAST_VERSION_PRESETS.keys(),
+    )
 
 
 def list_earnings_forecast_version_presets() -> list[EarningsForecastVersionPreset]:
@@ -401,6 +416,9 @@ def run_earnings_forecast_shadow_plan(
     artifact_root = Path(artifact_dir) if artifact_dir is not None else workspace.strategy_dir / "artifacts"
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_root.mkdir(parents=True, exist_ok=True)
+    effective_preset_name = preset_name
+    if effective_preset_name is None and config is None:
+        effective_preset_name = DEFAULT_LIVE_PRESET
 
     inputs = load_earnings_forecast_inputs(
         workspace,
@@ -415,14 +433,19 @@ def run_earnings_forecast_shadow_plan(
         no_future_leakage=True,
         out_of_sample_checked=True,
     )
-    result, preset = _run_shadow_backtest_result(
+    result, preset, strategy_spec = _run_shadow_backtest_result(
         inputs,
+        workspace=workspace,
+        start=start,
+        end=as_of,
         quality=quality,
         config=config,
-        preset_name=preset_name,
+        preset_name=effective_preset_name,
     )
     target = _latest_target_frame(result.weights)
-    artifact_label = f"{label}-{preset.name}" if preset is not None else label
+    strategy = strategy_spec.diagnostics() if strategy_spec is not None else None
+    artifact_version = str(strategy["name"]) if strategy is not None else ""
+    artifact_label = f"{label}-{artifact_version}" if artifact_version else label
     target_path = artifact_root / f"{artifact_label}-{target['date'].iloc[0]}目标持仓.csv"
     target.to_csv(target_path, index=False)
     summary = {
@@ -430,7 +453,14 @@ def run_earnings_forecast_shadow_plan(
         "as_of": str(target["date"].iloc[0]),
         "requested_as_of": as_of,
         "preset": dataclasses.asdict(preset) if preset is not None else None,
-        "strategy_mode": "preset" if preset is not None else "config",
+        "strategy": strategy,
+        "strategy_mode": (
+            "strategy_spec"
+            if strategy_spec is not None and strategy_spec.overlay is not None
+            else "preset"
+            if preset is not None
+            else "config"
+        ),
         "json_path": str(output_root / f"{artifact_label}-{target['date'].iloc[0]}.json"),
         "html_path": str(output_root / f"{artifact_label}-{target['date'].iloc[0]}.html"),
         "target_path": str(target_path),
@@ -931,6 +961,9 @@ def run_earnings_forecast_live_handoff(
     artifact_root = Path(artifact_dir) if artifact_dir is not None else workspace.strategy_dir / "artifacts"
     output_root.mkdir(parents=True, exist_ok=True)
     artifact_root.mkdir(parents=True, exist_ok=True)
+    effective_preset_name = preset_name
+    if effective_preset_name is None and config is None:
+        effective_preset_name = DEFAULT_LIVE_PRESET
 
     shadow = run_earnings_forecast_shadow_plan(
         workspace.root,
@@ -940,7 +973,7 @@ def run_earnings_forecast_live_handoff(
         artifact_dir=artifact_root,
         label=f"{label}-shadow",
         config=config,
-        preset_name=preset_name,
+        preset_name=effective_preset_name,
         require_precise_data=require_precise_data,
     )
     target = pd.read_csv(shadow.target_path)
@@ -1000,8 +1033,11 @@ def run_earnings_forecast_live_handoff(
     qmt_ready = len(blocking_reasons) == 0
     handoff_date = str(shadow.summary["as_of"])
     shadow_preset = shadow.summary.get("preset")
+    shadow_strategy = shadow.summary.get("strategy")
     artifact_label = (
-        f"{label}-{shadow_preset['name']}"
+        f"{label}-{shadow_strategy['name']}"
+        if isinstance(shadow_strategy, dict) and shadow_strategy.get("name")
+        else f"{label}-{shadow_preset['name']}"
         if isinstance(shadow_preset, dict) and shadow_preset.get("name")
         else label
     )
@@ -1012,6 +1048,7 @@ def run_earnings_forecast_live_handoff(
         "as_of": handoff_date,
         "requested_as_of": as_of,
         "preset": shadow_preset,
+        "strategy": shadow_strategy,
         "strategy_mode": shadow.summary.get("strategy_mode", "config"),
         "qmt_bridge_url": qmt_bridge_url,
         "qmt_account_id": qmt_account_id or "",
@@ -1043,10 +1080,13 @@ def run_earnings_forecast_live_handoff(
 def _run_shadow_backtest_result(
     inputs: EarningsForecastInputFrames,
     *,
+    workspace: Workspace,
+    start: str,
+    end: str,
     quality: ExperimentQuality,
     config: EarningsForecastDriftConfig | None,
     preset_name: str | None,
-) -> tuple[EarningsForecastDriftResult, EarningsForecastVersionPreset | None]:
+) -> tuple[EarningsForecastDriftResult, EarningsForecastVersionPreset | None, EarningsForecastStrategySpec | None]:
     if preset_name is not None and config is not None:
         raise ValueError("preset_name 与 config 不能同时传入；请二选一")
     if preset_name is None:
@@ -1068,10 +1108,19 @@ def _run_shadow_backtest_result(
                 st_risk_events=inputs.st_risk_events,
             ),
             None,
+            None,
         )
 
-    preset = get_earnings_forecast_version_preset(preset_name)
-    signal, market_gate, blocked_buy, blocked_sell = _build_version_signal_context(inputs, preset=preset)
+    strategy_spec = resolve_earnings_forecast_version_strategy(preset_name)
+    preset = get_earnings_forecast_version_preset(strategy_spec.base_preset_name)
+    base_signal, market_gate, blocked_buy, blocked_sell = _build_version_signal_context(inputs, preset=preset)
+    signal = build_earnings_forecast_strategy_signal(
+        base_signal,
+        workspace=workspace,
+        start=start,
+        end=end,
+        spec=strategy_spec,
+    )
     returns = open_to_close_returns(inputs.open_prices, inputs.close_prices)
     backtest = run_event_signal_backtest(
         signal,
@@ -1111,6 +1160,7 @@ def _run_shadow_backtest_result(
             segments=(),
         ),
         preset,
+        strategy_spec,
     )
 
 

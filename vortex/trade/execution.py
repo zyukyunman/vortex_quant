@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from vortex.trade.broker import OrderRecord, PaperBrokerAdapter, Quote
-from vortex.trade.models import ExecutionReport, TargetPortfolio
+from vortex.trade.broker import BrokerHealth, CashSnapshot, OrderRecord, PaperBrokerAdapter, Quote
+from vortex.trade.models import ExecutionReport, Lineage, OrderPlan, RiskCheckResult, RiskRuleResult, TargetPortfolio
 from vortex.trade.order_plan import OrderPlanConfig, generate_order_plan
 from vortex.trade.qmt_bridge import QmtBridgeAdapter, QmtBridgeConfig
 from vortex.trade.risk import PreTradeRiskConfig, run_pre_trade_risk_check
@@ -131,9 +132,24 @@ def run_qmt_rebalance(
     """
 
     adapter = QmtBridgeAdapter(bridge_config)
-    health = adapter.health()
+    try:
+        health = adapter.health()
+    except Exception as exc:  # noqa: BLE001 - bridge failures must still leave an audit artifact.
+        return _write_qmt_blocked_report(
+            portfolio,
+            bridge_config=bridge_config,
+            output_root=output_root,
+            health=BrokerHealth(ok=False, mode="qmt_bridge", message=str(exc)),
+            reason=f"bridge health check failed: {exc}",
+        )
     if not health.ok:
-        raise ValueError(f"bridge health failed: {health.message}")
+        return _write_qmt_blocked_report(
+            portfolio,
+            bridge_config=bridge_config,
+            output_root=output_root,
+            health=health,
+            reason=f"bridge health failed: {health.message}",
+        )
 
     cash = adapter.get_cash()
     positions = adapter.get_positions()
@@ -172,7 +188,7 @@ def run_qmt_rebalance(
     write_json(order_intent_path, plan.orders)
 
     submitted_orders: list[OrderRecord] = []
-    if risk.passed:
+    if risk.passed and bridge_config.allow_trading:
         for order in plan.orders:
             submitted_orders.append(adapter.submit_order(order))
 
@@ -207,6 +223,90 @@ def run_qmt_rebalance(
         execution_report_md_path=report_md_path,
         report=report,
     )
+
+
+def _write_qmt_blocked_report(
+    portfolio: TargetPortfolio,
+    *,
+    bridge_config: QmtBridgeConfig,
+    output_root: Path,
+    health: BrokerHealth,
+    reason: str,
+) -> QmtRebalanceArtifacts:
+    exec_id = _blocked_exec_id(portfolio, reason)
+    lineage = Lineage(
+        exec_id=exec_id,
+        portfolio_id=portfolio.portfolio_id,
+        strategy_version=portfolio.strategy_version,
+        strategy_run_id=portfolio.run_id,
+        snapshot_id=portfolio.snapshot_id,
+        gateway_type="qmt_bridge",
+    )
+    plan = OrderPlan(
+        exec_id=exec_id,
+        portfolio_id=portfolio.portfolio_id,
+        trade_date=portfolio.trade_date,
+        orders=[],
+        lineage=lineage,
+    )
+    risk = RiskCheckResult(
+        exec_id=exec_id,
+        passed=False,
+        blocking_reasons=[reason],
+        warnings=[],
+        rule_results=[
+            RiskRuleResult(
+                name="broker_health",
+                passed=False,
+                level="critical",
+                message=health.message,
+            )
+        ],
+        lineage=lineage,
+    )
+    exec_dir = output_root / "trade" / "executions" / exec_id
+    state_dir = output_root / "state" / "trade" / exec_id
+    order_intent_path = state_dir / "order_intent.json"
+    order_plan_path = exec_dir / "order_plan.json"
+    risk_result_path = exec_dir / "pre_trade_result.json"
+    report_path = exec_dir / "execution_report.json"
+    report_md_path = exec_dir / "execution_report.md"
+
+    write_json(order_plan_path, plan)
+    write_json(risk_result_path, risk)
+    write_json(order_intent_path, [])
+    report = ExecutionReport(
+        exec_id=exec_id,
+        mode="qmt_sim" if bridge_config.allow_trading else "qmt_dry_run",
+        portfolio_id=portfolio.portfolio_id,
+        trade_date=portfolio.trade_date,
+        order_plan=plan,
+        risk_result=risk,
+        cash=CashSnapshot(available_cash=0.0, frozen_cash=0.0, total_asset=0.0, market_value=0.0),
+        positions=[],
+        orders=[],
+        fills=[],
+        slippage_summary={},
+        unfilled_summary={},
+        lineage=lineage,
+    )
+    write_json(report_path, report)
+    _write_markdown_report(report_md_path, report)
+    return QmtRebalanceArtifacts(
+        exec_id=exec_id,
+        root_dir=exec_dir,
+        order_intent_path=order_intent_path,
+        order_plan_path=order_plan_path,
+        risk_result_path=risk_result_path,
+        execution_report_path=report_path,
+        execution_report_md_path=report_md_path,
+        report=report,
+    )
+
+
+def _blocked_exec_id(portfolio: TargetPortfolio, reason: str) -> str:
+    digest = hashlib.sha1(f"{portfolio.portfolio_id}|{portfolio.trade_date}|{reason}".encode("utf-8")).hexdigest()[:10]
+    return f"exec_{portfolio.trade_date}_blocked_{digest}"
 
 
 def _slippage_summary(fills, intents) -> dict[str, float]:

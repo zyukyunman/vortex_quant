@@ -694,6 +694,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "1B",
         "fetch_mode": "symbol_quarter_range",
         "partition_by": "report_date",
+        "refresh_existing_recent_partitions": 1,
         "default_enabled": True,
         "pit_required": True,
     },
@@ -703,6 +704,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "2",
         "fetch_mode": "symbol_quarter_range",
         "partition_by": "report_date",
+        "refresh_existing_recent_partitions": 1,
         "default_enabled": True,
     },
     "express": {
@@ -711,6 +713,7 @@ TUSHARE_DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "phase": "2",
         "fetch_mode": "symbol_quarter_range",
         "partition_by": "report_date",
+        "refresh_existing_recent_partitions": 1,
         "default_enabled": True,
     },
     "disclosure_date": {

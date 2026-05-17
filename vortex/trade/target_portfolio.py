@@ -39,29 +39,40 @@ def build_target_portfolio(
     rows["symbol"] = rows["symbol"].astype(str)
     rows["target_weight"] = pd.to_numeric(rows["target_weight"], errors="raise").astype(float)
     rows["reference_price"] = pd.to_numeric(rows["reference_price"], errors="raise").astype(float)
+    has_target_shares = "target_shares" in rows.columns
+    if has_target_shares:
+        rows["target_shares"] = pd.to_numeric(rows["target_shares"], errors="raise").astype(float)
+        if (rows["target_shares"] < 0).any():
+            raise ValueError("target_shares must be non-negative")
     if (rows["target_weight"] < 0).any():
         raise ValueError("target_weight must be non-negative")
     if (rows["reference_price"] <= 0).any():
         raise ValueError("reference_price must be positive")
-    if rows["target_weight"].sum() > 1.000001:
+    if not has_target_shares and rows["target_weight"].sum() > 1.000001:
         raise ValueError("target_weight sum cannot exceed 1")
 
     positions: list[TargetPosition] = []
     invested = 0.0
     reason_series = rows["reason"] if "reason" in rows.columns else pd.Series("", index=rows.index)
     for row, reason in zip(rows.itertuples(index=False), reason_series, strict=False):
-        target_value = float(config.notional * row.target_weight)
-        shares = int(target_value / float(row.reference_price) // config.lot_size) * config.lot_size
+        if has_target_shares:
+            shares = int(float(row.target_shares) // config.lot_size) * config.lot_size
+        else:
+            target_value = float(config.notional * row.target_weight)
+            shares = int(target_value / float(row.reference_price) // config.lot_size) * config.lot_size
         if shares < min_order_shares(str(row.symbol), "buy"):
             continue
         rounded_value = shares * float(row.reference_price)
         if shares <= 0 or rounded_value < config.min_position_value:
             continue
         invested += rounded_value
+        if invested > config.notional + 1e-6:
+            raise ValueError("target portfolio invested value cannot exceed notional")
+        target_weight = rounded_value / float(config.notional) if has_target_shares else float(row.target_weight)
         positions.append(
             TargetPosition(
                 symbol=str(row.symbol),
-                target_weight=float(row.target_weight),
+                target_weight=float(target_weight),
                 target_value=float(rounded_value),
                 target_shares=int(shares),
                 reference_price=float(row.reference_price),

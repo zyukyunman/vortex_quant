@@ -1510,7 +1510,17 @@ class DataPipeline:
                     for value in expected_quarters
                     if value not in existing_quarters and value not in covered_quarters
                 ]
-                if not missing_quarters:
+                refresh_quarters = self._recent_existing_partition_values_to_refresh(
+                    meta,
+                    expected_quarters=expected_quarters,
+                    existing_values=existing_quarters | covered_quarters,
+                )
+                fetch_quarters = [
+                    value
+                    for value in expected_quarters
+                    if value in set(missing_quarters) | set(refresh_quarters)
+                ]
+                if not fetch_quarters:
                     return DatasetFetchPlan(
                         start=start,
                         end=end,
@@ -1527,15 +1537,15 @@ class DataPipeline:
                         missing_partitions=0,
                     )
                 return DatasetFetchPlan(
-                    start=self._parse_date(missing_quarters[0]),
-                    end=self._parse_date(missing_quarters[-1]),
+                    start=self._parse_date(fetch_quarters[0]),
+                    end=self._parse_date(fetch_quarters[-1]),
                     trading_days=trading_days,
                     partition_key=partition_key,
                     target_partitions=len(expected_quarters),
                     existing_partitions=len(existing_target_quarters),
                     covered_partitions=len(covered_target_quarters),
-                    missing_partitions=len(missing_quarters),
-                    missing_partition_values=tuple(missing_quarters),
+                    missing_partitions=len(fetch_quarters),
+                    missing_partition_values=tuple(fetch_quarters),
                 )
 
         return DatasetFetchPlan(start=start, end=end, trading_days=trading_days)
@@ -1736,6 +1746,23 @@ class DataPipeline:
         if not retry_values:
             return covered_values
         return {value for value in covered_values if value not in retry_values}
+
+    @staticmethod
+    def _recent_existing_partition_values_to_refresh(
+        meta: dict[str, object],
+        *,
+        expected_quarters: list[str],
+        existing_values: set[str],
+    ) -> list[str]:
+        refresh_count = int(meta.get("refresh_existing_recent_partitions") or 0)
+        if refresh_count <= 0 or not expected_quarters or not existing_values:
+            return []
+        existing_expected = [
+            value for value in expected_quarters if value in existing_values
+        ]
+        if not existing_expected:
+            return []
+        return existing_expected[-refresh_count:]
 
     def _apply_pit_alignment(
         self,

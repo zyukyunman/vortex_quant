@@ -62,6 +62,9 @@ def test_qmt_bridge_readonly_methods_with_fake_transport() -> None:
     assert adapter.get_quotes(["000001.SZ"])["000001.SZ"].last_price == 10.1
     assert adapter.get_quotes(["000001.SZ"])["000001.SZ"].ask_price_1 == 10.11
     assert adapter.get_quotes(["000001.SZ"])["000001.SZ"].bid_price_1 == 10.09
+    assert adapter.get_quotes(["000001.SZ"])["000001.SZ"].is_suspended is None
+    assert adapter.get_quotes(["000001.SZ"])["000001.SZ"].is_limit_up is None
+    assert adapter.get_quotes(["000001.SZ"])["000001.SZ"].is_limit_down is None
     assert calls[0][3]["Authorization"] == "Bearer secret"
     assert calls[0][3]["X-API-Key"] == "secret"
 
@@ -76,6 +79,33 @@ def test_qmt_bridge_rejects_submit_when_trading_disabled() -> None:
 
     with pytest.raises(PermissionError):
         adapter.cancel_order("abc")
+
+
+def test_qmt_bridge_derives_limit_status_from_limit_prices() -> None:
+    def transport(method, endpoint, payload, headers):  # noqa: ARG001
+        if endpoint == "/api/market/full_tick?stocks=000001.SZ":
+            return {
+                "data": {
+                    "000001.SZ": {
+                        "open": 10.0,
+                        "lastPrice": 10.1,
+                        "up_limit": 10.1,
+                        "down_limit": 9.1,
+                        "volume": 10_000,
+                    }
+                }
+            }
+        raise AssertionError(endpoint)
+
+    adapter = QmtBridgeAdapter(
+        QmtBridgeConfig(base_url="http://127.0.0.1:8000", account_id="99034443"),
+        transport,
+    )
+
+    quote = adapter.get_quotes(["000001.SZ"])["000001.SZ"]
+    assert quote.is_limit_up is True
+    assert quote.is_limit_down is False
+    assert quote.is_suspended is None
 
 
 def test_qmt_bridge_filters_zero_share_shell_positions() -> None:

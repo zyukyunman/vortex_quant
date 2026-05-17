@@ -48,6 +48,57 @@ def test_pre_trade_risk_blocks_missing_st_limit_up_and_live_by_default() -> None
     assert "missing ST flag" in result.blocking_reasons
 
 
+def test_pre_trade_risk_blocks_unknown_quote_status_flags() -> None:
+    plan = OrderPlan(
+        exec_id="exec_1",
+        portfolio_id="tp_1",
+        trade_date="20260501",
+        orders=[OrderIntent(symbol="000001.SZ", side="buy", shares=100, limit_price=10.1)],
+    )
+
+    result = run_pre_trade_risk_check(
+        plan,
+        health=BrokerHealth(ok=True, mode="qmt_bridge", message="ok"),
+        cash=CashSnapshot(available_cash=100_000, frozen_cash=0, total_asset=100_000, market_value=0),
+        quotes={
+            "000001.SZ": Quote(
+                "000001.SZ",
+                open_price=10.0,
+                is_suspended=None,
+                is_limit_up=None,
+                is_limit_down=None,
+            )
+        },
+        st_flags={"000001.SZ": False},
+        config=PreTradeRiskConfig(mode="qmt_sim"),
+    )
+
+    assert result.passed is False
+    assert "missing suspension flag" in result.blocking_reasons
+    assert "missing limit-up flag" in result.blocking_reasons
+
+
+def test_pre_trade_risk_blocks_missing_quote_price() -> None:
+    plan = OrderPlan(
+        exec_id="exec_1",
+        portfolio_id="tp_1",
+        trade_date="20260501",
+        orders=[OrderIntent(symbol="000001.SZ", side="buy", shares=100, limit_price=0.01)],
+    )
+
+    result = run_pre_trade_risk_check(
+        plan,
+        health=BrokerHealth(ok=True, mode="qmt_bridge", message="ok"),
+        cash=CashSnapshot(available_cash=100_000, frozen_cash=0, total_asset=100_000, market_value=0),
+        quotes={"000001.SZ": Quote("000001.SZ", open_price=0.0, last_price=0.0)},
+        st_flags={"000001.SZ": False},
+        config=PreTradeRiskConfig(mode="qmt_sim"),
+    )
+
+    assert result.passed is False
+    assert "missing quote price" in result.blocking_reasons
+
+
 def test_pre_trade_risk_blocks_daily_notional() -> None:
     plan = OrderPlan(
         exec_id="exec_1",
