@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 import json
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from vortex.strategy.backtest import BacktestResult, _compute_metrics, review_ba
 
 
 DEFAULT_FACTOR_OVERLAY_LABEL = "业绩预告因子角色融合挑战"
+DEFAULT_CPCV_BACKTEST_LABEL = "业绩预告tail-risk冻结CPCV回测"
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,16 @@ class EarningsForecastFactorOverlayArtifacts:
 @dataclass(frozen=True)
 class EarningsForecastRobustnessArtifacts:
     """Robustness matrix artifacts for one promoted overlay."""
+
+    json_path: Path
+    matrix_path: Path
+    md_path: Path
+    summary: dict[str, object]
+
+
+@dataclass(frozen=True)
+class EarningsForecastCpcvBacktestArtifacts:
+    """CPCV-style test artifacts for one frozen overlay challenger."""
 
     json_path: Path
     matrix_path: Path
@@ -348,6 +360,183 @@ def run_earnings_forecast_strategy_robustness_matrix(
     json_path.write_text(json.dumps(_jsonable(summary), ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(_robustness_markdown(label, summary, matrix), encoding="utf-8")
     return EarningsForecastRobustnessArtifacts(
+        json_path=json_path,
+        matrix_path=matrix_path,
+        md_path=md_path,
+        summary=summary,
+    )
+
+
+def run_earnings_forecast_cpcv_backtest(
+    root: str | Path,
+    *,
+    preset_name: str = "baseline_top110_large",
+    reference_name: str | None = None,
+    challenger_name: str = "tail_risk_soft_q10_p25",
+    start: str,
+    end: str,
+    n_groups: int = 8,
+    n_test_groups: int = 2,
+    purge_horizon: int = 40,
+    embargo: int = 20,
+    output_dir: str | Path | None = None,
+    artifact_dir: str | Path | None = None,
+    label: str = DEFAULT_CPCV_BACKTEST_LABEL,
+    require_precise_data: bool = True,
+    max_combinations: int | None = None,
+) -> EarningsForecastCpcvBacktestArtifacts:
+    """Run CPCV-style out-of-sample checks for one frozen overlay challenger.
+
+    The challenger parameters are fixed before this function runs. Train groups
+    are therefore used for leakage accounting and overfit-gap context, not for
+    re-fitting or selecting a new parameter.
+    """
+
+    if n_groups < 2:
+        raise ValueError("n_groups must be at least 2")
+    if n_test_groups <= 0 or n_test_groups >= n_groups:
+        raise ValueError("n_test_groups must be in [1, n_groups)")
+    if purge_horizon < 0:
+        raise ValueError("purge_horizon must be non-negative")
+    if embargo < 0:
+        raise ValueError("embargo must be non-negative")
+
+    workspace = Workspace(Path(root).expanduser())
+    workspace.ensure_initialized()
+    output_root = Path(output_dir) if output_dir is not None else workspace.strategy_dir
+    artifact_root = Path(artifact_dir) if artifact_dir is not None else workspace.strategy_dir / "artifacts"
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    preset = get_earnings_forecast_version_preset(preset_name)
+    challenger = _variant_by_name(challenger_name)
+    reference = _variant_by_name(reference_name) if reference_name else OverlayVariant(preset.name, "baseline", None, "baseline")
+    variants = (reference, challenger)
+    inputs = load_earnings_forecast_inputs(
+        workspace,
+        start=start,
+        end=end,
+        require_precise_data=require_precise_data,
+    )
+    factor_inputs = load_daily_factor_inputs_for_cogalpha(workspace, start=start, end=end)
+    factors = _compute_overlay_factors(factor_inputs, variants)
+    base_signal, market_gate, blocked_buy, blocked_sell = _build_version_signal_context(inputs, preset=preset)
+    returns = open_to_close_returns(inputs.open_prices, inputs.close_prices)
+    quality = ExperimentQuality(
+        pit_safe=True,
+        adjusted_prices=True,
+        cost_included=True,
+        no_future_leakage=True,
+        out_of_sample_checked=True,
+    )
+    config = EventBacktestConfig(
+        top_n=preset.top_n,
+        max_weight=preset.max_weight,
+        target_exposure=1.0,
+        transaction_cost_bps=preset.transaction_cost_bps,
+        position_mode=preset.position_mode,
+    )
+
+    backtests: dict[str, BacktestResult] = {}
+    for variant in variants:
+        signal = _build_overlay_signal(base_signal, factors, variant)
+        backtests[variant.name] = run_event_signal_backtest(
+            signal,
+            returns,
+            config,
+            market_gate=market_gate,
+            blocked_buy_mask=blocked_buy,
+            blocked_sell_mask=blocked_sell,
+            quality=quality,
+            goal_criteria=None,
+        )
+
+    baseline_result = backtests[reference.name]
+    challenger_result = backtests[challenger.name]
+    common_dates = baseline_result.returns.index.intersection(challenger_result.returns.index).sort_values()
+    groups = _cpcv_contiguous_groups(common_dates, n_groups)
+    combo_items = list(combinations(range(n_groups), n_test_groups))
+    if max_combinations is not None:
+        combo_items = combo_items[: max(0, int(max_combinations))]
+
+    rows: list[dict[str, object]] = []
+    for fold_index, test_group_ids in enumerate(combo_items, start=1):
+        split = _cpcv_split_dates(
+            common_dates,
+            groups,
+            test_group_ids,
+            purge_horizon=purge_horizon,
+            embargo=embargo,
+        )
+        test_dates = split["test_dates"]
+        train_dates = split["train_dates"]
+        row = {
+            "fold": f"fold_{fold_index:02d}",
+            "test_groups": ",".join(str(group_id + 1) for group_id in test_group_ids),
+            "train_days": int(len(train_dates)),
+            "test_days": int(len(test_dates)),
+            "purged_or_embargoed_days": int(split["excluded_days"]),
+            "test_start": _format_cpcv_date(test_dates[0]) if len(test_dates) else None,
+            "test_end": _format_cpcv_date(test_dates[-1]) if len(test_dates) else None,
+        }
+        row.update(_cpcv_metric_delta_columns(baseline_result, challenger_result, test_dates, "test"))
+        row.update(_cpcv_metric_delta_columns(baseline_result, challenger_result, train_dates, "train"))
+        row["decision"] = _cpcv_fold_decision(row)
+        rows.append(row)
+
+    matrix = pd.DataFrame(rows)
+    safe_label = _artifact_label(label)
+    matrix_path = artifact_root / f"{safe_label}矩阵.csv"
+    json_path = output_root / f"{safe_label}.json"
+    md_path = output_root / f"{safe_label}.md"
+    matrix.to_csv(matrix_path, index=False)
+
+    full_baseline = baseline_result.metrics.__dict__
+    full_challenger = challenger_result.metrics.__dict__
+    group_rows = [
+        {
+            "group": int(group_id + 1),
+            "start": _format_cpcv_date(group_dates[0]),
+            "end": _format_cpcv_date(group_dates[-1]),
+            "days": int(len(group_dates)),
+        }
+        for group_id, group_dates in enumerate(groups)
+    ]
+    summary = {
+        "label": label,
+        "preset": preset.name,
+        "baseline": reference.name,
+        "reference": reference.name,
+        "reference_logic": _overlay_variant_logic(reference),
+        "challenger": challenger.name,
+        "challenger_logic": _overlay_variant_logic(challenger),
+        "start": start,
+        "end": end,
+        "n_groups": int(n_groups),
+        "n_test_groups": int(n_test_groups),
+        "purge_horizon": int(purge_horizon),
+        "embargo": int(embargo),
+        "evaluation_mode": "frozen_full_path_test_mask",
+        "trade_days": int(len(common_dates)),
+        "first_trade_date": _format_cpcv_date(common_dates[0]) if len(common_dates) else None,
+        "last_trade_date": _format_cpcv_date(common_dates[-1]) if len(common_dates) else None,
+        "group_calendar": group_rows,
+        "split_count": int(len(matrix)),
+        "json_path": str(json_path),
+        "matrix_path": str(matrix_path),
+        "md_path": str(md_path),
+        "full_sample": {
+            "baseline": full_baseline,
+            "challenger": full_challenger,
+            "annual_return_delta": float(full_challenger["annual_return"] - full_baseline["annual_return"]),
+            "max_drawdown_delta": float(full_challenger["max_drawdown"] - full_baseline["max_drawdown"]),
+            "calmar_delta": float(full_challenger["calmar"] - full_baseline["calmar"]),
+        },
+        "cpcv_status": _cpcv_status(matrix),
+    }
+    json_path.write_text(json.dumps(_jsonable(summary), ensure_ascii=False, indent=2), encoding="utf-8")
+    md_path.write_text(_cpcv_markdown(label, summary, matrix), encoding="utf-8")
+    return EarningsForecastCpcvBacktestArtifacts(
         json_path=json_path,
         matrix_path=matrix_path,
         md_path=md_path,
@@ -932,6 +1121,27 @@ def _tail_risk_mutation_variants() -> tuple[OverlayVariant, ...]:
                     penalty_strength=penalty,
                 )
             )
+    variants.append(
+        OverlayVariant(
+            name="tail_risk_ramp_q50_p25",
+            role="tail_risk_soft_ramp",
+            factor_template="tail_risk_downside_vol_20d",
+            overlay_type="soft_penalty_ramp",
+            filter_quantile=0.50,
+            penalty_strength=0.25,
+        )
+    )
+    for quantile, penalty in ((0.20, 0.20), (0.25, 0.20), (0.25, 0.25)):
+        variants.append(
+            OverlayVariant(
+                name=f"tail_risk_ramp_q{int(quantile * 100):02d}_p{int(penalty * 100):02d}",
+                role="tail_risk_soft_ramp",
+                factor_template="tail_risk_downside_vol_20d",
+                overlay_type="soft_penalty_ramp",
+                filter_quantile=quantile,
+                penalty_strength=penalty,
+            )
+        )
     for pool in (150, 160):
         for tail_weight in (0.10, 0.12):
             variants.append(
@@ -972,7 +1182,11 @@ def _build_overlay_signal(
         return base_signal
     if variant.factor_template is None:
         raise ValueError(f"variant requires factor_template: {variant.name}")
-    factor = factors[variant.factor_template].reindex(index=base_signal.index, columns=base_signal.columns)
+    factor = _visible_overlay_factor(
+        factors[variant.factor_template],
+        index=base_signal.index,
+        columns=base_signal.columns,
+    )
     if variant.overlay_type == "candidate_rerank":
         return build_fused_candidate_signal(
             base_signal,
@@ -990,7 +1204,8 @@ def _build_overlay_signal(
             base_signal,
             {
                 variant.factor_template: factor,
-                variant.secondary_factor_template: factors[variant.secondary_factor_template].reindex(
+                variant.secondary_factor_template: _visible_overlay_factor(
+                    factors[variant.secondary_factor_template],
                     index=base_signal.index,
                     columns=base_signal.columns,
                 ),
@@ -1006,12 +1221,27 @@ def _build_overlay_signal(
         )
     if variant.overlay_type == "bottom_filter":
         percentile = factor.rank(axis=1, pct=True)
-        return base_signal.where(percentile >= variant.filter_quantile)
+        return base_signal.where(percentile.isna() | (percentile >= variant.filter_quantile))
     if variant.overlay_type == "soft_penalty":
         percentile = factor.rank(axis=1, pct=True)
-        penalty_mask = percentile < variant.filter_quantile
+        penalty_mask = percentile.notna() & (percentile < variant.filter_quantile)
         return base_signal.where(~penalty_mask, base_signal * (1.0 - variant.penalty_strength))
+    if variant.overlay_type == "soft_penalty_ramp":
+        percentile = factor.rank(axis=1, pct=True)
+        active = percentile.notna() & (percentile < variant.filter_quantile)
+        scaled = (percentile / variant.filter_quantile).clip(lower=0.0, upper=1.0)
+        multiplier = 1.0 - variant.penalty_strength * (1.0 - scaled)
+        return base_signal.where(~active, base_signal * multiplier)
     raise ValueError(f"unknown overlay_type: {variant.overlay_type}")
+
+
+def _visible_overlay_factor(
+    factor: pd.DataFrame,
+    *,
+    index: pd.Index,
+    columns: pd.Index,
+) -> pd.DataFrame:
+    return factor.reindex(index=index, columns=columns).shift(1)
 
 
 def _build_minute_target_price_buy_limits(
@@ -1581,6 +1811,174 @@ def _slice_optional_frame_by_date(frame: pd.DataFrame | None, start: str, end: s
     return _slice_by_date(frame, start, end)
 
 
+def _cpcv_contiguous_groups(dates: pd.Index, n_groups: int) -> list[pd.Index]:
+    if len(dates) < n_groups:
+        raise ValueError(f"not enough trade dates for CPCV: {len(dates)} dates < {n_groups} groups")
+    positions = np.array_split(np.arange(len(dates)), n_groups)
+    return [dates.take(position) for position in positions if len(position) > 0]
+
+
+def _cpcv_split_dates(
+    dates: pd.Index,
+    groups: list[pd.Index],
+    test_group_ids: tuple[int, ...],
+    *,
+    purge_horizon: int,
+    embargo: int,
+) -> dict[str, object]:
+    test_mask = np.zeros(len(dates), dtype=bool)
+    excluded_mask = np.zeros(len(dates), dtype=bool)
+    for group_id in test_group_ids:
+        group = groups[group_id]
+        start_pos = int(dates.get_loc(group[0]))
+        end_pos = int(dates.get_loc(group[-1]))
+        test_mask[start_pos : end_pos + 1] = True
+        excluded_start = max(0, start_pos - purge_horizon)
+        excluded_end = min(len(dates) - 1, end_pos + embargo)
+        excluded_mask[excluded_start : excluded_end + 1] = True
+    train_mask = (~test_mask) & (~excluded_mask)
+    return {
+        "test_dates": dates[test_mask],
+        "train_dates": dates[train_mask],
+        "excluded_days": int((excluded_mask & ~test_mask).sum()),
+    }
+
+
+def _cpcv_metric_delta_columns(
+    baseline: BacktestResult,
+    challenger: BacktestResult,
+    dates: pd.Index,
+    prefix: str,
+) -> dict[str, object]:
+    baseline_metrics = _cpcv_metrics_for_dates(baseline, dates)
+    challenger_metrics = _cpcv_metrics_for_dates(challenger, dates)
+    columns: dict[str, object] = {}
+    metric_names = (
+        "annual_return",
+        "max_drawdown",
+        "sharpe",
+        "calmar",
+        "turnover",
+        "total_return",
+        "sortino",
+        "cvar_5pct",
+        "worst_5d_return",
+        "worst_20d_return",
+        "positive_month_rate",
+        "annual_win_rate",
+    )
+    for name in metric_names:
+        base_value = getattr(baseline_metrics, name) if baseline_metrics is not None else None
+        challenger_value = getattr(challenger_metrics, name) if challenger_metrics is not None else None
+        columns[f"{prefix}_baseline_{name}"] = base_value
+        columns[f"{prefix}_challenger_{name}"] = challenger_value
+        columns[f"{prefix}_{name}_delta"] = (
+            float(challenger_value - base_value)
+            if base_value is not None and challenger_value is not None
+            else None
+        )
+    return columns
+
+
+def _cpcv_metrics_for_dates(result: BacktestResult, dates: pd.Index) -> object | None:
+    if len(dates) == 0:
+        return None
+    returns = result.returns.reindex(dates).fillna(0.0)
+    if returns.empty:
+        return None
+    equity_values = [1.0, *((1.0 + returns).cumprod().to_list())]
+    equity_curve = pd.Series(equity_values, index=pd.RangeIndex(len(equity_values)))
+    weights = result.weights.reindex(dates).fillna(0.0)
+    if weights.empty:
+        turnover_sum = 0.0
+    else:
+        turnover = weights.diff().abs().sum(axis=1)
+        turnover.iloc[0] = float(weights.iloc[0].abs().sum())
+        turnover_sum = float(turnover.sum())
+    return _compute_metrics(
+        equity_curve,
+        returns,
+        turnover_sum=turnover_sum,
+        rebalance_count=len(returns),
+    )
+
+
+def _cpcv_fold_decision(row: dict[str, object]) -> str:
+    annual_delta = row.get("test_annual_return_delta")
+    drawdown_delta = row.get("test_max_drawdown_delta")
+    calmar_delta = row.get("test_calmar_delta")
+    if annual_delta is None or drawdown_delta is None or calmar_delta is None:
+        return "empty"
+    if float(annual_delta) > 0 and float(drawdown_delta) >= 0 and float(calmar_delta) > 0:
+        return "win"
+    if float(calmar_delta) > 0 and float(drawdown_delta) >= -0.01:
+        return "risk_acceptable_win"
+    if float(annual_delta) > 0 or float(calmar_delta) > 0:
+        return "mixed"
+    return "lose"
+
+
+def _cpcv_status(matrix: pd.DataFrame) -> dict[str, object]:
+    if matrix.empty:
+        return {"status": "blocked", "reason": "empty CPCV matrix"}
+    calmar_delta = pd.to_numeric(matrix["test_calmar_delta"], errors="coerce").dropna()
+    annual_delta = pd.to_numeric(matrix["test_annual_return_delta"], errors="coerce").dropna()
+    drawdown_delta = pd.to_numeric(matrix["test_max_drawdown_delta"], errors="coerce").dropna()
+    if calmar_delta.empty or annual_delta.empty or drawdown_delta.empty:
+        return {"status": "blocked", "reason": "no valid CPCV metric deltas"}
+    calmar_win_rate = float((calmar_delta > 0).mean())
+    annual_win_rate = float((annual_delta > 0).mean())
+    median_calmar_delta = float(calmar_delta.median())
+    median_annual_delta = float(annual_delta.median())
+    drawdown_delta_p25 = float(drawdown_delta.quantile(0.25))
+    if (
+        median_calmar_delta > 0
+        and median_annual_delta > 0
+        and calmar_win_rate >= 0.70
+        and drawdown_delta_p25 >= -0.01
+    ):
+        status = "cpcv_pass_reference_baseline_candidate"
+        reason = "Frozen challenger beats baseline across the CPCV test distribution."
+    elif median_calmar_delta > 0 and median_annual_delta > 0 and calmar_win_rate >= 0.60:
+        status = "cpcv_conditional_shadow"
+        reason = "Frozen challenger is positive but not strong enough for automatic baseline replacement."
+    else:
+        status = "cpcv_fail_keep_baseline"
+        reason = "Frozen challenger does not clear sample-out replacement thresholds."
+    return {
+        "status": status,
+        "reason": reason,
+        "test_calmar_win_rate": calmar_win_rate,
+        "test_annual_return_win_rate": annual_win_rate,
+        "median_test_calmar_delta": median_calmar_delta,
+        "median_test_annual_return_delta": median_annual_delta,
+        "test_max_drawdown_delta_p25": drawdown_delta_p25,
+        "split_count": int(len(matrix)),
+    }
+
+
+def _overlay_variant_logic(variant: OverlayVariant) -> dict[str, object]:
+    return {
+        "variant": variant.name,
+        "role": variant.role,
+        "overlay_type": variant.overlay_type,
+        "factor_template": variant.factor_template,
+        "secondary_factor_template": variant.secondary_factor_template,
+        "weight": variant.weight,
+        "secondary_weight": variant.secondary_weight,
+        "candidate_pool_size": variant.candidate_pool_size,
+        "filter_quantile": variant.filter_quantile,
+        "penalty_strength": variant.penalty_strength,
+    }
+
+
+def _format_cpcv_date(value: object) -> str:
+    parsed = pd.to_datetime(str(value), errors="coerce")
+    if pd.isna(parsed):
+        return str(value)
+    return parsed.strftime("%Y%m%d")
+
+
 def _robustness_delta_frame(rows: pd.DataFrame, challenger_name: str) -> pd.DataFrame:
     baseline = rows.loc[rows["variant"] == "baseline"].set_index("scenario")
     challenger = rows.loc[rows["variant"] == challenger_name].set_index("scenario")
@@ -1661,6 +2059,56 @@ def _robustness_markdown(label: str, summary: dict[str, object], matrix: pd.Data
         "decision",
     ]
     lines.extend(_markdown_table(matrix[columns]))
+    return "\n".join(lines) + "\n"
+
+
+def _cpcv_markdown(label: str, summary: dict[str, object], matrix: pd.DataFrame) -> str:
+    status = summary.get("cpcv_status", {})
+    full_sample = summary.get("full_sample", {})
+    lines = [
+        f"# {label}",
+        "",
+        "## Frozen Candidate",
+        "",
+        f"- Baseline: `{summary['baseline']}`",
+        f"- Challenger: `{summary['challenger']}`",
+        f"- Evaluation mode: `{summary['evaluation_mode']}`",
+        "- Train blocks are used for leakage accounting and train/test gap context; no parameter is refit inside folds.",
+        "",
+        "## CPCV Status",
+        "",
+        f"`{status.get('status', 'unknown')}`: {status.get('reason', '')}",
+        f"- Test Calmar win rate: {float(status.get('test_calmar_win_rate', 0.0)) * 100:.2f}%",
+        f"- Median test annual-return delta: {float(status.get('median_test_annual_return_delta', 0.0)):.6f}",
+        f"- Median test Calmar delta: {float(status.get('median_test_calmar_delta', 0.0)):.6f}",
+        f"- Test drawdown-delta p25: {float(status.get('test_max_drawdown_delta_p25', 0.0)):.6f}",
+        "",
+        "## Full Sample Delta",
+        "",
+        f"- Annual-return delta: {float(full_sample.get('annual_return_delta', 0.0)):.6f}",
+        f"- Max-drawdown delta: {float(full_sample.get('max_drawdown_delta', 0.0)):.6f}",
+        f"- Calmar delta: {float(full_sample.get('calmar_delta', 0.0)):.6f}",
+        "",
+        "## Groups",
+        "",
+    ]
+    lines.extend(_markdown_table(pd.DataFrame(summary.get("group_calendar", []))))
+    lines.extend(["", "## Fold Matrix", ""])
+    columns = [
+        "fold",
+        "test_groups",
+        "train_days",
+        "test_days",
+        "purged_or_embargoed_days",
+        "test_annual_return_delta",
+        "test_max_drawdown_delta",
+        "test_calmar_delta",
+        "test_turnover_delta",
+        "train_calmar_delta",
+        "decision",
+    ]
+    available_columns = [column for column in columns if column in matrix.columns]
+    lines.extend(_markdown_table(matrix[available_columns] if available_columns else matrix))
     return "\n".join(lines) + "\n"
 
 

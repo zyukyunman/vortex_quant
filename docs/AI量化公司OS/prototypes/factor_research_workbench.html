@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vortex AI 量化公司工作台原型</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f0f3f6;
+      --border: #d8dee6;
+      --text: #18212f;
+      --muted: #607083;
+      --green: #16784a;
+      --blue: #2467d8;
+      --amber: #a76609;
+      --red: #b42318;
+      --purple: #6d3cb4;
+      --shadow: 0 12px 30px rgba(31, 42, 55, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--border);
+      background: #111827;
+      color: #e5e7eb;
+      padding: 20px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 38px;
+    }
+
+    .brand-mark {
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      background: #2563eb;
+      font-weight: 700;
+    }
+
+    .brand-title {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+
+    .nav {
+      display: grid;
+      gap: 6px;
+    }
+
+    .nav button {
+      width: 100%;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #cbd5e1;
+      text-align: left;
+      padding: 9px 10px;
+      font-size: 14px;
+      cursor: default;
+    }
+
+    .nav button.active {
+      background: #1f2937;
+      color: #ffffff;
+    }
+
+    .main {
+      min-width: 0;
+      padding: 20px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .topbar {
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+
+    .top-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .btn {
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .btn.primary {
+      background: #1d4ed8;
+      border-color: #1d4ed8;
+      color: #ffffff;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      gap: 10px;
+    }
+
+    .status-item,
+    .panel,
+    .table-panel,
+    .phone {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .status-item {
+      min-height: 74px;
+      padding: 12px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .status-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .status-value {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 15px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex: 0 0 auto;
+    }
+
+    .ok { background: var(--green); }
+    .run { background: var(--blue); }
+    .wait { background: #6b7280; }
+    .warn { background: var(--amber); }
+    .block { background: var(--red); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .left-stack,
+    .right-stack {
+      display: grid;
+      gap: 16px;
+    }
+
+    .panel {
+      padding: 16px;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    .subtle {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(92px, 1fr));
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+
+    .step {
+      min-height: 92px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--panel-soft);
+      display: grid;
+      align-content: start;
+      gap: 8px;
+    }
+
+    .step strong {
+      font-size: 13px;
+    }
+
+    .step span {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .candidate-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .candidate {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      background: #ffffff;
+      display: grid;
+      gap: 8px;
+      min-height: 156px;
+    }
+
+    .candidate h3 {
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+
+    .tags {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .tag {
+      border-radius: 999px;
+      padding: 3px 7px;
+      background: var(--panel-soft);
+      color: #344054;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .metric-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      background: #f8fafc;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      background: var(--panel-soft);
+    }
+
+    .badge.green { color: var(--green); }
+    .badge.blue { color: var(--blue); }
+    .badge.amber { color: var(--amber); }
+    .badge.red { color: var(--red); }
+
+    .phone {
+      padding: 12px;
+      max-width: 360px;
+      justify-self: stretch;
+    }
+
+    .phone-screen {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #f8fafc;
+    }
+
+    .phone-head {
+      padding: 10px 12px;
+      background: #111827;
+      color: #ffffff;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .notice {
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+      border-bottom: 1px solid var(--border);
+      background: #ffffff;
+    }
+
+    .notice-title {
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .notice-body {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .notice-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    @media (max-width: 1100px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        flex-direction: row;
+        align-items: center;
+        overflow-x: auto;
+      }
+
+      .nav {
+        grid-auto-flow: column;
+        grid-auto-columns: max-content;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .main {
+        padding: 14px;
+      }
+
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .status-strip,
+      .candidate-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .flow {
+        grid-template-columns: repeat(7, 150px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">V</div>
+        <div class="brand-title">Vortex<br>AI 量化公司</div>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button class="active">运营驾驶舱</button>
+        <button>因子研究实验室</button>
+        <button>智能体办公室</button>
+        <button>运行中心</button>
+        <button>交易台</button>
+        <button>归档中心</button>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1>运营驾驶舱</h1>
+          <div class="subtle">系统持续运行；只有阻塞、审批、交易异常和重要研究结论会通知你。</div>
+        </div>
+        <div class="top-actions">
+          <button class="btn">查看通知</button>
+          <button class="btn">追问智能体</button>
+          <button class="btn primary">处理待审批</button>
+        </div>
+      </header>
+
+      <section class="status-strip" aria-label="系统状态">
+        <div class="status-item">
+          <div class="status-label">数据</div>
+          <div class="status-value"><span>正常</span><span class="dot ok"></span></div>
+          <div class="subtle">最新快照 2026-05-15</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">研究</div>
+          <div class="status-value"><span>运行中</span><span class="dot run"></span></div>
+          <div class="subtle">3 个候选待门禁</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">策略</div>
+          <div class="status-value"><span>等待</span><span class="dot wait"></span></div>
+          <div class="subtle">等待新信号评审</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">交易</div>
+          <div class="status-value"><span>警告</span><span class="dot warn"></span></div>
+          <div class="subtle">QMT 认证需复核</div>
+        </div>
+        <div class="status-item">
+          <div class="status-label">智能体</div>
+          <div class="status-value"><span>正常</span><span class="dot ok"></span></div>
+          <div class="subtle">2 场会议已归档</div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="left-stack">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>因子研究操作流程</h2>
+              <span class="badge blue">当前阶段：质量门禁</span>
+            </div>
+            <div class="flow">
+              <div class="step"><strong>研究议题</strong><span>量价低波拥挤反转是否能改善当前策略容错率</span></div>
+              <div class="step"><strong>档案检索</strong><span>已排除 4 条重复失败路径</span></div>
+              <div class="step"><strong>数据检查</strong><span>日频字段可用；分钟成交结构待补</span></div>
+              <div class="step"><strong>研究委员会</strong><span>CogAlpha 选择 5 个视角</span></div>
+              <div class="step"><strong>候选生成</strong><span>6 个候选，2 个交叉变体</span></div>
+              <div class="step"><strong>质量门禁</strong><span>3 个通过，2 个拒绝，1 个补证据</span></div>
+              <div class="step"><strong>评测归档</strong><span>等待多周期评测</span></div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>候选因子</h2>
+              <span class="subtle">按质量门禁优先级排序</span>
+            </div>
+            <div class="candidate-grid">
+              <div class="candidate">
+                <h3>流动性冲击反转</h3>
+                <div class="tags">
+                  <span class="tag">流动性</span>
+                  <span class="tag">反转</span>
+                  <span class="tag">20 日</span>
+                </div>
+                <div class="metric-row"><span>门禁</span><strong>通过</strong></div>
+                <div class="metric-row"><span>风险</span><strong>容量待评估</strong></div>
+                <button class="btn">查看证据</button>
+              </div>
+              <div class="candidate">
+                <h3>低波拥挤过滤</h3>
+                <div class="tags">
+                  <span class="tag">低波</span>
+                  <span class="tag">拥挤</span>
+                  <span class="tag">过滤</span>
+                </div>
+                <div class="metric-row"><span>门禁</span><strong>通过</strong></div>
+                <div class="metric-row"><span>风险</span><strong>小市值暴露</strong></div>
+                <button class="btn">进入评测</button>
+              </div>
+              <div class="candidate">
+                <h3>路径质量门控</h3>
+                <div class="tags">
+                  <span class="tag">路径</span>
+                  <span class="tag">门控</span>
+                  <span class="tag">60 日</span>
+                </div>
+                <div class="metric-row"><span>门禁</span><strong>补证据</strong></div>
+                <div class="metric-row"><span>风险</span><strong>字段覆盖不足</strong></div>
+                <button class="btn">追问智能体</button>
+              </div>
+            </div>
+          </article>
+
+          <section class="table-panel">
+            <div class="panel">
+              <div class="panel-head">
+                <h2>运行中心</h2>
+                <span class="subtle">只展示需要关注的运行</span>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>运行</th>
+                    <th>领域</th>
+                    <th>状态</th>
+                    <th>当前阶段</th>
+                    <th>下一步</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>research_20260516_01</td>
+                    <td>研究</td>
+                    <td><span class="badge blue">运行中</span></td>
+                    <td>质量门禁</td>
+                    <td>等待 3 个候选完成检查</td>
+                  </tr>
+                  <tr>
+                    <td>trade_20260516_qmt</td>
+                    <td>交易</td>
+                    <td><span class="badge amber">警告</span></td>
+                    <td>桥接健康</td>
+                    <td>需要复核认证状态</td>
+                  </tr>
+                  <tr>
+                    <td>archive_20260515</td>
+                    <td>归档</td>
+                    <td><span class="badge green">已完成</span></td>
+                    <td>版本血统</td>
+                    <td>无</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <aside class="right-stack">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>待处理</h2>
+              <span class="badge red">2 项</span>
+            </div>
+            <table>
+              <tbody>
+                <tr>
+                  <td>QMT 认证状态需要复核</td>
+                  <td><span class="badge amber">高</span></td>
+                </tr>
+                <tr>
+                  <td>路径质量门控候选缺少字段覆盖证据</td>
+                  <td><span class="badge blue">中</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>智能体会议</h2>
+              <span class="subtle">最近结论</span>
+            </div>
+            <table>
+              <tbody>
+                <tr>
+                  <td>因子研究委员会</td>
+                  <td><span class="badge green">已归档</span></td>
+                </tr>
+                <tr>
+                  <td>交易审查</td>
+                  <td><span class="badge amber">等待证据</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </article>
+
+          <article class="phone">
+            <div class="phone-screen">
+              <div class="phone-head">飞书通知预览</div>
+              <div class="notice">
+                <div class="notice-title">交易审查警告：QMT 认证需复核</div>
+                <div class="notice-body">影响：今日模拟盘链路不会继续提交新委托。建议：查看桥接状态并确认是否暂停交易。</div>
+                <div class="notice-actions">
+                  <button class="btn">已知悉</button>
+                  <button class="btn primary">打开工作台</button>
+                </div>
+              </div>
+              <div class="notice">
+                <div class="notice-title">研究候选待补证据</div>
+                <div class="notice-body">路径质量门控缺少字段覆盖证据。可让智能体补查，或直接驳回本候选。</div>
+                <div class="notice-actions">
+                  <button class="btn">驳回</button>
+                  <button class="btn">追问</button>
+                </div>
+              </div>
+            </div>
+          </article>
+        </aside>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

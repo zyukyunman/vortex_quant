@@ -6,7 +6,7 @@ updated: 2026-05-01
 status: research_lead
 factor_family: value_quality
 data_sources: [valuation, bars]
-artifact_root: /Users/zyukyunman/Documents/vortex_workspace/research/factor-reports/daily-cross-section-baseline
+artifact_root: ../vortex_workspace/research/factor-reports/daily-cross-section-baseline
 ---
 
 # 低PB低波股息质量因子
@@ -60,5 +60,5 @@ artifact_root: /Users/zyukyunman/Documents/vortex_workspace/research/factor-repo
 ## 产物路径
 
 ```text
-/Users/zyukyunman/Documents/vortex_workspace/research/factor-reports/daily-cross-section-baseline/
+../vortex_workspace/research/factor-reports/daily-cross-section-baseline/
 ```

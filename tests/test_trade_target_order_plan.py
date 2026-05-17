@@ -32,6 +32,63 @@ def test_build_target_portfolio_rounds_to_lots_and_cash_target() -> None:
     assert portfolio.cash_target == 17_000
 
 
+def test_build_target_portfolio_respects_target_shares_override_for_inertia() -> None:
+    targets = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "target_weight": 0.06,
+                "target_shares": 600,
+                "reference_price": 10.0,
+                "reason": "retain_excess",
+            },
+        ]
+    )
+
+    portfolio = build_target_portfolio(
+        targets,
+        trade_date="20260501",
+        strategy_version="tail_risk_soft_q10_p25",
+        run_id="run_1",
+        snapshot_id="snap_1",
+        config=TargetPortfolioBuildConfig(notional=100_000, lot_size=100),
+    )
+    plan = generate_order_plan(
+        portfolio,
+        cash=CashSnapshot(available_cash=10_000, frozen_cash=0, total_asset=100_000, market_value=6_000),
+        positions=[Position("000001.SZ", shares=600, available_shares=600, cost_price=9.0, last_price=10.0)],
+        quotes={"000001.SZ": Quote("000001.SZ", open_price=10.0, bid_price_1=9.99)},
+        config=OrderPlanConfig(min_order_value=3_000),
+    )
+
+    assert portfolio.positions[0].target_shares == 600
+    assert portfolio.positions[0].target_weight == pytest.approx(0.06)
+    assert plan.orders == []
+
+
+def test_build_target_portfolio_rejects_target_shares_over_budget() -> None:
+    targets = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "target_weight": 0.5,
+                "target_shares": 20_000,
+                "reference_price": 10.0,
+            },
+        ]
+    )
+
+    with pytest.raises(ValueError, match="target portfolio invested value cannot exceed notional"):
+        build_target_portfolio(
+            targets,
+            trade_date="20260501",
+            strategy_version="tail_risk_soft_q10_p25",
+            run_id="run_1",
+            snapshot_id="snap_1",
+            config=TargetPortfolioBuildConfig(notional=100_000, lot_size=100),
+        )
+
+
 def test_build_target_portfolio_skips_star_positions_below_200_shares() -> None:
     targets = pd.DataFrame(
         [

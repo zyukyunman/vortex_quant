@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from types import SimpleNamespace
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,9 @@ from vortex.runtime.workspace import Workspace
 from vortex.strategy.earnings_forecast_drift import EarningsForecastDriftConfig
 from vortex.strategy.earnings_forecast_cogalpha import run_earnings_forecast_cogalpha_role_cycle
 from vortex.strategy.earnings_forecast_overlay import (
+    _build_overlay_signal,
+    _variant_by_name,
+    run_earnings_forecast_cpcv_backtest,
     run_earnings_forecast_daily_mutation_grid,
     run_earnings_forecast_factor_overlay_challenge,
     run_earnings_forecast_overlay_execution_review,
@@ -33,6 +37,8 @@ from vortex.strategy.earnings_forecast_runner import (
     run_precise_earnings_forecast_review,
 )
 from vortex.strategy.earnings_forecast_live import (
+    LivePositionInertiaConfig,
+    _apply_live_position_inertia_to_candidates,
     execute_pending_qmt_task,
     get_earnings_forecast_auto_observability_paths,
     is_trade_day,
@@ -40,6 +46,10 @@ from vortex.strategy.earnings_forecast_live import (
     resolve_next_trade_date,
     run_earnings_forecast_auto_once,
     run_earnings_forecast_auto_cycle_once,
+)
+from vortex.strategy.earnings_forecast_strategy_spec import (
+    apply_earnings_forecast_overlay_signal,
+    resolve_earnings_forecast_strategy_spec,
 )
 from vortex.strategy.earnings_forecast_selection import run_earnings_forecast_selection_stability_review
 from vortex.trade.market_rules import MarketPermissionConfig
@@ -160,6 +170,29 @@ def test_get_earnings_forecast_version_preset_returns_named_preset():
     assert challenger.candidate_pool_size is None
     assert challenger.liquidity_rerank_weight == 0.0
     assert challenger.portfolio_notional == 100_000_000.0
+
+
+def test_resolve_tail_risk_live_strategy_spec_uses_baseline_soft_overlay():
+    spec = resolve_earnings_forecast_strategy_spec(
+        "tail_risk_soft_q10_p25",
+        base_preset_names=("baseline_top110_large", "stable_100w"),
+    )
+
+    assert spec.name == "tail_risk_soft_q10_p25"
+    assert spec.base_preset_name == "baseline_top110_large"
+    assert spec.overlay is not None
+    assert spec.overlay.overlay_type == "soft_penalty"
+    assert spec.overlay.factor_template == "tail_risk_downside_vol_20d"
+    assert spec.overlay.filter_quantile == 0.10
+    assert spec.overlay.penalty_strength == 0.25
+
+
+def test_resolve_unknown_live_strategy_spec_reports_allowed_names():
+    with pytest.raises(KeyError, match="unknown earnings forecast strategy preset"):
+        resolve_earnings_forecast_strategy_spec(
+            "unknown_strategy",
+            base_preset_names=("baseline_top110_large", "stable_100w"),
+        )
 
 
 def test_version_signal_context_filters_lower_half_market_cap(tmp_path):
@@ -436,6 +469,72 @@ def test_cmd_strategy_robustness_matrix_outputs_json(tmp_path, capsys):
     assert payload["json_path"].endswith("cli-robustness.json")
 
 
+def test_run_earnings_forecast_cpcv_backtest_writes_reports(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_cpcv_backtest(
+        root,
+        preset_name="stable_100w",
+        challenger_name="tail_risk_soft_q10_p25",
+        start="20260101",
+        end="20260310",
+        n_groups=4,
+        n_test_groups=2,
+        purge_horizon=5,
+        embargo=2,
+        output_dir=root / "strategy" / "cpcv",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="cpcv-test",
+    )
+
+    assert artifacts.json_path.exists()
+    assert artifacts.matrix_path.exists()
+    assert artifacts.md_path.exists()
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["label"] == "cpcv-test"
+    assert payload["preset"] == "stable_100w"
+    assert payload["challenger"] == "tail_risk_soft_q10_p25"
+    assert payload["n_groups"] == 4
+    assert payload["n_test_groups"] == 2
+    assert payload["split_count"] == 6
+    assert payload["cpcv_status"]["status"] in {
+        "cpcv_pass_reference_baseline_candidate",
+        "cpcv_conditional_shadow",
+        "cpcv_fail_keep_baseline",
+    }
+
+
+def test_cmd_strategy_cpcv_backtest_outputs_json(tmp_path, capsys):
+    root = _build_earnings_workspace(tmp_path)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="cpcv-backtest",
+            root=str(root),
+            preset="stable_100w",
+            challenger="tail_risk_soft_q10_p25",
+            start="20260101",
+            end="20260310",
+            n_groups=4,
+            n_test_groups=2,
+            purge_horizon=5,
+            embargo=2,
+            max_combinations=None,
+            output_dir=str(root / "strategy" / "cpcv"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-cpcv",
+            allow_missing_precise_data=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["label"] == "cli-cpcv"
+    assert payload["json_path"].endswith("cli-cpcv.json")
+    assert payload["matrix_path"].endswith("cli-cpcv矩阵.csv")
+
+
 def test_run_earnings_forecast_daily_mutation_grid_writes_reports(tmp_path):
     root = _build_earnings_workspace(tmp_path)
 
@@ -658,6 +757,24 @@ def test_run_earnings_forecast_shadow_plan_writes_target_files(tmp_path):
     assert artifacts.summary["requested_as_of"] == "20260310"
 
 
+def test_run_earnings_forecast_shadow_plan_defaults_to_stable_100w(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = run_earnings_forecast_shadow_plan(
+        root,
+        start="20260101",
+        as_of="20260310",
+        output_dir=root / "strategy" / "shadow",
+        artifact_dir=root / "strategy" / "artifacts",
+        label="shadow-default",
+    )
+
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+    assert payload["preset"]["name"] == "stable_100w"
+    assert payload["strategy_mode"] == "preset"
+    assert payload["json_path"].endswith(f"shadow-default-stable_100w-{payload['as_of']}.json")
+
+
 def test_run_earnings_forecast_shadow_plan_accepts_preset(tmp_path):
     root = _build_earnings_workspace(tmp_path)
 
@@ -713,6 +830,7 @@ def test_run_earnings_forecast_live_handoff_writes_reports(tmp_path):
     assert artifacts.html_path.exists()
     payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
     assert payload["qmt_ready"] is True
+    assert payload["preset"]["name"] == "stable_100w"
     assert payload["bridge_snapshot"]["cash"]["available_cash"] == 10_000_000.0
     assert payload["target_holding_count"] > 0
 
@@ -814,7 +932,7 @@ def test_prepare_earnings_forecast_next_session_writes_target_portfolio_and_task
     artifacts = prepare_earnings_forecast_next_session(
         root,
         start="20260101",
-        as_of="20260311",
+        as_of="20260309",
         qmt_bridge_url="http://bridge.local:8000",
         qmt_bridge_token="token",
         qmt_account_id="99034443",
@@ -829,7 +947,7 @@ def test_prepare_earnings_forecast_next_session_writes_target_portfolio_and_task
     assert artifacts.task_path.exists()
     payload = json.loads(artifacts.task_path.read_text(encoding="utf-8"))
     assert payload["status"] == "pending"
-    assert payload["requested_as_of"] == "20260311"
+    assert payload["requested_as_of"] == "20260309"
     assert payload["trade_date"] == "20260311"
     assert Path(payload["quality_review_path"]).exists()
     assert payload["target_diagnostics"]["mode"] == "live_topn_replacement"
@@ -847,6 +965,328 @@ def test_prepare_earnings_forecast_next_session_writes_target_portfolio_and_task
     assert artifacts.summary["quality_summary"]["holding_count"] == len(portfolio["positions"])
 
 
+def test_prepare_earnings_forecast_next_session_rejects_same_day_execution(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="execution_trade_date must be after signal as_of"):
+        prepare_earnings_forecast_next_session(
+            root,
+            start="20260101",
+            as_of="20260309",
+            execution_trade_date="20260309",
+            qmt_bridge_url="http://bridge.local:8000",
+            qmt_bridge_token="token",
+            qmt_account_id="99034443",
+            output_dir=root / "strategy" / "handoff",
+            artifact_dir=root / "strategy" / "artifacts",
+            preset_name="baseline_top110_large",
+            bridge_transport=_clean_fake_bridge_transport,
+        )
+
+
+def test_prepare_next_session_records_requested_as_of_as_signal_date(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = prepare_earnings_forecast_next_session(
+        root,
+        start="20260101",
+        as_of="20260309",
+        execution_trade_date="20260310",
+        qmt_bridge_url="http://bridge.local:8000",
+        qmt_bridge_token="token",
+        qmt_account_id="99034443",
+        output_dir=root / "strategy" / "handoff",
+        artifact_dir=root / "strategy" / "artifacts",
+        bridge_transport=_clean_fake_bridge_transport,
+    )
+
+    payload = json.loads(artifacts.task_path.read_text(encoding="utf-8"))
+    assert payload["as_of"] == "20260309"
+    assert payload["requested_as_of"] == "20260309"
+    assert payload["trade_date"] == "20260310"
+
+
+def test_tail_risk_overlay_ignores_same_day_factor_values() -> None:
+    symbols = [f"{idx:06d}.SZ" for idx in range(1, 21)]
+    base_signal = pd.DataFrame(
+        [[1.0 - idx * 0.01 for idx in range(len(symbols))]] * 2,
+        index=["20260309", "20260310"],
+        columns=symbols,
+    )
+    factor = pd.DataFrame(
+        [[float(idx) for idx in range(len(symbols))]] * 2,
+        index=base_signal.index,
+        columns=symbols,
+    )
+    modified_same_day_factor = factor.copy()
+    modified_same_day_factor.loc["20260310"] = list(reversed(range(len(symbols))))
+    spec = resolve_earnings_forecast_strategy_spec(
+        "tail_risk_soft_q10_p25",
+        base_preset_names=["baseline_top110_large"],
+    )
+
+    before = apply_earnings_forecast_overlay_signal(
+        base_signal,
+        {"tail_risk_downside_vol_20d": factor},
+        spec.overlay,
+    )
+    after = apply_earnings_forecast_overlay_signal(
+        base_signal,
+        {"tail_risk_downside_vol_20d": modified_same_day_factor},
+        spec.overlay,
+    )
+
+    pd.testing.assert_series_equal(before.loc["20260310"], after.loc["20260310"])
+
+
+def test_research_overlay_runner_ignores_same_day_factor_values() -> None:
+    symbols = [f"{idx:06d}.SZ" for idx in range(1, 21)]
+    base_signal = pd.DataFrame(
+        [[1.0 - idx * 0.01 for idx in range(len(symbols))]] * 2,
+        index=["20260309", "20260310"],
+        columns=symbols,
+    )
+    factor = pd.DataFrame(
+        [[float(idx) for idx in range(len(symbols))]] * 2,
+        index=base_signal.index,
+        columns=symbols,
+    )
+    modified_same_day_factor = factor.copy()
+    modified_same_day_factor.loc["20260310"] = list(reversed(range(len(symbols))))
+    variant = _variant_by_name("tail_risk_soft_q10_p25")
+
+    before = _build_overlay_signal(
+        base_signal,
+        {"tail_risk_downside_vol_20d": factor},
+        variant,
+    )
+    after = _build_overlay_signal(
+        base_signal,
+        {"tail_risk_downside_vol_20d": modified_same_day_factor},
+        variant,
+    )
+
+    pd.testing.assert_series_equal(before.loc["20260310"], after.loc["20260310"])
+
+
+def test_prepare_next_session_defaults_to_stable_100w_strategy(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    artifacts = prepare_earnings_forecast_next_session(
+        root,
+        start="20260101",
+        as_of="20260309",
+        qmt_bridge_url="http://bridge.local:8000",
+        qmt_bridge_token="token",
+        qmt_account_id="99034443",
+        output_dir=root / "strategy" / "handoff",
+        artifact_dir=root / "strategy" / "artifacts",
+        bridge_transport=_clean_fake_bridge_transport,
+    )
+
+    payload = json.loads(artifacts.task_path.read_text(encoding="utf-8"))
+    portfolio = json.loads(artifacts.target_portfolio_path.read_text(encoding="utf-8"))
+
+    assert payload["strategy_version"] == "stable_100w"
+    assert portfolio["strategy_version"] == "stable_100w"
+    assert payload["target_diagnostics"]["desired_top_n"] == 50
+    assert payload["target_diagnostics"]["strategy"]["base_preset"] == "stable_100w"
+    assert payload["target_diagnostics"]["strategy"]["overlay_variant"] is None
+    assert payload["target_diagnostics"]["strategy"]["overlay_type"] is None
+    assert payload["target_diagnostics"]["strategy"]["factor_template"] is None
+    assert payload["target_diagnostics"]["strategy"]["penalty_strength"] is None
+
+
+def test_prepare_next_session_rejects_tail_risk_shadow_only_strategy(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+
+    with pytest.raises(ValueError, match="只允许用于 shadow/challenge"):
+        prepare_earnings_forecast_next_session(
+            root,
+            start="20260101",
+            as_of="20260309",
+            qmt_bridge_url="http://bridge.local:8000",
+            qmt_bridge_token="token",
+            qmt_account_id="99034443",
+            output_dir=root / "strategy" / "handoff",
+            artifact_dir=root / "strategy" / "artifacts",
+            preset_name="tail_risk_soft_q10_p25",
+            bridge_transport=_clean_fake_bridge_transport,
+        )
+
+
+def test_prepare_next_session_uses_execution_trade_date_signal_row(tmp_path):
+    root = _build_earnings_workspace(tmp_path)
+    storage = ParquetDuckDBBackend(root / "data")
+    dates = pd.bdate_range("2025-08-01", "2026-03-09").strftime("%Y%m%d").tolist()
+    index_rows = [
+        {
+            "date": date,
+            "symbol": symbol,
+            "close": 1000.0 + idx * 5.0,
+        }
+        for idx, date in enumerate(dates)
+        for symbol in ["000300.SH", "000905.SH", "000852.SH"]
+    ]
+    _upsert_by_date(storage, "index_daily", pd.DataFrame(index_rows))
+    storage.upsert(
+        "forecast",
+        pd.DataFrame(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "ann_date": "20260309",
+                    "type": "预增",
+                    "p_change_min": 300.0,
+                    "p_change_max": 400.0,
+                    "report_date": "20260331",
+                }
+            ]
+        ),
+        {"report_date": "20260331"},
+    )
+
+    artifacts = prepare_earnings_forecast_next_session(
+        root,
+        start="20250801",
+        as_of="20260309",
+        qmt_bridge_url="http://bridge.local:8000",
+        qmt_bridge_token="token",
+        qmt_account_id="99034443",
+        output_dir=root / "strategy" / "handoff",
+        artifact_dir=root / "strategy" / "artifacts",
+        preset_name="baseline_top110_large",
+        live_top_n=1,
+        bridge_transport=_clean_fake_bridge_transport,
+    )
+
+    payload = json.loads(artifacts.task_path.read_text(encoding="utf-8"))
+    portfolio = json.loads(artifacts.target_portfolio_path.read_text(encoding="utf-8"))
+
+    assert payload["as_of"] == "20260309"
+    assert payload["trade_date"] == "20260311"
+    assert payload["target_diagnostics"]["signal_as_of"] == "20260309"
+    assert payload["target_diagnostics"]["signal_trade_date"] == "20260311"
+    assert payload["target_diagnostics"]["eligible_signal_count"] == 1
+    assert [position["symbol"] for position in portfolio["positions"]] == ["000001.SZ"]
+
+
+def test_live_position_inertia_keeps_winner_excess_shares():
+    candidates = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "weight": 0.05,
+                "reference_price": 10.0,
+                "action": "buy_or_increase",
+            }
+        ]
+    )
+
+    adjusted, diagnostics = _apply_live_position_inertia_to_candidates(
+        candidates,
+        current_positions={"000001.SZ": 600},
+        momentum_retention={"000001.SZ": 1.0},
+        portfolio_notional=100_000.0,
+        config=LivePositionInertiaConfig(),
+    )
+
+    row = adjusted.iloc[0]
+    assert row["target_shares"] == 600
+    assert row["weight"] == pytest.approx(0.06)
+    assert row["inertia_action"] == "retain_excess"
+    assert diagnostics["retained_excess_shares"] == 100
+
+
+def test_live_position_inertia_trims_weak_momentum_partially():
+    candidates = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "weight": 0.05,
+                "reference_price": 10.0,
+                "action": "buy_or_increase",
+            }
+        ]
+    )
+
+    adjusted, diagnostics = _apply_live_position_inertia_to_candidates(
+        candidates,
+        current_positions={"000001.SZ": 600},
+        momentum_retention={"000001.SZ": 0.25},
+        portfolio_notional=100_000.0,
+        config=LivePositionInertiaConfig(),
+    )
+
+    row = adjusted.iloc[0]
+    assert row["target_shares"] == 500
+    assert row["weight"] == pytest.approx(0.05)
+    assert row["inertia_action"] == "trim_excess"
+    assert diagnostics["trimmed_excess_shares"] == 100
+
+
+def test_live_position_inertia_missing_momentum_does_not_protect_excess_by_default():
+    candidates = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "weight": 0.05,
+                "reference_price": 10.0,
+                "action": "buy_or_increase",
+            }
+        ]
+    )
+
+    adjusted, diagnostics = _apply_live_position_inertia_to_candidates(
+        candidates,
+        current_positions={"000001.SZ": 600},
+        momentum_retention={},
+        portfolio_notional=100_000.0,
+        config=LivePositionInertiaConfig(),
+    )
+
+    row = adjusted.iloc[0]
+    assert row["target_shares"] == 500
+    assert row["inertia_action"] == "trim_excess"
+    assert row["momentum_retention"] == 0.0
+    assert diagnostics["missing_momentum_count"] == 1
+    assert diagnostics["retained_excess_shares"] == 0
+
+
+def test_live_position_inertia_keeps_total_target_within_budget():
+    candidates = pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "weight": 0.50,
+                "reference_price": 10.0,
+                "action": "buy_or_increase",
+            },
+            {
+                "symbol": "000002.SZ",
+                "weight": 0.50,
+                "reference_price": 10.0,
+                "action": "buy_or_increase",
+            },
+        ]
+    )
+
+    adjusted, diagnostics = _apply_live_position_inertia_to_candidates(
+        candidates,
+        current_positions={"000001.SZ": 6_000},
+        momentum_retention={"000001.SZ": 1.0, "000002.SZ": 1.0},
+        portfolio_notional=100_000.0,
+        config=LivePositionInertiaConfig(),
+    )
+
+    by_symbol = adjusted.set_index("symbol")
+    target_value = float((adjusted["target_shares"] * adjusted["reference_price"]).sum())
+    assert by_symbol.loc["000001.SZ", "target_shares"] == 6_000
+    assert by_symbol.loc["000002.SZ", "target_shares"] == 4_000
+    assert target_value <= 100_000.0
+    assert diagnostics["budget_limited"] is True
+
+
 def test_prepare_next_session_fails_closed_when_stock_st_partition_missing(tmp_path):
     root = _build_earnings_workspace(tmp_path)
     missing_partition = sorted((root / "data" / "stock_st").glob("date=*"))[-1]
@@ -856,7 +1296,7 @@ def test_prepare_next_session_fails_closed_when_stock_st_partition_missing(tmp_p
         prepare_earnings_forecast_next_session(
             root,
             start="20260101",
-            as_of="20260311",
+            as_of="20260309",
             qmt_bridge_url="http://bridge.local:8000",
             qmt_bridge_token="token",
             qmt_account_id="99034443",
@@ -1024,15 +1464,13 @@ def test_prepare_next_session_allows_empty_handoff_before_live_replacement(tmp_p
 
     payload = json.loads(artifacts.task_path.read_text(encoding="utf-8"))
     assert payload["status"] == "pending"
-    assert payload["target_diagnostics"]["shortfall_reason"] == "no_positive_signal_candidates"
+    assert payload["target_diagnostics"]["shortfall_reason"] == "market_cap_filter_shortfall"
     portfolio = json.loads(artifacts.target_portfolio_path.read_text(encoding="utf-8"))
-    assert portfolio["positions"] == []
-    assert portfolio["cash_target"] == 1_000_000.0
+    assert [position["symbol"] for position in portfolio["positions"]] == ["000001.SZ"]
+    assert portfolio["cash_target"] < 1_000_000.0
 
 
 def test_execute_pending_qmt_task_uses_frozen_target_portfolio(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     root = _build_earnings_workspace(tmp_path)
 
     def fake_transport(method, url, payload=None, headers=None):  # noqa: ARG001
@@ -1053,7 +1491,7 @@ def test_execute_pending_qmt_task_uses_frozen_target_portfolio(tmp_path, monkeyp
     prepared = prepare_earnings_forecast_next_session(
         root,
         start="20260101",
-        as_of="20260310",
+        as_of="20260309",
         qmt_bridge_url="http://bridge.local:8000",
         qmt_bridge_token="token",
         qmt_account_id="99034443",
@@ -1095,7 +1533,12 @@ def test_execute_pending_qmt_task_uses_frozen_target_portfolio(tmp_path, monkeyp
         )
 
     monkeypatch.setattr("vortex.trade.qmt_bridge.QmtBridgeAdapter", FakeProbeAdapter)
-    monkeypatch.setattr("vortex.strategy.earnings_forecast_live.load_trade_st_flags", lambda *args, **kwargs: {})
+
+    def fake_load_trade_st_flags(*args, **kwargs):  # noqa: ANN001, ARG001
+        captured["st_as_of"] = kwargs["as_of"]
+        return {str(symbol): False for symbol in kwargs["symbols"]}
+
+    monkeypatch.setattr("vortex.strategy.earnings_forecast_live.load_trade_st_flags", fake_load_trade_st_flags)
     monkeypatch.setattr("vortex.strategy.earnings_forecast_live.run_qmt_rebalance", fake_run_qmt_rebalance)
 
     result = execute_pending_qmt_task(
@@ -1110,10 +1553,78 @@ def test_execute_pending_qmt_task_uses_frozen_target_portfolio(tmp_path, monkeyp
     assert captured["portfolio_id"] == prepared.summary["portfolio_id"]
     assert captured["trade_date"] == prepared.summary["trade_date"]
     assert captured["strategy_version"] == "baseline_top110_large"
+    assert captured["st_as_of"] == prepared.summary["trade_date"]
     assert result["task_status"] == "done"
     payload = json.loads(prepared.task_path.read_text(encoding="utf-8"))
     assert payload["status"] == "done"
     assert payload["target_portfolio_path"] == str(prepared.target_portfolio_path)
+
+
+def test_execute_pending_qmt_task_allows_missing_st_data_when_explicit(tmp_path, monkeypatch):
+    root = _build_earnings_workspace(tmp_path)
+    prepared = prepare_earnings_forecast_next_session(
+        root,
+        start="20260101",
+        as_of="20260309",
+        qmt_bridge_url="http://bridge.local:8000",
+        qmt_bridge_token="token",
+        qmt_account_id="99034443",
+        output_dir=root / "strategy" / "handoff",
+        artifact_dir=root / "strategy" / "artifacts",
+        preset_name="baseline_top110_large",
+        bridge_transport=_clean_fake_bridge_transport,
+    )
+
+    class FakeProbeAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def get_positions(self):
+            return []
+
+    captured: dict[str, object] = {}
+
+    def fake_load_trade_st_flags(*args, **kwargs):  # noqa: ANN001, ARG001
+        raise ValueError("stock_st missing")
+
+    def fake_run_qmt_rebalance(portfolio, **kwargs):  # noqa: ANN001
+        exec_dir = root / "trade" / "executions" / "exec_20260311_missing_st"
+        exec_dir.mkdir(parents=True, exist_ok=True)
+        report_path = exec_dir / "execution_report.json"
+        report_md_path = exec_dir / "execution_report.md"
+        report_path.write_text("{}", encoding="utf-8")
+        report_md_path.write_text("# test", encoding="utf-8")
+        captured["st_flags"] = kwargs["st_flags"]
+        captured["require_st_data"] = kwargs["risk_config"].require_st_data
+        return SimpleNamespace(
+            exec_id="exec_20260311_missing_st",
+            execution_report_path=report_path,
+            execution_report_md_path=report_md_path,
+            report=SimpleNamespace(
+                risk_result=SimpleNamespace(
+                    passed=True,
+                    blocking_reasons=[],
+                )
+            ),
+        )
+
+    monkeypatch.setattr("vortex.trade.qmt_bridge.QmtBridgeAdapter", FakeProbeAdapter)
+    monkeypatch.setattr("vortex.strategy.earnings_forecast_live.load_trade_st_flags", fake_load_trade_st_flags)
+    monkeypatch.setattr("vortex.strategy.earnings_forecast_live.run_qmt_rebalance", fake_run_qmt_rebalance)
+
+    result = execute_pending_qmt_task(
+        root,
+        task_path=prepared.task_path,
+        qmt_bridge_url="http://bridge.local:8000",
+        qmt_bridge_token="token",
+        qmt_account_id="99034443",
+        allow_missing_st_data=True,
+        allow_trading=False,
+    )
+
+    assert result["task_status"] == "done"
+    assert captured["st_flags"] is None
+    assert captured["require_st_data"] is False
 
 
 def test_run_earnings_forecast_auto_cycle_once_prepares_and_executes_due_task(tmp_path, monkeypatch):
@@ -1214,14 +1725,20 @@ def test_run_earnings_forecast_auto_cycle_once_records_nav_after_execution(tmp_p
         "vortex.strategy.earnings_forecast_live._run_data_update_foreground",
         lambda *args, **kwargs: {"status": "success"},  # noqa: ARG005
     )
-    monkeypatch.setattr(
-        "vortex.strategy.earnings_forecast_live.execute_pending_qmt_task",
-        lambda *args, **kwargs: {  # noqa: ARG005
+    execute_kwargs = {}
+
+    def fake_execute(*args, **kwargs):  # noqa: ANN001, ARG001
+        execute_kwargs.update(kwargs)
+        return {
             "task_path": str(task_path),
             "task_status": "done",
             "exec_id": "exec_20260310_test",
             "risk_passed": True,
-        },
+        }
+
+    monkeypatch.setattr(
+        "vortex.strategy.earnings_forecast_live.execute_pending_qmt_task",
+        fake_execute,
     )
     monkeypatch.setattr(
         "vortex.strategy.earnings_forecast_live.is_trade_day",
@@ -1232,7 +1749,7 @@ def test_run_earnings_forecast_auto_cycle_once_records_nav_after_execution(tmp_p
 
     def fake_nav_snapshot(*args, **kwargs):  # noqa: ARG001
         captured.update(kwargs)
-        return {"run_id": "earnings_forecast_auto-baseline_top110_large-99034443", "net_value": 1.0}
+        return {"run_id": "earnings_forecast_auto-stable_100w-99034443", "net_value": 1.0}
 
     monkeypatch.setattr(
         "vortex.strategy.earnings_forecast_live._record_auto_nav_snapshot",
@@ -1252,9 +1769,10 @@ def test_run_earnings_forecast_auto_cycle_once_records_nav_after_execution(tmp_p
     )
 
     assert payload["executed"][0]["exec_id"] == "exec_20260310_test"
+    assert execute_kwargs["allow_trading"] is False
     assert payload["nav_snapshot"]["net_value"] == 1.0
     assert captured["trade_date"] == "20260310"
-    assert captured["preset_name"] == "baseline_top110_large"
+    assert captured["preset_name"] == "stable_100w"
     assert captured["initial_equity"] == 1_000_000.0
     assert captured["benchmark"] == "000852.SH"
 
@@ -1541,7 +2059,8 @@ def test_cmd_strategy_live_handoff_outputs_json(tmp_path, capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out)
     assert payload["label"] == "cli-handoff"
     assert payload["qmt_ready"] is True
-    assert payload["json_path"].endswith(f"cli-handoff-{payload['as_of']}.json")
+    assert payload["preset"]["name"] == "stable_100w"
+    assert payload["json_path"].endswith(f"cli-handoff-stable_100w-{payload['as_of']}.json")
 
 
 def test_cmd_strategy_live_handoff_with_preset_outputs_json(tmp_path, capsys, monkeypatch):
@@ -1634,7 +2153,7 @@ def test_cmd_strategy_prepare_next_session_outputs_json(tmp_path, capsys, monkey
             earnings_action="prepare-next-session",
             root=str(root),
             start="20260101",
-            as_of="20260311",
+            as_of="20260309",
             preset="baseline_top110_large",
             qmt_bridge_url="http://bridge.local:8000",
             qmt_bridge_token="token",
@@ -1656,6 +2175,82 @@ def test_cmd_strategy_prepare_next_session_outputs_json(tmp_path, capsys, monkey
     assert Path(payload["task_path"]).exists()
     assert Path(payload["target_portfolio_path"]).parent == root / "trade" / "targets" / "20260311"
     assert Path(payload["task_path"]).parent == root / "state" / "trade" / "pending_qmt"
+
+
+def test_cmd_strategy_prepare_next_session_keeps_plan_when_xueqiu_sync_fails(tmp_path, capsys, monkeypatch):
+    root = _build_earnings_workspace(tmp_path)
+
+    import vortex.strategy.earnings_forecast_live as live_module
+
+    original_prepare = live_module.prepare_earnings_forecast_next_session
+
+    def prepare_with_fake_transport(*args, **kwargs):  # noqa: ANN002, ANN003
+        kwargs["bridge_transport"] = _clean_fake_bridge_transport
+        return original_prepare(*args, **kwargs)
+
+    def fail_xueqiu_sync(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
+        raise ValueError("xueqiu error 400016: login expired")
+
+    notifications: list[tuple[object, object]] = []
+
+    class FakeNotificationService:
+        def __init__(self, _db):  # noqa: ANN001
+            return
+
+        def notify(self, message, profile_notification=None):  # noqa: ANN001
+            notifications.append((message, profile_notification))
+            return [{"status": "sent", "channel": "dummy"}]
+
+    monkeypatch.setattr(live_module, "prepare_earnings_forecast_next_session", prepare_with_fake_transport)
+    monkeypatch.setattr("vortex.trade.xueqiu.run_xueqiu_rebalance", fail_xueqiu_sync)
+    monkeypatch.setattr("vortex.notification.service.NotificationService", FakeNotificationService)
+
+    cli.cmd_strategy(
+        argparse.Namespace(
+            strategy_action="earnings-forecast",
+            earnings_action="prepare-next-session",
+            root=str(root),
+            start="20260101",
+            as_of="20260309",
+            preset="baseline_top110_large",
+            qmt_bridge_url="http://bridge.local:8000",
+            qmt_bridge_token="token",
+            qmt_account_id="99034443",
+            output_dir=str(root / "strategy" / "handoff"),
+            artifact_dir=str(root / "strategy" / "artifacts"),
+            label="cli-prepare",
+            portfolio_notional=1_000_000.0,
+            min_position_value=3_000.0,
+            allow_missing_precise_data=False,
+            enable_xueqiu=True,
+            xueqiu_cube_symbol="ZH3625640",
+            xueqiu_market="cn",
+            xueqiu_cookie="u=1",
+            xueqiu_cookie_file=None,
+            xueqiu_submit=True,
+            xueqiu_notification_profile="default",
+            no_xueqiu_auth_notify=False,
+            format="json",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "prepared"
+    assert payload["xueqiu_sync"]["status"] == "error"
+    assert "login expired" in payload["xueqiu_sync"]["error"]
+    assert payload["xueqiu_sync"]["login_required"] is True
+    assert payload["xueqiu_sync"]["notification"]["status"] == "sent"
+    assert len(notifications) == 1
+    message, profile_notification = notifications[0]
+    assert message.event_type == "trade.xueqiu.auth_required"
+    assert "雪球组合 ZH3625640" in message.summary
+    assert isinstance(profile_notification, dict)
+
+    task_payload = json.loads(Path(payload["task_path"]).read_text(encoding="utf-8"))
+    assert task_payload["xueqiu_sync_status"] == "error"
+    assert "login expired" in task_payload["xueqiu_sync_error"]
+    assert task_payload["xueqiu_sync_login_required"] is True
+    assert task_payload["xueqiu_auth_notification"]["status"] == "sent"
 
 
 def test_cmd_strategy_auto_status_outputs_json(tmp_path, capsys):

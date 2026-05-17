@@ -1929,6 +1929,18 @@ def cmd_server(args: argparse.Namespace) -> None:
             sys.exit(1)
 
 
+def cmd_console(args: argparse.Namespace) -> None:
+    """本地控制台。"""
+    from vortex.runtime.control_console import run_control_console
+
+    root = Path(getattr(args, "root", DEFAULT_WORKSPACE)).expanduser().resolve()
+    run_control_console(
+        root,
+        host=str(getattr(args, "host", "127.0.0.1")),
+        port=int(getattr(args, "port", 8765)),
+    )
+
+
 def cmd_profile(args: argparse.Namespace) -> None:
     """配置管理。"""
     from vortex.config.profile.resolver import ProfileResolver
@@ -2306,10 +2318,15 @@ def _collect_earnings_forecast_auto_status(root: Path) -> dict[str, object]:
     status = read_earnings_forecast_auto_status(root)
     pid = status.get("pid")
     pid_int = int(pid) if pid is not None else None
+    pid_alive = _is_pid_alive(pid_int)
+    effective_status = status.get("service_status") or "unknown"
+    if effective_status == "running" and not pid_alive:
+        effective_status = "stale_dead_pid"
     return {
         "root": str(root),
         **status,
-        "pid_alive": _is_pid_alive(pid_int),
+        "pid_alive": pid_alive,
+        "effective_service_status": effective_status,
     }
 
 
@@ -2419,6 +2436,34 @@ def _print_earnings_forecast_auto_logs(
                 print(chunk, end="" if chunk.endswith("\n") else "\n")
             last_size = len(text)
         time.sleep(0.5)
+
+
+def _earnings_auto_allow_trading(args: argparse.Namespace) -> bool:
+    """Auto-run defaults to dry-run; real submit requires explicit confirmation."""
+
+    from vortex.trade.live_gate import validate_live_trading_permission
+
+    return validate_live_trading_permission(
+        enable_trading=bool(getattr(args, "enable_trading", False)),
+        disable_trading=bool(getattr(args, "disable_trading", False)),
+        account_id=str(getattr(args, "qmt_account_id", "") or ""),
+        allowed_account_ids=getattr(args, "allowed_account_id", None) or [],
+        confirmation=str(getattr(args, "confirm_trading", "") or ""),
+    )
+
+
+def _qmt_rebalance_allow_trading(args: argparse.Namespace) -> bool:
+    """Direct QMT rebalance also defaults to dry-run."""
+
+    from vortex.trade.live_gate import validate_live_trading_permission
+
+    return validate_live_trading_permission(
+        enable_trading=bool(getattr(args, "enable_trading", False)),
+        disable_trading=bool(getattr(args, "disable_trading", False)),
+        account_id=str(getattr(args, "qmt_account_id", "") or ""),
+        allowed_account_ids=getattr(args, "allowed_account_id", None) or [],
+        confirmation=str(getattr(args, "confirm_trading", "") or ""),
+    )
 
 
 def cmd_data(args: argparse.Namespace) -> None:
@@ -2944,6 +2989,7 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         "cogalpha-role-cycle",
         "factor-overlay-challenge",
         "robustness-matrix",
+        "cpcv-backtest",
         "daily-mutation-grid",
         "overlay-execution-review",
         "regime-budget-challenge",
@@ -2952,7 +2998,9 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         raise SystemExit(f"未知 earnings-forecast 子命令: {args.earnings_action}")
 
     from vortex.strategy.earnings_forecast_overlay import (
+        DEFAULT_CPCV_BACKTEST_LABEL,
         DEFAULT_FACTOR_OVERLAY_LABEL,
+        run_earnings_forecast_cpcv_backtest,
         run_earnings_forecast_daily_mutation_grid,
         run_earnings_forecast_factor_overlay_challenge,
         run_earnings_forecast_overlay_execution_review,
@@ -2971,6 +3019,7 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         DEFAULT_AUTO_NAV_INITIAL_EQUITY,
         DEFAULT_AUTO_PREPARE_TIME,
         DEFAULT_AUTO_PRESET,
+        _sync_auto_xueqiu_task,
         prepare_earnings_forecast_next_session,
         run_earnings_forecast_auto_once,
         run_earnings_forecast_auto_cycle_once,
@@ -3097,6 +3146,19 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             min_position_value=float(args.min_position_value),
             require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
         )
+        if bool(getattr(args, "enable_xueqiu", False)):
+            artifacts.summary["xueqiu_sync"] = _sync_auto_xueqiu_task(
+                Path(args.root).expanduser(),
+                task_path=artifacts.task_path,
+                cube_symbol=args.xueqiu_cube_symbol,
+                cookie=args.xueqiu_cookie,
+                cookie_file=args.xueqiu_cookie_file,
+                market=args.xueqiu_market,
+                submit=bool(args.xueqiu_submit),
+                profile_name=getattr(args, "xueqiu_notification_profile", None),
+                notify_auth_error=not bool(getattr(args, "no_xueqiu_auth_notify", False)),
+                source="prepare-next-session",
+            )
         if args.format == "json":
             print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
             return
@@ -3104,6 +3166,13 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         print(f"  Handoff: {artifacts.handoff_json_path}")
         print(f"  Target portfolio: {artifacts.target_portfolio_path}")
         print(f"  Pending task: {artifacts.task_path}")
+        if artifacts.summary.get("xueqiu_sync"):
+            xueqiu_sync = artifacts.summary["xueqiu_sync"]
+            if isinstance(xueqiu_sync, dict):
+                print(
+                    "  Xueqiu sync: "
+                    f"{xueqiu_sync.get('report_path') or xueqiu_sync.get('status') or '-'}"
+                )
         return
 
     if args.earnings_action == "auto-status":
@@ -3120,6 +3189,7 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         return
 
     if args.earnings_action == "auto-run":
+        allow_auto_trading = _earnings_auto_allow_trading(args)
         if not bool(args.once):
             run_earnings_forecast_auto_loop(
                 Path(args.root).expanduser(),
@@ -3133,9 +3203,17 @@ def cmd_strategy(args: argparse.Namespace) -> None:
                 prepare_time=args.prepare_time or DEFAULT_AUTO_PREPARE_TIME,
                 execute_time=args.execute_time or DEFAULT_AUTO_EXECUTE_TIME,
                 poll_seconds=int(args.poll_seconds),
-                allow_trading=not bool(args.disable_trading),
+                allow_trading=allow_auto_trading,
                 nav_initial_equity=float(args.nav_initial_equity),
                 nav_benchmark=args.nav_benchmark or DEFAULT_AUTO_NAV_BENCHMARK,
+                xueqiu_enabled=bool(args.enable_xueqiu),
+                xueqiu_cube_symbol=args.xueqiu_cube_symbol,
+                xueqiu_cookie=args.xueqiu_cookie,
+                xueqiu_cookie_file=args.xueqiu_cookie_file,
+                xueqiu_market=args.xueqiu_market,
+                xueqiu_submit=bool(args.xueqiu_submit),
+                xueqiu_notification_profile=args.xueqiu_notification_profile or args.profile,
+                xueqiu_notify_auth_error=not bool(getattr(args, "no_xueqiu_auth_notify", False)),
             )
             return
         payload = run_earnings_forecast_auto_once(
@@ -3149,9 +3227,17 @@ def cmd_strategy(args: argparse.Namespace) -> None:
             label=args.label or DEFAULT_AUTO_LABEL,
             prepare_time=args.prepare_time or DEFAULT_AUTO_PREPARE_TIME,
             execute_time=args.execute_time or DEFAULT_AUTO_EXECUTE_TIME,
-            allow_trading=not bool(args.disable_trading),
+            allow_trading=allow_auto_trading,
             nav_initial_equity=float(args.nav_initial_equity),
             nav_benchmark=args.nav_benchmark or DEFAULT_AUTO_NAV_BENCHMARK,
+            xueqiu_enabled=bool(args.enable_xueqiu),
+            xueqiu_cube_symbol=args.xueqiu_cube_symbol,
+            xueqiu_cookie=args.xueqiu_cookie,
+            xueqiu_cookie_file=args.xueqiu_cookie_file,
+            xueqiu_market=args.xueqiu_market,
+            xueqiu_submit=bool(args.xueqiu_submit),
+            xueqiu_notification_profile=args.xueqiu_notification_profile or args.profile,
+            xueqiu_notify_auth_error=not bool(getattr(args, "no_xueqiu_auth_notify", False)),
         )
         if args.format == "json":
             print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
@@ -3306,6 +3392,36 @@ def cmd_strategy(args: argparse.Namespace) -> None:
         print(f"  矩阵: {artifacts.matrix_path}")
         print(f"  Markdown: {artifacts.md_path}")
         status = artifacts.summary.get("robustness_status") or {}
+        if isinstance(status, dict):
+            print(f"  状态: {status.get('status', 'unknown')}")
+        return
+
+    if args.earnings_action == "cpcv-backtest":
+        artifacts = run_earnings_forecast_cpcv_backtest(
+            Path(args.root).expanduser(),
+            preset_name=args.preset,
+            reference_name=getattr(args, "reference", None),
+            challenger_name=args.challenger,
+            start=args.start,
+            end=args.end,
+            n_groups=int(args.n_groups),
+            n_test_groups=int(args.n_test_groups),
+            purge_horizon=int(args.purge_horizon),
+            embargo=int(args.embargo),
+            output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
+            artifact_dir=Path(args.artifact_dir).expanduser() if args.artifact_dir else None,
+            label=args.label or DEFAULT_CPCV_BACKTEST_LABEL,
+            require_precise_data=not bool(getattr(args, "allow_missing_precise_data", False)),
+            max_combinations=getattr(args, "max_combinations", None),
+        )
+        if args.format == "json":
+            print(json.dumps(artifacts.summary, ensure_ascii=False, indent=2, default=str))
+            return
+        print("业绩预告冻结候选 CPCV 回测完成")
+        print(f"  JSON: {artifacts.json_path}")
+        print(f"  矩阵: {artifacts.matrix_path}")
+        print(f"  Markdown: {artifacts.md_path}")
+        status = artifacts.summary.get("cpcv_status") or {}
         if isinstance(status, dict):
             print(f"  状态: {status.get('status', 'unknown')}")
         return
@@ -3524,6 +3640,33 @@ def _trade_status_summary(
     return payload
 
 
+def _load_workspace_env_for_cli(root: Path) -> None:
+    """Load workspace .env values without overriding explicitly exported env vars."""
+
+    env_file = root.expanduser() / ".env"
+    if not env_file.exists():
+        return
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _first_text(*values: object) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _trade_quote_summary(
     root: Path,
     *,
@@ -3706,6 +3849,7 @@ def _run_trade_qmt_rebalance(args: argparse.Namespace) -> dict[str, object]:
 
     if not args.qmt_bridge_url:
         raise ValueError("缺少 --qmt-bridge-url")
+    allow_trading = _qmt_rebalance_allow_trading(args)
     portfolio = target_portfolio_from_dict(read_json(Path(args.target_portfolio).expanduser()))
     if args.st_flags:
         st_flags = _read_trade_st_flags(Path(args.st_flags).expanduser())
@@ -3736,7 +3880,7 @@ def _run_trade_qmt_rebalance(args: argparse.Namespace) -> dict[str, object]:
             base_url=args.qmt_bridge_url,
             token=args.qmt_bridge_token,
             account_id=args.qmt_account_id or None,
-            allow_trading=not bool(args.disable_trading),
+            allow_trading=allow_trading,
         ),
         output_root=Path(args.root).expanduser(),
         st_flags=st_flags,
@@ -3746,8 +3890,8 @@ def _run_trade_qmt_rebalance(args: argparse.Namespace) -> dict[str, object]:
             min_order_value=float(args.min_order_value),
         ),
         risk_config=PreTradeRiskConfig(
-            mode="qmt_sim",
-            allow_live=not bool(args.disable_trading),
+            mode="live" if allow_trading else "qmt_sim",
+            allow_live=allow_trading,
             require_st_data=not bool(args.allow_missing_st_data),
             max_order_count=int(args.max_order_count),
             max_single_order_value=float(args.max_single_order_value),
@@ -3766,6 +3910,47 @@ def _run_trade_qmt_rebalance(args: argparse.Namespace) -> dict[str, object]:
         "execution_report_path": str(artifacts.execution_report_path),
         "execution_report_md_path": str(artifacts.execution_report_md_path),
     }
+
+
+def _run_trade_xueqiu_rebalance(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade.serialization import read_json, target_portfolio_from_dict
+    from vortex.trade.xueqiu import XueqiuConfig, run_xueqiu_rebalance
+
+    cube_symbol = str(args.cube_symbol or "").strip()
+    if not cube_symbol:
+        raise ValueError("缺少 --cube-symbol 或环境变量 XUEQIU_CUBE_SYMBOL")
+    portfolio = target_portfolio_from_dict(read_json(Path(args.target_portfolio).expanduser()))
+    artifacts = run_xueqiu_rebalance(
+        portfolio,
+        config=XueqiuConfig(
+            cube_symbol=cube_symbol,
+            market=args.market,
+            cookie=args.cookie,
+            cookie_file=args.cookie_file,
+            allow_submit=bool(args.submit),
+            ignore_minor_weight_pct=float(args.ignore_minor_weight_pct),
+        ),
+        output_root=Path(args.root).expanduser(),
+        comment=args.comment,
+    )
+    return dict(artifacts.summary)
+
+
+def _run_trade_xueqiu_auth_check(args: argparse.Namespace) -> dict[str, object]:
+    from vortex.trade.xueqiu import XueqiuConfig, check_xueqiu_auth
+
+    cube_symbol = str(args.cube_symbol or "").strip()
+    if not cube_symbol:
+        raise ValueError("缺少 --cube-symbol 或环境变量 XUEQIU_CUBE_SYMBOL")
+    return check_xueqiu_auth(
+        config=XueqiuConfig(
+            cube_symbol=cube_symbol,
+            market=args.market,
+            cookie=args.cookie,
+            cookie_file=args.cookie_file,
+            request_timeout_seconds=float(args.request_timeout_seconds),
+        )
+    )
 
 
 def _run_trade_nav_snapshot(args: argparse.Namespace) -> dict[str, object]:
@@ -3880,28 +4065,107 @@ def _print_trade_dict(title: str, payload: dict[str, object]) -> None:
         print(f"  {key}: {value}")
 
 
+def _run_research_cogalpha_cycle(args: argparse.Namespace) -> dict[str, object]:
+    if not args.demo:
+        raise SystemExit("第一版 research cogalpha-cycle 只支持 --demo 确定性演示数据")
+
+    from vortex.research.cogalpha import run_cogalpha_company_demo_cycle
+
+    notification_config = None
+    if getattr(args, "notify", False):
+        notification_config = {
+            "enabled": True,
+            "level": args.notification_level,
+            "channel": args.notification_channel,
+        }
+    return run_cogalpha_company_demo_cycle(
+        args.root,
+        output_dir=args.output_dir,
+        run_id=args.run_id,
+        days=args.days,
+        symbols=args.symbols,
+        min_periods=args.min_periods,
+        groups=args.groups,
+        top_n=args.top_n,
+        notify=args.notify,
+        notification_config=notification_config,
+    )
+
+
+def cmd_research(args: argparse.Namespace) -> None:
+    """因子研究与研发公司运行入口。"""
+
+    if args.research_action == "cogalpha-cycle":
+        payload = _run_research_cogalpha_cycle(args)
+        title = "CogAlpha 因子研究公司级运行完成"
+    else:
+        raise SystemExit(f"未知 research 子命令: {args.research_action}")
+    if args.format == "json":
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    run = payload.get("run", {})
+    quality_gate = payload.get("quality_gate", {})
+    artifacts = payload.get("artifacts", {})
+    print(title)
+    print(f"  run_id: {run.get('run_id')}")
+    print(f"  status: {run.get('status')}")
+    print(f"  output_dir: {run.get('output_dir')}")
+    print(f"  quality_gate: {quality_gate.get('status')}")
+    print(f"  promoted_candidate_count: {quality_gate.get('promoted_candidate_count')}")
+    manifest = artifacts.get("run_manifest") if isinstance(artifacts, dict) else None
+    if isinstance(manifest, dict):
+        print(f"  run_manifest: {manifest.get('path')}")
+
+
 def cmd_trade(args: argparse.Namespace) -> None:
     """交易执行入口。"""
 
+    root = Path(args.root)
+    _load_workspace_env_for_cli(root)
+
     if args.trade_action == "status":
         payload = _trade_status_summary(
-            Path(args.root),
-            bridge_url=getattr(args, "qmt_bridge_url", None),
-            bridge_token=getattr(args, "qmt_bridge_token", None),
-            bridge_account_id=getattr(args, "qmt_account_id", None),
+            root,
+            bridge_url=_first_text(
+                getattr(args, "qmt_bridge_url", None),
+                os.getenv("QMT_BRIDGE_URL"),
+                os.getenv("QMT_BRIDGE_BASE_URL"),
+            ),
+            bridge_token=_first_text(
+                getattr(args, "qmt_bridge_token", None),
+                os.getenv("QMT_BRIDGE_TOKEN"),
+                os.getenv("QMT_BRIDGE_API_KEY"),
+            ),
+            bridge_account_id=_first_text(
+                getattr(args, "qmt_account_id", None),
+                os.getenv("QMT_ACCOUNT_ID"),
+                os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID"),
+            ),
         )
         title = "Trade 状态"
     elif args.trade_action == "quote":
         payload = _trade_quote_summary(
-            Path(args.root),
+            root,
             symbols=_parse_str_csv(args.symbols),
-            bridge_url=getattr(args, "qmt_bridge_url", None),
-            bridge_token=getattr(args, "qmt_bridge_token", None),
-            bridge_account_id=getattr(args, "qmt_account_id", None),
+            bridge_url=_first_text(
+                getattr(args, "qmt_bridge_url", None),
+                os.getenv("QMT_BRIDGE_URL"),
+                os.getenv("QMT_BRIDGE_BASE_URL"),
+            ),
+            bridge_token=_first_text(
+                getattr(args, "qmt_bridge_token", None),
+                os.getenv("QMT_BRIDGE_TOKEN"),
+                os.getenv("QMT_BRIDGE_API_KEY"),
+            ),
+            bridge_account_id=_first_text(
+                getattr(args, "qmt_account_id", None),
+                os.getenv("QMT_ACCOUNT_ID"),
+                os.getenv("QMT_BRIDGE_TRADING_ACCOUNT_ID"),
+            ),
         )
         title = "Trade 实时行情"
     elif args.trade_action == "inspect":
-        payload = _trade_inspect_summary(Path(args.root), args.exec_id)
+        payload = _trade_inspect_summary(root, args.exec_id)
         title = "Trade 执行检查"
     elif args.trade_action == "reconcile":
         payload = _run_trade_reconcile(args)
@@ -3912,6 +4176,12 @@ def cmd_trade(args: argparse.Namespace) -> None:
     elif args.trade_action == "qmt" and args.trade_qmt_action == "rebalance":
         payload = _run_trade_qmt_rebalance(args)
         title = "QMT rebalance 完成"
+    elif args.trade_action == "xueqiu" and args.trade_xueqiu_action == "rebalance":
+        payload = _run_trade_xueqiu_rebalance(args)
+        title = "雪球组合 rebalance 完成"
+    elif args.trade_action == "xueqiu" and args.trade_xueqiu_action == "auth-check":
+        payload = _run_trade_xueqiu_auth_check(args)
+        title = "雪球组合认证检查"
     elif args.trade_action == "nav" and args.trade_nav_action == "snapshot":
         payload = _run_trade_nav_snapshot(args)
         title = "策略净值快照已记录"
@@ -3995,6 +4265,13 @@ def main() -> None:
     start_parser.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     for action in ("stop", "status"):
         server_sub.add_parser(action, parents=[root_parser])
+
+    # --- vortex console start ---
+    console_parser = subparsers.add_parser("console", help="本地控制台")
+    console_sub = console_parser.add_subparsers(dest="console_action")
+    console_start = console_sub.add_parser("start", parents=[root_parser], help="启动本地控制台页面")
+    console_start.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1")
+    console_start.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
 
     # --- vortex profile {explain|resolve} ---
     profile_parser = subparsers.add_parser("profile", help="配置管理")
@@ -4114,6 +4391,41 @@ def main() -> None:
     inspect_sub.add_argument("--limit", type=int, default=10, help="样例行数（默认 10，0 表示只看元信息）")
     inspect_sub.add_argument("--format", choices=["text", "json"], default="text")
 
+    # --- vortex research ---
+    research_parser = subparsers.add_parser("research", help="因子研究与研发公司运行")
+    research_sub = research_parser.add_subparsers(dest="research_action")
+    cogalpha_cycle_sub = research_sub.add_parser(
+        "cogalpha-cycle",
+        parents=[root_parser],
+        help="运行公司级 CogAlpha 因子研究闭环",
+    )
+    cogalpha_cycle_sub.add_argument(
+        "--demo",
+        action="store_true",
+        help="使用确定性演示数据跑通公司级研究闭环",
+    )
+    cogalpha_cycle_sub.add_argument("--output-dir", help="artifact 输出目录；默认 workspace/research/cogalpha/company_runs/{run_id}")
+    cogalpha_cycle_sub.add_argument("--run-id", help="运行编号；默认自动生成")
+    cogalpha_cycle_sub.add_argument("--days", type=int, default=220, help="演示数据交易日数量，默认 220")
+    cogalpha_cycle_sub.add_argument("--symbols", type=int, default=60, help="演示数据股票数量，默认 60")
+    cogalpha_cycle_sub.add_argument("--min-periods", type=int, default=30, help="最少有效期数，默认 30")
+    cogalpha_cycle_sub.add_argument("--groups", type=int, default=5, help="多空分组数，默认 5")
+    cogalpha_cycle_sub.add_argument("--top-n", type=int, default=10, help="summary 输出候选数，默认 10")
+    cogalpha_cycle_sub.add_argument("--notify", action="store_true", help="运行完成后通过通知服务发送出站通知")
+    cogalpha_cycle_sub.add_argument(
+        "--notification-channel",
+        choices=["lark", "feishu", "agent"],
+        default="lark",
+        help="通知渠道，默认 lark",
+    )
+    cogalpha_cycle_sub.add_argument(
+        "--notification-level",
+        choices=["info", "warning", "critical"],
+        default="info",
+        help="通知最低级别，默认 info",
+    )
+    cogalpha_cycle_sub.add_argument("--format", choices=["text", "json"], default="text")
+
     # --- vortex strategy earnings-forecast precise-review ---
     strategy_parser = subparsers.add_parser("strategy", help="策略研究与复核")
     strategy_sub = strategy_parser.add_subparsers(dest="strategy_action")
@@ -4124,6 +4436,11 @@ def main() -> None:
         "stable_100w",
         "liquidity_top80",
         "liquidity_top90_1000w",
+        "baseline_top110_large",
+        "tail_risk_soft_q10_p25",
+    ]
+    earnings_execution_preset_choices = [
+        "stable_100w",
         "baseline_top110_large",
     ]
     precise_sub = earnings_sub.add_parser(
@@ -4165,8 +4482,9 @@ def main() -> None:
     shadow_sub.add_argument("--label", help="输出文件名前缀")
     shadow_sub.add_argument(
         "--preset",
+        default="stable_100w",
         choices=earnings_preset_choices,
-        help="可选：按已固化策略版本 preset 生成影子目标；不传则保持原 config 口径",
+        help="按已固化策略版本生成影子目标；100 万实盘默认 stable_100w，baseline_top110_large 保留为大容量回滚/对照",
     )
     shadow_sub.add_argument(
         "--allow-missing-precise-data",
@@ -4194,8 +4512,9 @@ def main() -> None:
     handoff_sub.add_argument("--label", help="输出文件名前缀")
     handoff_sub.add_argument(
         "--preset",
-        choices=earnings_preset_choices,
-        help="可选：按已固化策略版本 preset 生成交接目标；不传则保持原 config 口径",
+        default="stable_100w",
+        choices=earnings_execution_preset_choices,
+        help="按已固化策略版本生成交接目标；100 万实盘默认 stable_100w，baseline_top110_large 保留为大容量回滚/对照",
     )
     handoff_sub.add_argument(
         "--allow-missing-precise-data",
@@ -4207,10 +4526,10 @@ def main() -> None:
     prepare_sub = earnings_sub.add_parser(
         "prepare-next-session",
         parents=[root_parser],
-        help="按最新可见数据生成冻结组合与待执行任务（交易日默认落到当天）",
+        help="按最新可见数据生成冻结组合与待执行任务（默认执行日为信号日后的下一交易日）",
     )
     prepare_sub.add_argument("--start", required=True, help="策略回看起始日期 YYYYMMDD")
-    prepare_sub.add_argument("--as-of", required=True, help="最新可见数据基准日 YYYYMMDD；若为交易日则默认生成当天计划")
+    prepare_sub.add_argument("--as-of", required=True, help="最新可见数据基准日 YYYYMMDD；执行日必须晚于该信号日")
     prepare_sub.add_argument("--qmt-bridge-url", required=True, help="qmt-bridge 地址，例如 http://10.0.0.2:8000")
     prepare_sub.add_argument("--qmt-bridge-token", default=os.getenv("QMT_BRIDGE_TOKEN"), help="qmt-bridge API Token")
     prepare_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
@@ -4219,9 +4538,9 @@ def main() -> None:
     prepare_sub.add_argument("--label", help="输出文件名前缀")
     prepare_sub.add_argument(
         "--preset",
-        default="baseline_top110_large",
-        choices=earnings_preset_choices,
-        help="冻结组合默认使用 baseline_top110_large",
+        default="stable_100w",
+        choices=earnings_execution_preset_choices,
+        help="冻结组合默认使用 stable_100w；baseline_top110_large 保留为大容量回滚/对照；shadow/challenge 版本不可生成 QMT 任务",
     )
     prepare_sub.add_argument("--portfolio-notional", type=float, default=1_000_000.0, help="冻结目标本金，默认 100 万")
     prepare_sub.add_argument("--min-position-value", type=float, default=3_000.0, help="单个目标持仓最小金额，默认 3000")
@@ -4230,6 +4549,14 @@ def main() -> None:
         action="store_true",
         help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
     )
+    prepare_sub.add_argument("--enable-xueqiu", action="store_true", help="生成冻结组合后同步雪球组合；默认不启用")
+    prepare_sub.add_argument("--xueqiu-cube-symbol", default=os.getenv("XUEQIU_CUBE_SYMBOL"), help="雪球组合代码，例如 ZH3625640")
+    prepare_sub.add_argument("--xueqiu-market", choices=["cn", "us", "hk"], default="cn", help="雪球组合市场，默认 cn")
+    prepare_sub.add_argument("--xueqiu-cookie", default=os.getenv("XUEQIU_COOKIE"), help="雪球 Cookie 字符串；建议通过环境变量提供")
+    prepare_sub.add_argument("--xueqiu-cookie-file", default=os.getenv("XUEQIU_COOKIE_FILE"), help="包含雪球 Cookie 字符串的本地文件")
+    prepare_sub.add_argument("--xueqiu-submit", action="store_true", help="真正提交雪球组合调仓；默认只 dry-run")
+    prepare_sub.add_argument("--xueqiu-notification-profile", default=os.getenv("XUEQIU_NOTIFICATION_PROFILE", "default"), help="雪球登录失效通知使用的数据 profile，默认 default")
+    prepare_sub.add_argument("--no-xueqiu-auth-notify", action="store_true", help="雪球登录失效时只记录错误，不发送通知")
     prepare_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     auto_sub = earnings_sub.add_parser(
@@ -4244,9 +4571,9 @@ def main() -> None:
     auto_sub.add_argument("--qmt-account-id", help="交易账户 ID（可选）")
     auto_sub.add_argument(
         "--preset",
-        default="baseline_top110_large",
-        choices=earnings_preset_choices,
-        help="自动编排默认使用 baseline_top110_large",
+        default="stable_100w",
+        choices=earnings_execution_preset_choices,
+        help="自动编排默认使用 stable_100w；baseline_top110_large 保留为大容量回滚/对照；shadow/challenge 版本不可执行",
     )
     auto_sub.add_argument("--label", help="自动编排标签")
     auto_sub.add_argument("--prepare-time", default="08:10", help="开盘前生成当日执行计划的触发时间 HH:MM，默认 08:10")
@@ -4254,8 +4581,28 @@ def main() -> None:
     auto_sub.add_argument("--poll-seconds", type=int, default=60, help="循环轮询秒数，默认 60")
     auto_sub.add_argument("--nav-initial-equity", type=float, default=1_000_000.0, help="账户级净值初始资金，默认 100 万")
     auto_sub.add_argument("--nav-benchmark", default="000852.SH", help="账户级净值对标指数，默认中证1000")
+    auto_sub.add_argument("--enable-xueqiu", action="store_true", help="启用雪球组合旁路同步；默认不启用")
+    auto_sub.add_argument("--xueqiu-cube-symbol", default=os.getenv("XUEQIU_CUBE_SYMBOL"), help="雪球组合代码，例如 ZH3625640")
+    auto_sub.add_argument("--xueqiu-market", choices=["cn", "us", "hk"], default="cn", help="雪球组合市场，默认 cn")
+    auto_sub.add_argument("--xueqiu-cookie", default=os.getenv("XUEQIU_COOKIE"), help="雪球 Cookie 字符串；建议通过环境变量提供")
+    auto_sub.add_argument("--xueqiu-cookie-file", default=os.getenv("XUEQIU_COOKIE_FILE"), help="包含雪球 Cookie 字符串的本地文件")
+    auto_sub.add_argument("--xueqiu-submit", action="store_true", help="真正提交雪球组合调仓；默认只 dry-run")
+    auto_sub.add_argument("--xueqiu-notification-profile", default=os.getenv("XUEQIU_NOTIFICATION_PROFILE"), help="雪球登录失效通知使用的数据 profile；默认跟随 --profile")
+    auto_sub.add_argument("--no-xueqiu-auth-notify", action="store_true", help="雪球登录失效时只记录错误，不发送通知")
     auto_sub.add_argument("--once", action="store_true", help="只跑一轮 tick，不进入常驻循环")
-    auto_sub.add_argument("--disable-trading", action="store_true", help="生成计划但不真正 submit_order")
+    auto_sub.add_argument("--enable-trading", action="store_true", help="显式允许 auto-run 执行 submit_order")
+    auto_sub.add_argument(
+        "--allowed-account-id",
+        action="append",
+        default=[],
+        help="允许真实下单的账户白名单；可重复传入，必须包含 --qmt-account-id",
+    )
+    auto_sub.add_argument(
+        "--confirm-trading",
+        default="",
+        help="真实下单二次确认；启用交易时必须传 CONFIRM_AUTO_TRADING",
+    )
+    auto_sub.add_argument("--disable-trading", action="store_true", help="兼容旧脚本；显式保持 dry-run")
     auto_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     auto_status_sub = earnings_sub.add_parser(
@@ -4398,6 +4745,42 @@ def main() -> None:
         help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
     )
     robustness_sub.add_argument("--format", choices=["text", "json"], default="text")
+
+    cpcv_sub = earnings_sub.add_parser(
+        "cpcv-backtest",
+        parents=[root_parser],
+        help="对冻结 overlay challenger 做 CPCV 式样本外分块回测，并与 baseline 对比",
+    )
+    cpcv_sub.add_argument(
+        "--preset",
+        default="baseline_top110_large",
+        choices=[
+            "aggressive_100w",
+            "stable_100w",
+            "liquidity_top80",
+            "liquidity_top90_1000w",
+            "baseline_top110_large",
+        ],
+        help="基准策略版本 preset，默认 baseline_top110_large",
+    )
+    cpcv_sub.add_argument("--challenger", default="tail_risk_soft_q10_p25", help="被冻结验证的 overlay variant")
+    cpcv_sub.add_argument("--reference", help="可选：用某个 overlay variant 作为参考基准；默认使用 preset baseline")
+    cpcv_sub.add_argument("--start", required=True, help="起始日期 YYYYMMDD")
+    cpcv_sub.add_argument("--end", required=True, help="结束日期 YYYYMMDD")
+    cpcv_sub.add_argument("--n-groups", type=int, default=8, help="连续时间分块数，默认 8")
+    cpcv_sub.add_argument("--n-test-groups", type=int, default=2, help="每次作为测试集的分块数，默认 2")
+    cpcv_sub.add_argument("--purge-horizon", type=int, default=40, help="从训练集中剔除测试块前的交易日数，默认 40")
+    cpcv_sub.add_argument("--embargo", type=int, default=20, help="从训练集中剔除测试块后的交易日数，默认 20")
+    cpcv_sub.add_argument("--max-combinations", type=int, help="只运行前 N 个组合，用于快速验收")
+    cpcv_sub.add_argument("--output-dir", help="JSON/Markdown 输出目录；默认 workspace/strategy")
+    cpcv_sub.add_argument("--artifact-dir", help="CSV artifact 输出目录；默认 workspace/strategy/artifacts")
+    cpcv_sub.add_argument("--label", help="输出文件名前缀")
+    cpcv_sub.add_argument(
+        "--allow-missing-precise-data",
+        action="store_true",
+        help="允许缺少 stk_limit/suspend_d 时降级运行（默认 fail-closed）",
+    )
+    cpcv_sub.add_argument("--format", choices=["text", "json"], default="text")
 
     mutation_sub = earnings_sub.add_parser(
         "daily-mutation-grid",
@@ -4642,8 +5025,53 @@ def main() -> None:
     qmt_rebalance.add_argument("--max-order-count", type=int, default=80)
     qmt_rebalance.add_argument("--max-single-order-value", type=float, default=100_000.0)
     qmt_rebalance.add_argument("--max-daily-order-value", type=float, default=1_000_000.0)
-    qmt_rebalance.add_argument("--disable-trading", action="store_true", help="只生成报告，不真正 submit_order")
+    qmt_rebalance.add_argument("--enable-trading", action="store_true", help="显式允许提交 QMT 委托；默认只生成 dry-run 报告")
+    qmt_rebalance.add_argument(
+        "--allowed-account-id",
+        action="append",
+        default=[],
+        help="允许真实下单的账户白名单；可重复传入，必须包含 --qmt-account-id",
+    )
+    qmt_rebalance.add_argument(
+        "--confirm-trading",
+        default="",
+        help="真实下单二次确认；启用交易时必须传 CONFIRM_AUTO_TRADING",
+    )
+    qmt_rebalance.add_argument("--disable-trading", action="store_true", help="兼容旧脚本；显式保持 dry-run")
     qmt_rebalance.add_argument("--format", choices=["text", "json"], default="text")
+
+    trade_xueqiu = trade_sub.add_parser("xueqiu", help="雪球组合模拟账户")
+    trade_xueqiu_sub = trade_xueqiu.add_subparsers(dest="trade_xueqiu_action")
+    xueqiu_rebalance = trade_xueqiu_sub.add_parser(
+        "rebalance",
+        parents=[root_parser],
+        help="使用 target_portfolio 通过雪球组合接口同步目标仓位",
+    )
+    xueqiu_rebalance.add_argument("--target-portfolio", required=True, help="target_portfolio.json 路径")
+    xueqiu_rebalance.add_argument("--cube-symbol", default=os.getenv("XUEQIU_CUBE_SYMBOL"), help="雪球组合代码，例如 ZH3625640")
+    xueqiu_rebalance.add_argument("--market", choices=["cn", "us", "hk"], default="cn", help="雪球组合市场，默认 cn")
+    xueqiu_rebalance.add_argument("--cookie", default=os.getenv("XUEQIU_COOKIE"), help="雪球 Cookie 字符串；建议用环境变量提供")
+    xueqiu_rebalance.add_argument("--cookie-file", default=os.getenv("XUEQIU_COOKIE_FILE"), help="包含雪球 Cookie 字符串的本地文件")
+    xueqiu_rebalance.add_argument("--comment", help="调仓说明；默认写入 Vortex 组合血统")
+    xueqiu_rebalance.add_argument(
+        "--ignore-minor-weight-pct",
+        type=float,
+        default=0.0,
+        help="忽略小于该百分比的权重变化，但仍保留持仓；默认 0",
+    )
+    xueqiu_rebalance.add_argument("--submit", action="store_true", help="真正提交到雪球；默认只生成 dry-run 审计产物")
+    xueqiu_rebalance.add_argument("--format", choices=["text", "json"], default="text")
+    xueqiu_auth = trade_xueqiu_sub.add_parser(
+        "auth-check",
+        parents=[root_parser],
+        help="检查雪球组合接口登录态；不提交调仓",
+    )
+    xueqiu_auth.add_argument("--cube-symbol", default=os.getenv("XUEQIU_CUBE_SYMBOL"), help="雪球组合代码，例如 ZH3625640")
+    xueqiu_auth.add_argument("--market", choices=["cn", "us", "hk"], default="cn", help="雪球组合市场，默认 cn")
+    xueqiu_auth.add_argument("--cookie", default=os.getenv("XUEQIU_COOKIE"), help="雪球 Cookie 字符串；建议用环境变量提供")
+    xueqiu_auth.add_argument("--cookie-file", default=os.getenv("XUEQIU_COOKIE_FILE"), help="包含雪球 Cookie 字符串的本地文件")
+    xueqiu_auth.add_argument("--request-timeout-seconds", type=float, default=10.0, help="接口超时秒数，默认 10")
+    xueqiu_auth.add_argument("--format", choices=["text", "json"], default="text")
 
     trade_nav = trade_sub.add_parser("nav", help="账户级策略净值台账")
     trade_nav_sub = trade_nav.add_subparsers(dest="trade_nav_action")
@@ -4653,7 +5081,7 @@ def main() -> None:
         help="从 QMT 账户资产记录一条策略净值快照",
     )
     nav_snapshot.add_argument("--strategy-name", default="earnings_forecast_auto", help="策略名称")
-    nav_snapshot.add_argument("--strategy-version", default="baseline_top110_large", help="策略版本或 preset")
+    nav_snapshot.add_argument("--strategy-version", default="stable_100w", help="策略版本或 preset")
     nav_snapshot.add_argument("--run-id", help="净值 run id；默认由策略、版本和账户生成")
     nav_snapshot.add_argument("--initial-equity", type=float, default=1_000_000.0, help="初始策略资金")
     nav_snapshot.add_argument("--benchmark", default="000852.SH", help="对标指数代码，默认中证1000")
@@ -4670,7 +5098,7 @@ def main() -> None:
         help="查看策略净值、基准和窗口超额",
     )
     nav_status.add_argument("--strategy-name", default="earnings_forecast_auto", help="策略名称")
-    nav_status.add_argument("--strategy-version", default="baseline_top110_large", help="策略版本或 preset")
+    nav_status.add_argument("--strategy-version", default="stable_100w", help="策略版本或 preset")
     nav_status.add_argument("--run-id", help="净值 run id；默认由策略、版本和账户生成")
     nav_status.add_argument("--qmt-account-id", default=os.getenv("QMT_ACCOUNT_ID"), help="交易账户 ID")
     nav_status.add_argument("--format", choices=["text", "json"], default="text")
@@ -4686,10 +5114,14 @@ def main() -> None:
             cmd_init(args)
         case "server":
             cmd_server(args)
+        case "console":
+            cmd_console(args)
         case "profile":
             cmd_profile(args)
         case "data":
             cmd_data(args)
+        case "research":
+            cmd_research(args)
         case "strategy":
             cmd_strategy(args)
         case "trade":

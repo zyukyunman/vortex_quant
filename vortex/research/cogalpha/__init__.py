@@ -7,6 +7,7 @@ from vortex.research.cogalpha.adapters import (
     formula_spec_from_recipe,
     infer_agent_for_formula_spec,
 )
+from vortex.research.cogalpha.company_run import RUN_MANIFEST_SCHEMA, run_cogalpha_company_demo_cycle
 from vortex.research.cogalpha.fitness import CogAlphaFitnessRule, evaluate_cogalpha_candidate, rank_cogalpha_candidates
 from vortex.research.cogalpha.demo import build_demo_daily_inputs, run_cogalpha_demo
 from vortex.research.cogalpha.quality import QualityGateRule, check_candidate_metadata, check_factor_output, run_quality_gate
@@ -46,6 +47,7 @@ __all__ = [
     "QualityCheckResult",
     "QualityGateRule",
     "QualityIssue",
+    "RUN_MANIFEST_SCHEMA",
     "CogAlphaResearchCycleConfig",
     "CogAlphaResearchDirection",
     "agent_by_name",
@@ -70,6 +72,7 @@ __all__ = [
     "run_quality_gate",
     "run_cogalpha_generation",
     "run_cogalpha_research_cycle",
+    "run_cogalpha_company_demo_cycle",
     "run_cogalpha_demo",
     "select_recipes_for_direction",
     "write_generation_report_json",

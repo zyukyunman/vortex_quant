@@ -136,21 +136,34 @@ class QmtBridgeAdapter:
         else:
             data = self._post("quotes", {"symbols": symbols})
         rows = _quote_rows(data)
-        quotes = {
-            str(_first(row, "symbol", "stock_code", "code")): Quote(
-                symbol=str(_first(row, "symbol", "stock_code", "code")),
+        quotes = {}
+        for row in rows:
+            symbol = str(_first(row, "symbol", "stock_code", "code"))
+            last_price = float(_first_optional(row, "last_price", "lastPrice", "price", default=0.0))
+            quotes[symbol] = Quote(
+                symbol=symbol,
                 open_price=float(_first_optional(row, "open_price", "open", "price", "lastClose", default=0.0)),
-                last_price=float(_first_optional(row, "last_price", "lastPrice", "price", default=0.0)),
+                last_price=last_price,
                 ask_price_1=_price_level(row.get("askPrice"), 0),
                 bid_price_1=_price_level(row.get("bidPrice"), 0),
                 volume=int(row["volume"]) if "volume" in row and row["volume"] is not None else None,
                 amount=float(row["amount"]) if "amount" in row and row["amount"] is not None else None,
-                is_suspended=bool(row.get("is_suspended", False)),
-                is_limit_up=bool(row.get("is_limit_up", False)),
-                is_limit_down=bool(row.get("is_limit_down", False)),
+                is_suspended=_quote_bool(row, "is_suspended", "suspended", "isSuspended", "suspendFlag"),
+                is_limit_up=_quote_limit_flag(
+                    row,
+                    explicit_names=("is_limit_up", "limit_up", "isLimitUp"),
+                    limit_names=("up_limit", "upper_limit", "limitUp", "highLimit", "upperLimit"),
+                    last_price=last_price,
+                    direction="up",
+                ),
+                is_limit_down=_quote_limit_flag(
+                    row,
+                    explicit_names=("is_limit_down", "limit_down", "isLimitDown"),
+                    limit_names=("down_limit", "lower_limit", "limitDown", "lowLimit", "lowerLimit"),
+                    last_price=last_price,
+                    direction="down",
+                ),
             )
-            for row in rows
-        }
         missing = [symbol for symbol in symbols if symbol not in quotes]
         if missing:
             raise KeyError(f"missing quotes: {missing}")
@@ -326,6 +339,53 @@ def _price_level(value: Any, index: int) -> float | None:
         if level > 0:
             return round(level, 4)
     return None
+
+
+def _quote_bool(row: dict[str, Any], *names: str) -> bool | None:
+    for name in names:
+        if name in row and row[name] is not None:
+            return _parse_bool(row[name])
+    return None
+
+
+def _quote_limit_flag(
+    row: dict[str, Any],
+    *,
+    explicit_names: tuple[str, ...],
+    limit_names: tuple[str, ...],
+    last_price: float | None,
+    direction: str,
+) -> bool | None:
+    explicit = _quote_bool(row, *explicit_names)
+    if explicit is not None:
+        return explicit
+    limit_price = _optional_float(row, *limit_names)
+    if limit_price is None or last_price is None or last_price <= 0:
+        return None
+    if direction == "up":
+        return float(last_price) >= limit_price - 1e-6
+    if direction == "down":
+        return float(last_price) <= limit_price + 1e-6
+    raise ValueError(f"unknown limit direction: {direction}")
+
+
+def _optional_float(row: dict[str, Any], *names: str) -> float | None:
+    for name in names:
+        if name in row and row[name] is not None:
+            value = float(row[name])
+            if value > 0:
+                return value
+    return None
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "t", "suspended", "停牌", "涨停", "跌停"}:
+            return True
+        if text in {"0", "false", "no", "n", "f", "normal", "正常", ""}:
+            return False
+    return bool(value)
 
 
 def _order_record_from_bridge(row: dict[str, Any]) -> OrderRecord:

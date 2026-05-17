@@ -6,7 +6,7 @@ updated: 2026-05-02
 status: research_lead
 factor_family: research_source
 data_sources: [external_research, github, quantpedia, jkp]
-artifact_root: /Users/zyukyunman/Documents/vortex_workspace/research/factor-reports/
+artifact_root: ../vortex_workspace/research/factor-reports/
 ---
 
 # 外部 Alpha 资料线索

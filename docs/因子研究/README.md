@@ -2,7 +2,7 @@
 tags: [vortex, vortex/moc, vortex/research-domain, vortex/factor-archive]
 aliases: [因子研究档案, 因子研究, Factor Research Archive]
 created: 2026-05-01
-updated: 2026-05-02
+updated: 2026-05-17
 ---
 
 # 因子研究档案
@@ -76,6 +76,17 @@ graph TD
 | [[外部Alpha资料线索]] | `research_lead` | JKP/Alpha101/Quantpedia 更适合作为因子地图和公式语法来源，不能直接复制成策略 |
 
 默认研究编排：新一轮因子挖掘应先从 [[CogAlpha因子研究落地路线]] 选择研究方向和 agent/recipe，生成 `generation_summary.json` / `research_cycle.json` 后，再进入 [[因子研究与评测全流程说明]] 和本档案归档。
+
+## 仓库归属
+
+因子研究属于 `vortex_quant`，不迁到 `vortex_docs`。外部论文、书籍或文章可以在 [vortex_docs](../../../vortex_docs) 保存来源和探索性阅读；一旦开始使用 Vortex 本地数据、字段、runner、artifact、preset、策略晋升或交易约束，状态、结论和下一轮实验都必须回到本目录维护。
+
+归属规则：
+
+1. 外部资料只提供假设来源，不能直接当作 Vortex 因子证据。
+2. 使用本地数据跑过 IC、多空、回测、CPCV、容量、可交易性或执行复核的内容，必须进入 [[因子实验总表]] 或对应实验档案。
+3. 和代码、配置、preset、QMT、paper/shadow/live 或策略晋升绑定的投资框架，属于本仓库。
+4. 不为外部知识库单独建桥接页；需要来源时，在具体因子档案或研究报告里用 Markdown 链接指向 `vortex_docs` 源文件。
 
 ---
 

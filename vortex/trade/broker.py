@@ -48,9 +48,9 @@ class Quote:
     bid_price_1: float | None = None
     volume: int | None = None
     amount: float | None = None
-    is_suspended: bool = False
-    is_limit_up: bool = False
-    is_limit_down: bool = False
+    is_suspended: bool | None = False
+    is_limit_up: bool | None = False
+    is_limit_down: bool | None = False
 
     @property
     def execution_price(self) -> float:

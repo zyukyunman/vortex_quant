@@ -51,7 +51,7 @@ Mac ↔ Windows：HTTP / WebSocket / RPyC 远程调用
 
 ```text
 Mac 主机
-  vortex strategy earnings-forecast shadow-plan --preset baseline_top110_large
+  vortex strategy earnings-forecast shadow-plan --preset stable_100w
   目标持仓、订单草案、风控、报告
   ↓
 BridgeAdapter
@@ -91,7 +91,7 @@ Mac Vortex → Windows VM bridge → QMT/MiniQMT → 国金模拟盘
 Mac 侧只需要运行 Vortex 和访问桥接服务，不需要安装 QMT 或 xtquant。
 
 ```bash
-cd /Users/zyukyunman/Documents/vortex_quant
+cd ../vortex_quant
 uv sync
 uv run python -m pytest tests/ -q
 ```
@@ -577,7 +577,7 @@ tests/test_trade_qmt_bridge.py
 
 对于**模拟账户**，当前正式执行口径已经调整为：
 
-1. **交易日 08:10 后**先拉数、跑策略、冻结 `trade_date=today` 的目标组合；
+1. **交易日 08:10 后**先拉数、用执行日前最新已完成交易日生成信号、冻结 `trade_date=today` 的目标组合；
 2. **当天开盘前/开盘附近**再消费冻结组合下单；
 3. 收盘后立即做对账和执行归因。
 
@@ -614,7 +614,7 @@ tests/test_trade_qmt_bridge.py
 | 步骤 | 动作 | 通过标准 | 失败处理 |
 |---|---|---|---|
 | 1 | 确认 Windows VM、QMT/MiniQMT、bridge 进程都在线 | `health=ok`，QMT 已登录 | fail-closed，当日不下单 |
-| 2 | 运行 `vortex strategy earnings-forecast prepare-next-session --preset baseline_top110_large` | 写出 `trade_date=today` 的冻结组合与 pending task；候选池按上一交易日 `valuation.total_mv` 只保留 A 股总市值前 50%；`stock_st` 日度名单、财务 ST 风险和名称含 ST 任一命中都剔除 | 任一关键数据缺失则 fail-closed |
+| 2 | 运行 `vortex strategy earnings-forecast prepare-next-session --preset stable_100w` | 写出 `trade_date=today` 的冻结组合与 pending task；信号日必须早于执行日；候选池按信号日 `valuation.total_mv` 只保留 A 股总市值前 50%；`stock_st` 日度名单、财务 ST 风险和名称含 ST 任一命中都剔除 | 任一关键数据缺失则 fail-closed |
 | 3 | 运行 `vortex trade status` | 现金、持仓、委托、成交可读 | fail-closed |
 | 4 | 运行 `vortex trade quote` 拉目标股票行情 | 目标股票报价可读，缺失数量可解释 | 缺失则降级为人工检查 |
 | 5 | 检查冻结产物 | `TargetPortfolio`、pending task、handoff JSON 全部落盘 | 任一缺失则不进入当日执行 |
@@ -692,7 +692,7 @@ selected_position_count
 vortex trade nav snapshot \
   --root ~/Documents/vortex_workspace \
   --strategy-name earnings_forecast_auto \
-  --strategy-version baseline_top110_large \
+  --strategy-version stable_100w \
   --initial-equity 1000000 \
   --benchmark 000852.SH \
   --qmt-bridge-url http://<windows-ip>:8000 \
@@ -702,7 +702,7 @@ vortex trade nav snapshot \
 vortex trade nav status \
   --root ~/Documents/vortex_workspace \
   --strategy-name earnings_forecast_auto \
-  --strategy-version baseline_top110_large \
+  --strategy-version stable_100w \
   --qmt-account-id <account_id>
 ```
 

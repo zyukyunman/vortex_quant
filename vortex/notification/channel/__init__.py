@@ -2,6 +2,7 @@
 
 当前支持的渠道：
 - feishu: 飞书文本通知（通过飞书开放平台 API）
+- lark: Lark 国际版文本通知（通过 Lark Open Platform API）
 - agent: AI Agent 通知（通过 Copilot CLI 等后端）
 """
 
